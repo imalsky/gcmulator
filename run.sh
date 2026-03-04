@@ -24,6 +24,7 @@ MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
 TORCH_HARMONICS_PACKAGE_SPEC="${TORCH_HARMONICS_PACKAGE_SPEC:-git+https://github.com/NVIDIA/torch-harmonics.git}"
 TORCH_HARMONICS_PIP_ARGS="${TORCH_HARMONICS_PIP_ARGS:---no-deps --no-build-isolation}"
+TORCH_HARMONICS_FORCE_CPU_BUILD="${TORCH_HARMONICS_FORCE_CPU_BUILD:-1}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
 read -r -a TORCH_HARMONICS_PIP_ARGS_ARR <<< "${TORCH_HARMONICS_PIP_ARGS}"
 
@@ -83,7 +84,12 @@ if [[ "${TORCH_HARMONICS_PACKAGE_SPEC}" == git+* ]] && ! command -v git >/dev/nu
 fi
 echo "Reinstalling torch_harmonics package: ${TORCH_HARMONICS_PACKAGE_SPEC}"
 python -m pip uninstall -y torch_harmonics torch-harmonics >/dev/null 2>&1 || true
-python -m pip install --upgrade "${TORCH_HARMONICS_PIP_ARGS_ARR[@]}" "${TORCH_HARMONICS_PACKAGE_SPEC}"
+if [ "${TORCH_HARMONICS_FORCE_CPU_BUILD}" = "1" ]; then
+  TH_INSTALL_PREFIX=(env CUDA_VISIBLE_DEVICES= FORCE_CUDA_EXTENSION=0)
+else
+  TH_INSTALL_PREFIX=()
+fi
+"${TH_INSTALL_PREFIX[@]}" python -m pip install --upgrade "${TORCH_HARMONICS_PIP_ARGS_ARR[@]}" "${TORCH_HARMONICS_PACKAGE_SPEC}"
 if ! python - <<'PY' >/dev/null 2>&1
 import torch_harmonics  # noqa: F401
 PY
