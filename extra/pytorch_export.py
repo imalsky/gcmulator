@@ -211,6 +211,9 @@ def main() -> None:
     ensure_torch_harmonics_importable(source_cfg_path.parent)
 
     model_cfg = _dict_to_namespace(ckpt["model_config"])
+    ckpt_geometry = dict(ckpt.get("geometry", {}))
+    lat_order = str(ckpt_geometry.get("lat_order", "north_to_south"))
+    lon_origin = str(ckpt_geometry.get("lon_origin", "0_to_2pi"))
     shape = dict(ckpt["shape"])
     state_chans = int(shape["C"])
     h = int(shape["H"])
@@ -223,6 +226,8 @@ def main() -> None:
         state_chans=state_chans,
         param_dim=param_dim,
         cfg_model=model_cfg,
+        lat_order=lat_order,
+        lon_origin=lon_origin,
     )
     core_model.load_state_dict(ckpt["model_state"], strict=True)
     core_model.to(device=device)

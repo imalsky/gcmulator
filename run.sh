@@ -22,7 +22,10 @@ MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
+TORCH_HARMONICS_PACKAGE_SPEC="${TORCH_HARMONICS_PACKAGE_SPEC:-git+https://github.com/NVIDIA/torch-harmonics.git}"
+TORCH_HARMONICS_PIP_ARGS="${TORCH_HARMONICS_PIP_ARGS:---no-deps}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
+read -r -a TORCH_HARMONICS_PIP_ARGS_ARR <<< "${TORCH_HARMONICS_PIP_ARGS}"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda not found on PATH."
@@ -71,6 +74,21 @@ import my_swamp  # noqa: F401
 PY
 then
   echo "ERROR: my_swamp import failed after package install (${MY_SWAMP_PACKAGE_SPEC})"
+  exit 1
+fi
+
+if [[ "${TORCH_HARMONICS_PACKAGE_SPEC}" == git+* ]] && ! command -v git >/dev/null 2>&1; then
+  echo "ERROR: git is required to install TORCH_HARMONICS_PACKAGE_SPEC='${TORCH_HARMONICS_PACKAGE_SPEC}'."
+  exit 1
+fi
+echo "Reinstalling torch_harmonics package: ${TORCH_HARMONICS_PACKAGE_SPEC}"
+python -m pip uninstall -y torch_harmonics torch-harmonics >/dev/null 2>&1 || true
+python -m pip install --upgrade "${TORCH_HARMONICS_PIP_ARGS_ARR[@]}" "${TORCH_HARMONICS_PACKAGE_SPEC}"
+if ! python - <<'PY' >/dev/null 2>&1
+import torch_harmonics  # noqa: F401
+PY
+then
+  echo "ERROR: torch_harmonics import failed after package install (${TORCH_HARMONICS_PACKAGE_SPEC})"
   exit 1
 fi
 

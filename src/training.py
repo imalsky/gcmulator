@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .config import GCMulatorConfig, resolve_path, time_days_to_rollout_steps
+from .geometry import geometry_shift_for_nlon
 from .modeling import (
     SphereLoss,
     autocast_context,
@@ -34,6 +35,8 @@ LOGGER = logging.getLogger("src.train")
 
 # Lower bound used when computing z-score denominators from empirical variance.
 STD_FLOOR = 1.0e-12
+FINITE_CHECK_INTERVAL = 25
+PREPROCESS_FINGERPRINT_VERSION = 1
 
 
 def _list_raw_dataset_files(dataset_dir: Path) -> List[Path]:
@@ -66,6 +69,138 @@ def _split_files(files: Sequence[Path], *, seed: int, val_fraction: float) -> Tu
             "Increase dataset size or increase val_fraction."
         )
     return train, val
+
+
+def _load_raw_metadata(file_path: Path) -> Dict[str, Any]:
+    """Load metadata from one raw simulation file without touching state arrays."""
+    with np.load(file_path, allow_pickle=True) as z:
+        try:
+            lat_order = str(np.asarray(z["lat_order"], dtype=object).item())
+            lon_origin = str(np.asarray(z["lon_origin"], dtype=object).item())
+            lon_shift = int(np.asarray(z["lon_shift"], dtype=np.int64).item())
+            nlat = int(np.asarray(z["nlat"], dtype=np.int64).item())
+            nlon = int(np.asarray(z["nlon"], dtype=np.int64).item())
+        except KeyError as exc:
+            raise ValueError(
+                f"Raw file {file_path} is missing geometry metadata key '{exc.args[0]}'. "
+                "Regenerate the raw dataset with current data_generation.py."
+            ) from exc
+        fields = [str(x) for x in np.asarray(z["fields"], dtype=object).tolist()]
+        param_names = [str(x) for x in np.asarray(z["param_names"], dtype=object).tolist()]
+    return {
+        "lat_order": lat_order,
+        "lon_origin": lon_origin,
+        "lon_shift": lon_shift,
+        "nlat": nlat,
+        "nlon": nlon,
+        "fields": fields,
+        "param_names": param_names,
+    }
+
+
+def _validate_raw_geometry(files: Sequence[Path], *, cfg: GCMulatorConfig) -> Dict[str, Any]:
+    """Validate raw geometry consistency and match against configured conventions."""
+    expected_lat_order = "north_to_south" if cfg.geometry.flip_latitude_to_north_south else "south_to_north"
+    expected_lon_origin = "0_to_2pi" if cfg.geometry.roll_longitude_to_0_2pi else "minus_pi_to_pi"
+
+    ref: Dict[str, Any] | None = None
+    for fp in files:
+        meta = _load_raw_metadata(fp)
+        expected_lon_shift = geometry_shift_for_nlon(int(meta["nlon"]), cfg.geometry.roll_longitude_to_0_2pi)
+        if int(meta["lon_shift"]) != int(expected_lon_shift):
+            raise ValueError(
+                f"Geometry mismatch in {fp}: lon_shift={meta['lon_shift']} but expected "
+                f"{expected_lon_shift} for nlon={meta['nlon']} and roll_longitude_to_0_2pi="
+                f"{cfg.geometry.roll_longitude_to_0_2pi}."
+            )
+
+        if str(meta["lat_order"]) != expected_lat_order or str(meta["lon_origin"]) != expected_lon_origin:
+            raise ValueError(
+                f"Geometry mismatch in {fp}: "
+                f"lat_order={meta['lat_order']} lon_origin={meta['lon_origin']} but expected "
+                f"lat_order={expected_lat_order} lon_origin={expected_lon_origin} from config.geometry."
+            )
+
+        if ref is None:
+            ref = {
+                "lat_order": str(meta["lat_order"]),
+                "lon_origin": str(meta["lon_origin"]),
+                "lon_shift": int(meta["lon_shift"]),
+                "nlat": int(meta["nlat"]),
+                "nlon": int(meta["nlon"]),
+            }
+        else:
+            current = (
+                str(meta["lat_order"]),
+                str(meta["lon_origin"]),
+                int(meta["lon_shift"]),
+                int(meta["nlat"]),
+                int(meta["nlon"]),
+            )
+            baseline = (
+                str(ref["lat_order"]),
+                str(ref["lon_origin"]),
+                int(ref["lon_shift"]),
+                int(ref["nlat"]),
+                int(ref["nlon"]),
+            )
+            if current != baseline:
+                raise ValueError(
+                    "Raw dataset mixes geometry conventions or grid shapes across files. "
+                    f"First mismatch: {fp} has {current}, expected {baseline}."
+                )
+
+    if ref is None:
+        raise ValueError("Raw dataset is empty while validating geometry.")
+    return ref
+
+
+def _raw_file_signature(file_path: Path) -> Dict[str, Any]:
+    """Return a compact signature used to detect raw-dataset changes."""
+    st = file_path.stat()
+    return {
+        "name": file_path.name,
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+
+
+def _build_preprocess_fingerprint(*, cfg: GCMulatorConfig, files: Sequence[Path]) -> Dict[str, Any]:
+    """Build reproducibility fingerprint for processed-data cache reuse."""
+    return {
+        "version": PREPROCESS_FINGERPRINT_VERSION,
+        "split_seed": int(cfg.training.split_seed),
+        "val_fraction": float(cfg.training.val_fraction),
+        "normalization": asdict(cfg.normalization),
+        "geometry": asdict(cfg.geometry),
+        "solver": {
+            "M": int(cfg.solver.M),
+            "dt_seconds": float(cfg.solver.dt_seconds),
+            "default_time_days": float(cfg.solver.default_time_days),
+        },
+        "model_time_mapping": {
+            "default_time_days": float(cfg.solver.default_time_days),
+            "rollout_steps_at_default_time": int(cfg.model.rollout_steps_at_default_time),
+        },
+        "raw_files": [_raw_file_signature(fp) for fp in files],
+    }
+
+
+def _processed_cache_is_valid(*, meta: Dict[str, Any], fingerprint: Dict[str, Any], processed_dir: Path) -> bool:
+    """Return True when processed data matches the current preprocessing fingerprint."""
+    if meta.get("build_fingerprint") != fingerprint:
+        return False
+    splits = meta.get("splits")
+    if not isinstance(splits, dict):
+        return False
+    for split_name in ("train", "val"):
+        names = splits.get(split_name)
+        if not isinstance(names, list) or not names:
+            return False
+        for name in names:
+            if not (processed_dir / str(name)).is_file():
+                return False
+    return True
 
 
 def _load_raw_state_and_params(file_path: Path) -> Tuple[np.ndarray, np.ndarray, float, List[str], List[str]]:
@@ -204,13 +339,25 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
     processed_dir = resolve_path(config_path, cfg.paths.processed_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
+    files = _list_raw_dataset_files(dataset_dir)
+    fingerprint = _build_preprocess_fingerprint(cfg=cfg, files=files)
     meta_path = processed_dir / "processed_meta.json"
+    if meta_path.is_file():
+        try:
+            cached = json.loads(meta_path.read_text(encoding="utf-8"))
+            if _processed_cache_is_valid(meta=cached, fingerprint=fingerprint, processed_dir=processed_dir):
+                LOGGER.info("Reusing cached processed dataset at %s", processed_dir)
+                return cached
+        except Exception:
+            # Fallback to full rebuild if metadata is malformed or stale.
+            pass
+
     if processed_dir.exists():
         for p in processed_dir.glob("*"):
             if p.is_file():
                 p.unlink()
 
-    files = _list_raw_dataset_files(dataset_dir)
+    geometry_meta = _validate_raw_geometry(files, cfg=cfg)
     train_files, val_files = _split_files(files, seed=cfg.training.split_seed, val_fraction=cfg.training.val_fraction)
 
     stats = _fit_stats_streaming(
@@ -257,6 +404,11 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
         "splits": {"train": written_train, "val": written_val},
         "normalization": stats_to_json(stats),
         "constant_param_names": const_param_names,
+        "geometry": {
+            "lat_order": str(geometry_meta["lat_order"]),
+            "lon_origin": str(geometry_meta["lon_origin"]),
+            "lon_shift": int(geometry_meta["lon_shift"]),
+        },
         "solver": {
             "M": int(cfg.solver.M),
             "dt_seconds": float(cfg.solver.dt_seconds),
@@ -266,6 +418,7 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
             "default_time_days": float(cfg.solver.default_time_days),
             "rollout_steps_at_default_time": int(cfg.model.rollout_steps_at_default_time),
         },
+        "build_fingerprint": fingerprint,
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
@@ -363,6 +516,12 @@ def _check_finite_tensor(t: torch.Tensor, *, name: str) -> None:
         raise RuntimeError(f"{name} contains non-finite values")
 
 
+def _should_run_finite_check(step_idx: int) -> bool:
+    """Return True when finite-value checks should run for this batch index."""
+    idx = int(step_idx)
+    return idx == 0 or (FINITE_CHECK_INTERVAL > 0 and (idx % FINITE_CHECK_INTERVAL) == 0)
+
+
 def _abs_max_tensor(t: torch.Tensor) -> float:
     """Return absolute max value from tensor as Python float."""
     return float(t.detach().abs().max().item())
@@ -396,7 +555,7 @@ def _cosine_warmup_lr(
         raise ValueError(f"min_lr must be <= base_lr, got min_lr={min_lr}, base_lr={base_lr}")
 
     warmup = min(int(warmup_epochs), int(total_epochs))
-    e = int(epoch)
+    e = max(1, int(epoch))
     if warmup > 0 and e <= warmup:
         return float(base_lr) * (float(e) / float(warmup))
 
@@ -452,6 +611,9 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
 
     stats = stats_from_json(processed_meta["normalization"])
     field_names = list(processed_meta["fields"])
+    processed_geometry = dict(processed_meta.get("geometry", {}))
+    lat_order = str(processed_geometry.get("lat_order", "north_to_south"))
+    lon_origin = str(processed_geometry.get("lon_origin", "0_to_2pi"))
 
     train_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["train"])
     val_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["val"])
@@ -505,6 +667,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         state_chans=state_chans,
         param_dim=param_dim,
         cfg_model=cfg.model,
+        lat_order=lat_order,
+        lon_origin=lon_origin,
     ).to(device)
 
     loss_fn = SphereLoss(nlat=h, nlon=w, grid=cfg.model.grid).to(device)
@@ -553,8 +717,10 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         for pb, yb, tb in train_loader:
             pb = pb.to(device=device, non_blocking=use_non_blocking)
             yb = yb.to(device=device, non_blocking=use_non_blocking)
-            _check_finite_tensor(pb, name="train params batch")
-            _check_finite_tensor(yb, name="train target batch")
+            do_finite_check = _should_run_finite_check(train_count)
+            if do_finite_check:
+                _check_finite_tensor(pb, name="train params batch")
+                _check_finite_tensor(yb, name="train target batch")
             steps = _batch_steps(
                 tb,
                 default_time_days=cfg.solver.default_time_days,
@@ -564,7 +730,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, cfg.training.amp_mode):
                 yhat = model(pb, steps=steps)
-                _check_finite_tensor(yhat, name="train prediction batch")
+                if do_finite_check:
+                    _check_finite_tensor(yhat, name="train prediction batch")
                 loss = loss_fn(yhat, yb)
             if not torch.isfinite(loss).item():
                 raise RuntimeError("Training loss became non-finite")
@@ -605,6 +772,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             for pb, yb, tb in val_loader:
                 pb = pb.to(device=device, non_blocking=use_non_blocking)
                 yb = yb.to(device=device, non_blocking=use_non_blocking)
+                do_finite_check = _should_run_finite_check(val_count)
                 steps = _batch_steps(
                     tb,
                     default_time_days=cfg.solver.default_time_days,
@@ -612,7 +780,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 )
                 with autocast_context(device, cfg.training.amp_mode):
                     yhat = model(pb, steps=steps)
-                    _check_finite_tensor(yhat, name="val prediction batch")
+                    if do_finite_check:
+                        _check_finite_tensor(yhat, name="val prediction batch")
                     vloss = loss_fn(yhat, yb)
                 if not torch.isfinite(vloss).item():
                     raise RuntimeError("Validation loss became non-finite")
@@ -647,6 +816,10 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             "fields": field_names,
             "param_names": list(processed_meta["param_names"]),
             "shape": {"C": state_chans, "H": h, "W": w},
+            "geometry": {
+                "lat_order": lat_order,
+                "lon_origin": lon_origin,
+            },
             "normalization": stats_to_json(stats),
             "solver": asdict(cfg.solver),
             "model_config": asdict(cfg.model),

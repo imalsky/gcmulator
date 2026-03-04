@@ -79,10 +79,12 @@ Fixed canonical parameter ordering is:
 
 ### 4.3 Preprocessing (`src/training.py`, `preprocess_dataset`)
 1. Read raw `sim_*.npz`.
-2. Train/val split by `training.split_seed` and `training.val_fraction`.
-3. Fit normalization stats on train split only (streaming moments).
-4. Write normalized per-simulation processed files (`*_train.npz`, `*_val.npz`).
-5. Write `processed_meta.json` with shape, splits, normalization, and time-mapping metadata.
+2. Validate raw geometry metadata consistency and ensure it matches `config.geometry`.
+3. Train/val split by `training.split_seed` and `training.val_fraction`.
+4. Fit normalization stats on train split only (streaming moments).
+5. Write normalized per-simulation processed files (`*_train.npz`, `*_val.npz`).
+6. Write `processed_meta.json` with shape, splits, normalization, geometry, and time-mapping metadata.
+7. Reuse cached processed files when raw-file signatures and preprocessing config fingerprint match.
 
 ### 4.4 Training (`src/training.py`, `train_emulator`)
 1. Build rollout model from config and data shape.
@@ -121,6 +123,9 @@ Config may be JSON (or YAML if PyYAML is installed). Unknown keys are rejected.
   - `const`/`fixed`
   - `mixture_off_loguniform`
 - Hours aliases are converted to seconds inside sampling.
+- `K6Phi` semantics:
+  - `K6Phi: 0.0` means explicit zero geopotential diffusion.
+  - `K6Phi: null` means inherit `K6` (same diffusion as vorticity/divergence).
 
 ### 5.2 Time Mapping
 Rollout steps for a sample are computed by:
@@ -130,6 +135,10 @@ Validation enforces finite positive values and minimum step count `>= 1`.
 
 ### 5.3 Model Controls
 - SFNO base model is wrapped as a conditional rollout model.
+- Grid choices are locked by config validation for consistency with MY_SWAMP data and torch-harmonics:
+  - `model.grid == "legendre-gauss"`
+  - `model.grid_internal == "legendre-gauss"`
+  - `model.grid_internal == model.grid`
 - Optional input augmentations:
   - parameter maps
   - coordinate channels
@@ -146,6 +155,10 @@ Validation enforces finite positive values and minimum step count `>= 1`.
 2. Longitude roll from `[-pi, pi)` origin to `[0, 2pi)` origin (requires even `nlon`).
 
 Metadata about these choices is stored in each raw simulation file.
+Current training pipeline enforces the torch-harmonics-compatible convention via config validation:
+- `geometry.flip_latitude_to_north_south == true`
+- `geometry.roll_longitude_to_0_2pi == true`
+Preprocessing also validates every raw file to ensure geometry metadata is consistent across files and matches config.
 
 ## 7. Normalization Design
 `src/normalization.py` supports per-channel state transforms before z-score:
@@ -175,6 +188,7 @@ Normalization stats are serialized into processed metadata and checkpoints.
 4. `ParamRolloutModel`: iterative rollout for a fixed number of steps.
 
 Each rollout step receives current state plus optional static channels (params/maps, coords).
+Coordinate channels and IC basis maps are built with the same `lat_order` and `lon_origin` conventions persisted in preprocessing metadata/checkpoints.
 
 Current default SFNO profile is intentionally moderate-large and aligned with torch-harmonics patterns:
 - `scale_factor=2`
@@ -250,6 +264,7 @@ Required core dependencies:
 - `numpy`
 - `torch`
 - `torch_harmonics` (for training/model)
+  - launcher defaults install from NVIDIA GitHub: `git+https://github.com/NVIDIA/torch-harmonics.git`
 
 Optional/conditional dependencies:
 - `my_swamp` (for data generation)
@@ -261,6 +276,10 @@ Import strategy:
 - `ensure_my_swamp_importable` and `ensure_torch_harmonics_importable` try installed imports first, then nearby sibling checkouts.
 
 ## 11. Execution Interfaces
+Local environment requirement:
+- All local `gcmulator` generation/training/export commands should be run from conda environment `swamp_compare`.
+- The same `swamp_compare` environment must provide `torch_harmonics` importability (for example from editable install rooted at `/Users/imalsky/Desktop/SWAMPE_Project/torch-harmonics-main`).
+
 ### 11.1 Direct CLI
 - `python src/main.py --gen --config config.json`
 - `python src/main.py --train --config config.json`
@@ -271,10 +290,13 @@ Import strategy:
 - Optionally runs generation only when raw sims are missing (`RUN_GEN_IF_MISSING=1`).
 - Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
 - Reinstalls only `my_swamp` with `--no-deps` so existing environment package versions remain unchanged.
+- Always refreshes `torch_harmonics` before training (`TORCH_HARMONICS_PACKAGE_SPEC`, default `git+https://github.com/NVIDIA/torch-harmonics.git`, configurable pip args via `TORCH_HARMONICS_PIP_ARGS`).
+- Verifies `torch_harmonics` import immediately after install and fails early if unavailable.
 - Exposes generation/runtime defaults via environment:
   - `SWAMPE_JAX_ENABLE_X64` (default `0`)
   - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
   - `GCMULATOR_JAX_SIM_BATCH` (default `auto`)
+- When generation already produced `sim_*.npz`, reruns skip regeneration and reuse existing raw data.
 - Runs training.
 
 ### 11.3 PBS Convenience Script (`run.pbs`)
@@ -282,12 +304,15 @@ Import strategy:
 - Loads module stack (`miniconda3/gh2`) and activates conda env (`CONDA_ENV`, default `pyt2_8_gh`).
 - Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
 - Reinstalls only `my_swamp` with `--no-deps` so existing environment package versions remain unchanged.
+- Always refreshes `torch_harmonics` before training (`TORCH_HARMONICS_PACKAGE_SPEC`, default `git+https://github.com/NVIDIA/torch-harmonics.git`, configurable pip args via `TORCH_HARMONICS_PIP_ARGS`).
+- Verifies `torch_harmonics` import immediately after install and includes it in runtime preflight checks.
 - Enforces runtime GPU preflight by default (`REQUIRE_TORCH_CUDA=1`, `REQUIRE_JAX_GPU=1`) and records periodic `nvidia-smi` samples (`ENABLE_GPU_MONITOR=1`).
 - Exposes generation/runtime defaults via environment:
   - `SWAMPE_JAX_ENABLE_X64` (default `0`)
   - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
   - `GCMULATOR_JAX_SIM_BATCH` (default `auto`)
 - Uses generation/training flow control `RUN_GEN_IF_MISSING` consistent with `run.sh`.
+- When generation already produced `sim_*.npz`, reruns skip regeneration and reuse existing raw data.
 
 ### 11.4 SWAMPE Parity Check
 - `python extra/swampe_parity_compare.py`
@@ -303,7 +328,7 @@ Import strategy:
 - Reintroducing unit/smoke tests is recommended before major architecture changes.
 
 ## 13. Current Design Notes and Gaps
-1. Processed data is always rebuilt from raw simulations; no cache validation path is used.
+1. Processed data is rebuilt only when preprocessing fingerprint or raw-file signatures change.
 2. All training samples in a batch must share the same `time_days`; mixed values in one batch are rejected.
 3. Validation split is file-level random split, not stratified.
 4. Batched generation (`GCMULATOR_JAX_SIM_BATCH>1`) is currently only applied in single-worker generation mode (`generation_workers==1`).

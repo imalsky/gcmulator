@@ -39,7 +39,13 @@ def ensure_torch_harmonics_importable(config_dir: Path) -> None:
             except Exception:
                 os.sys.path.pop(0)
 
-    raise RuntimeError("Could not import torch_harmonics. Install it or keep torch-harmonics-main nearby.")
+    attempted = ", ".join(str(c) for c in candidates)
+    raise RuntimeError(
+        "Could not import torch_harmonics. Install it (for example: "
+        "pip install 'git+https://github.com/NVIDIA/torch-harmonics.git') "
+        "or run through run.pbs/run.sh with TORCH_HARMONICS_PACKAGE_SPEC set. "
+        f"Also searched local checkout candidates: {attempted}."
+    )
 
 
 def import_sfno() -> type[nn.Module]:
@@ -168,8 +174,7 @@ class SphereLoss(nn.Module):
             q = q[:, 0]
         q = q[None, None, :, None].to(device=pred.device, dtype=pred.dtype)
         loss = ((pred - target) ** 2) * q
-        loss = loss.sum(dim=(-2, -1)).mean(dim=(-1, -2))
-        return loss.mean()
+        return loss.sum(dim=(-2, -1)).mean()
 
 
 class ConditionalResidualWrapper(nn.Module):
@@ -186,7 +191,11 @@ class ConditionalResidualWrapper(nn.Module):
         self.base = base
         self.state_chans = int(state_chans)
         self.residual_prediction = bool(residual_prediction)
-        self.residual_scale = nn.Parameter(torch.tensor(float(residual_init_scale), dtype=torch.float32))
+        scale_init = torch.tensor(float(residual_init_scale), dtype=torch.float32)
+        if self.residual_prediction:
+            self.residual_scale = nn.Parameter(scale_init)
+        else:
+            self.register_buffer("residual_scale", scale_init, persistent=False)
 
     def forward(self, x: torch.Tensor, *, step_scale: float = 1.0) -> torch.Tensor:
         """Run step model and add scaled residual to state channels when enabled."""
@@ -203,12 +212,24 @@ def build_coord_channels_legendre_gauss(
     *,
     dtype: torch.dtype,
     device: torch.device,
+    lat_order: str = "north_to_south",
+    lon_origin: str = "0_to_2pi",
 ) -> torch.Tensor:
     """Build fixed sin/cos latitude-longitude channels on Legendre-Gauss grid."""
     mu, _ = np.polynomial.legendre.leggauss(int(nlat))
-    mu = mu[::-1].copy()
+    if lat_order == "north_to_south":
+        mu = mu[::-1].copy()
+    elif lat_order == "south_to_north":
+        mu = mu.copy()
+    else:
+        raise ValueError(f"Unsupported lat_order: {lat_order}")
     lat = np.arcsin(mu).astype(np.float32)
-    lon = (np.arange(int(nlon), dtype=np.float32) * (TWO_PI / float(nlon))).astype(np.float32)
+    if lon_origin == "0_to_2pi":
+        lon = (np.arange(int(nlon), dtype=np.float32) * (TWO_PI / float(nlon))).astype(np.float32)
+    elif lon_origin == "minus_pi_to_pi":
+        lon = np.linspace(-np.pi, np.pi, num=int(nlon), endpoint=False, dtype=np.float32)
+    else:
+        raise ValueError(f"Unsupported lon_origin: {lon_origin}")
 
     lat2d = lat[:, None]
     lon2d = lon[None, :]
@@ -229,13 +250,25 @@ def _make_smooth_random_basis(
     seed: int,
     count: int,
     max_k: int,
+    lat_order: str = "north_to_south",
+    lon_origin: str = "0_to_2pi",
 ) -> np.ndarray:
     """Generate smooth random basis maps for IC parameterization."""
     rng = np.random.default_rng(int(seed))
     mu, _ = np.polynomial.legendre.leggauss(int(nlat))
-    mu = mu[::-1].copy()
+    if lat_order == "north_to_south":
+        mu = mu[::-1].copy()
+    elif lat_order == "south_to_north":
+        mu = mu.copy()
+    else:
+        raise ValueError(f"Unsupported lat_order: {lat_order}")
     lat = np.arcsin(mu).astype(np.float32)
-    lon = (np.arange(int(nlon), dtype=np.float32) * (TWO_PI / float(nlon))).astype(np.float32)
+    if lon_origin == "0_to_2pi":
+        lon = (np.arange(int(nlon), dtype=np.float32) * (TWO_PI / float(nlon))).astype(np.float32)
+    elif lon_origin == "minus_pi_to_pi":
+        lon = np.linspace(-np.pi, np.pi, num=int(nlon), endpoint=False, dtype=np.float32)
+    else:
+        raise ValueError(f"Unsupported lon_origin: {lon_origin}")
     lat2d = lat[:, None]
     lon2d = lon[None, :]
 
@@ -268,6 +301,8 @@ class ParamICBasisMLP(nn.Module):
         rand_basis_count: int,
         rand_basis_max_k: int,
         out_tanh: bool,
+        lat_order: str = "north_to_south",
+        lon_origin: str = "0_to_2pi",
     ) -> None:
         super().__init__()
         self.param_dim = int(param_dim)
@@ -277,7 +312,14 @@ class ParamICBasisMLP(nn.Module):
         self.out_tanh = bool(out_tanh)
 
         basis_maps: List[np.ndarray] = []
-        coords = build_coord_channels_legendre_gauss(nlat, nlon, dtype=torch.float32, device=torch.device("cpu")).numpy()
+        coords = build_coord_channels_legendre_gauss(
+            nlat,
+            nlon,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            lat_order=str(lat_order),
+            lon_origin=str(lon_origin),
+        ).numpy()
         sin_lat, cos_lat, sin_lon, cos_lon = coords
 
         for name in [str(x).lower() for x in basis]:
@@ -299,6 +341,8 @@ class ParamICBasisMLP(nn.Module):
                 seed=rand_basis_seed,
                 count=rand_basis_count,
                 max_k=rand_basis_max_k,
+                lat_order=str(lat_order),
+                lon_origin=str(lon_origin),
             )
             for i in range(rnd.shape[0]):
                 basis_maps.append(rnd[i])
@@ -310,10 +354,10 @@ class ParamICBasisMLP(nn.Module):
         self.register_buffer("basis_maps", torch.from_numpy(basis_arr), persistent=False)
         self.nbasis = int(basis_arr.shape[0])
 
-        act_map: Dict[str, nn.Module] = {
-            "relu": nn.ReLU(),
-            "gelu": nn.GELU(),
-            "silu": nn.SiLU(),
+        act_map: Dict[str, type[nn.Module]] = {
+            "relu": nn.ReLU,
+            "gelu": nn.GELU,
+            "silu": nn.SiLU,
         }
         if activation not in act_map:
             raise ValueError(f"Unsupported IC activation: {activation}")
@@ -322,7 +366,7 @@ class ParamICBasisMLP(nn.Module):
         in_dim = int(param_dim)
         for _ in range(max(1, int(num_layers))):
             layers.append(nn.Linear(in_dim, int(hidden_dim)))
-            layers.append(act_map[activation])
+            layers.append(act_map[activation]())
             in_dim = int(hidden_dim)
         layers.append(nn.Linear(in_dim, self.state_chans * self.nbasis))
         self.mlp = nn.Sequential(*layers)
@@ -361,6 +405,8 @@ class ParamRolloutModel(nn.Module):
         nlon: int,
         include_param_maps: bool,
         include_coord_channels: bool,
+        lat_order: str = "north_to_south",
+        lon_origin: str = "0_to_2pi",
     ) -> None:
         super().__init__()
         self.stepper = stepper
@@ -373,7 +419,14 @@ class ParamRolloutModel(nn.Module):
         self.include_coord_channels = bool(include_coord_channels)
 
         if self.include_coord_channels:
-            cc = build_coord_channels_legendre_gauss(nlat, nlon, dtype=torch.float32, device=torch.device("cpu"))
+            cc = build_coord_channels_legendre_gauss(
+                nlat,
+                nlon,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                lat_order=str(lat_order),
+                lon_origin=str(lon_origin),
+            )
             self.register_buffer("coord_channels", cc, persistent=False)
         else:
             self.register_buffer("coord_channels", torch.zeros((0, nlat, nlon), dtype=torch.float32), persistent=False)
@@ -421,6 +474,8 @@ def build_rollout_model(
     state_chans: int,
     param_dim: int,
     cfg_model,
+    lat_order: str = "north_to_south",
+    lon_origin: str = "0_to_2pi",
 ) -> ParamRolloutModel:
     """Construct full conditional rollout model from data shape and config."""
     h, w = int(img_size[0]), int(img_size[1])
@@ -479,6 +534,8 @@ def build_rollout_model(
         rand_basis_count=int(cfg_model.ic.rand_basis_count),
         rand_basis_max_k=int(cfg_model.ic.rand_basis_max_k),
         out_tanh=bool(cfg_model.ic.out_tanh),
+        lat_order=str(lat_order),
+        lon_origin=str(lon_origin),
     )
 
     return ParamRolloutModel(
@@ -490,4 +547,6 @@ def build_rollout_model(
         nlon=w,
         include_param_maps=bool(cfg_model.include_param_maps),
         include_coord_channels=bool(cfg_model.include_coord_channels),
+        lat_order=str(lat_order),
+        lon_origin=str(lon_origin),
     )

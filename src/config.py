@@ -630,6 +630,21 @@ def validate_config(cfg: GCMulatorConfig) -> None:
 
     if cfg.model.scale_factor < 1:
         raise ValueError("model.scale_factor must be >= 1")
+    if cfg.model.grid not in {"legendre-gauss"}:
+        raise ValueError(
+            "model.grid must be 'legendre-gauss' for MY_SWAMP-generated datasets. "
+            f"Got {cfg.model.grid!r}."
+        )
+    if cfg.model.grid_internal not in {"legendre-gauss"}:
+        raise ValueError(
+            "model.grid_internal must be 'legendre-gauss' for this training pipeline. "
+            f"Got {cfg.model.grid_internal!r}."
+        )
+    if cfg.model.grid_internal != cfg.model.grid:
+        raise ValueError(
+            "model.grid_internal must match model.grid in this pipeline "
+            f"(got grid={cfg.model.grid!r}, grid_internal={cfg.model.grid_internal!r})."
+        )
     if cfg.model.embed_dim < 1:
         raise ValueError("model.embed_dim must be >= 1")
     if cfg.model.num_layers < 1:
@@ -671,6 +686,17 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("model.ic.basis cannot be empty when rand_basis_count is 0")
     if cfg.model.residual_init_scale <= 0:
         raise ValueError("model.residual_init_scale must be > 0")
+
+    # Geometry conventions are intentionally locked to match torch_harmonics
+    # legendre-gauss ordering (north->south latitude, [0,2pi) longitude origin).
+    if not cfg.geometry.flip_latitude_to_north_south:
+        raise ValueError(
+            "geometry.flip_latitude_to_north_south must be true for legendre-gauss training."
+        )
+    if not cfg.geometry.roll_longitude_to_0_2pi:
+        raise ValueError(
+            "geometry.roll_longitude_to_0_2pi must be true for legendre-gauss training."
+        )
 
 
 def _validate_parameter_specs(specs: List[ParameterSpec]) -> None:
@@ -716,18 +742,24 @@ def _validate_parameter_specs(specs: List[ParameterSpec]) -> None:
 
         if spec.dist in {"const", "fixed"}:
             if spec.value is None:
+                if spec.name == "K6Phi":
+                    continue
                 raise ValueError(f"{spec.dist} requires value for '{spec.name}'")
             if not _is_finite(spec.value):
                 raise ValueError(f"{spec.dist} value must be finite for '{spec.name}'")
             continue
 
         if spec.dist == "mixture_off_loguniform":
-            if spec.p_off is None or spec.off_value is None or spec.on_min is None or spec.on_max is None:
+            if spec.p_off is None or spec.on_min is None or spec.on_max is None:
                 raise ValueError(f"mixture_off_loguniform requires p_off/off_value/on_min/on_max for '{spec.name}'")
+            if spec.off_value is None and spec.name != "K6Phi":
+                raise ValueError(f"mixture_off_loguniform requires off_value for '{spec.name}'")
             if not (_is_finite(spec.p_off) and PROBABILITY_MIN <= float(spec.p_off) <= PROBABILITY_MAX):
                 raise ValueError(f"mixture_off_loguniform p_off must be in [0,1] for '{spec.name}'")
-            if not (_is_finite(spec.off_value) and _is_finite(spec.on_min) and _is_finite(spec.on_max)):
+            if not (_is_finite(spec.on_min) and _is_finite(spec.on_max)):
                 raise ValueError(f"mixture_off_loguniform values must be finite for '{spec.name}'")
+            if spec.off_value is not None and not _is_finite(spec.off_value):
+                raise ValueError(f"mixture_off_loguniform off_value must be finite for '{spec.name}'")
             if float(spec.on_min) <= 0 or float(spec.on_max) <= 0:
                 raise ValueError(f"mixture_off_loguniform on_min/on_max must be positive for '{spec.name}'")
             if float(spec.on_min) >= float(spec.on_max):

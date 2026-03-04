@@ -44,11 +44,14 @@ def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
 
     if spec.dist in {"const", "fixed"}:
         if spec.value is None:
+            if spec.name == "K6Phi":
+                # K6Phi=null means "inherit K6" at conversion time.
+                return float("nan")
             raise ValueError(f"fixed/const requires value for {spec.name}")
         return float(spec.value)
 
     if spec.dist == "mixture_off_loguniform":
-        if spec.p_off is None or spec.off_value is None or spec.on_min is None or spec.on_max is None:
+        if spec.p_off is None or spec.on_min is None or spec.on_max is None:
             raise ValueError(f"mixture_off_loguniform requires p_off/off_value/on_min/on_max for {spec.name}")
         if float(spec.on_min) <= 0 or float(spec.on_max) <= 0:
             raise ValueError(f"mixture_off_loguniform requires positive on_min/on_max for {spec.name}")
@@ -57,6 +60,10 @@ def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
         if not (PROBABILITY_MIN <= float(spec.p_off) <= PROBABILITY_MAX):
             raise ValueError(f"p_off must be in [0,1] for {spec.name}")
         if float(rng.uniform(PROBABILITY_MIN, PROBABILITY_MAX)) < float(spec.p_off):
+            if spec.off_value is None:
+                if spec.name == "K6Phi":
+                    return float("nan")
+                raise ValueError(f"mixture_off_loguniform requires off_value for {spec.name}")
             return float(spec.off_value)
         lo = math.log10(float(spec.on_min))
         hi = math.log10(float(spec.on_max))
@@ -86,8 +93,8 @@ def to_extended9(sampled: Dict[str, float]) -> Extended9Params:
     if missing:
         raise ValueError(f"Missing Extended-9 sampled parameters: {missing}")
 
-    k6phi_val = float(sampled["K6Phi"])
-    k6phi = None if k6phi_val == 0.0 else k6phi_val
+    k6phi_raw = float(sampled["K6Phi"])
+    k6phi = None if math.isnan(k6phi_raw) else k6phi_raw
 
     return Extended9Params(
         a_m=float(sampled["a_m"]),
