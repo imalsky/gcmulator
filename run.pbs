@@ -39,9 +39,9 @@ if [ "${rc}" -ne 0 ]; then
   exit 2
 fi
 
-# GH200-specific package correction (disable with FIX_H5PY_ARM=0).
+# GH200-specific package correction (enable with FIX_H5PY_ARM=1).
 # Use --no-deps to avoid unintended solver/package drift on strict systems.
-FIX_H5PY_ARM="${FIX_H5PY_ARM:-1}"
+FIX_H5PY_ARM="${FIX_H5PY_ARM:-0}"
 H5PY_SPEC="${H5PY_SPEC:-h5py}"
 if [ "${FIX_H5PY_ARM}" = "1" ]; then
   python -m pip uninstall -y h5py >/dev/null 2>&1 || true
@@ -51,8 +51,7 @@ fi
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
 MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
-REINSTALL_MY_SWAMP="${REINSTALL_MY_SWAMP:-1}"
-MY_SWAMP_PATH="${MY_SWAMP_PATH:-${PROJECT_ROOT}/../MY_SWAMP}"
+MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my_swamp}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -79,14 +78,16 @@ if [ ! -f "${MAIN_PY}" ]; then
   exit 1
 fi
 
-if [ "${REINSTALL_MY_SWAMP}" = "1" ]; then
-  if [ ! -d "${MY_SWAMP_PATH}" ]; then
-    echo "ERROR: MY_SWAMP source path not found: ${MY_SWAMP_PATH}"
-    exit 1
-  fi
-  echo "Reinstalling my_swamp from: ${MY_SWAMP_PATH}"
-  python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
-  python -m pip install --no-deps -e "${MY_SWAMP_PATH}"
+# Always refresh my_swamp from package source in this environment.
+echo "Reinstalling my_swamp package: ${MY_SWAMP_PACKAGE_SPEC}"
+python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
+python -m pip install --no-cache-dir --upgrade --no-deps "${MY_SWAMP_PACKAGE_SPEC}"
+if ! python - <<'PY' >/dev/null 2>&1
+import my_swamp  # noqa: F401
+PY
+then
+  echo "ERROR: my_swamp import failed after package install (${MY_SWAMP_PACKAGE_SPEC})"
+  exit 1
 fi
 
 if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then

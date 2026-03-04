@@ -20,8 +20,7 @@ CONDA_ENV="${CONDA_ENV:-swamp_compare}"
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
 MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
-REINSTALL_MY_SWAMP="${REINSTALL_MY_SWAMP:-1}"
-MY_SWAMP_PATH="${MY_SWAMP_PATH:-$PROJECT_ROOT/../MY_SWAMP}"
+MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my_swamp}"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda not found on PATH."
@@ -55,14 +54,16 @@ if [ ! -f "$MAIN_PY" ]; then
   exit 1
 fi
 
-if [ "$REINSTALL_MY_SWAMP" = "1" ]; then
-  if [ ! -d "$MY_SWAMP_PATH" ]; then
-    echo "ERROR: MY_SWAMP source path not found: $MY_SWAMP_PATH"
-    exit 1
-  fi
-  echo "Reinstalling my_swamp from: $MY_SWAMP_PATH"
-  python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
-  python -m pip install --no-deps -e "$MY_SWAMP_PATH"
+# Always refresh my_swamp from package source.
+echo "Reinstalling my_swamp package: ${MY_SWAMP_PACKAGE_SPEC}"
+python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
+python -m pip install --no-cache-dir --upgrade --no-deps "${MY_SWAMP_PACKAGE_SPEC}"
+if ! python - <<'PY' >/dev/null 2>&1
+import my_swamp  # noqa: F401
+PY
+then
+  echo "ERROR: my_swamp import failed after package install (${MY_SWAMP_PACKAGE_SPEC})"
+  exit 1
 fi
 
 if [ "$RUN_GEN_IF_MISSING" = "1" ]; then
