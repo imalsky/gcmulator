@@ -57,6 +57,8 @@ MY_SWAMP_INSTALL_LOG="${MY_SWAMP_INSTALL_LOG:-${PROJECT_ROOT}/my_swamp_install.l
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
 MY_SWAMP_INSTALL_NO_DEPS="${MY_SWAMP_INSTALL_NO_DEPS:-0}"
 MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax[cuda13]}"
+JAX_FORCE_REINSTALL="${JAX_FORCE_REINSTALL:-1}"
+JAX_PIP_ARGS="${JAX_PIP_ARGS:---find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html --extra-index-url https://pypi.org/simple/}"
 REQUIRE_TORCH_CUDA="${REQUIRE_TORCH_CUDA:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
@@ -64,6 +66,7 @@ GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
 GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
 read -r -a MY_SWAMP_EXTRA_PACKAGES_ARR <<< "${MY_SWAMP_EXTRA_PACKAGES}"
+read -r -a JAX_PIP_ARGS_ARR <<< "${JAX_PIP_ARGS}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -116,6 +119,9 @@ PY
   fi
   echo "  MY_SWAMP_INSTALL_NO_DEPS: ${MY_SWAMP_INSTALL_NO_DEPS}"
   echo "  MY_SWAMP_EXTRA_PACKAGES : ${MY_SWAMP_EXTRA_PACKAGES:-<none>}"
+  echo "  JAX_FORCE_REINSTALL     : ${JAX_FORCE_REINSTALL}"
+  echo "  JAX_PIP_ARGS            : ${JAX_PIP_ARGS}"
+  echo "  LD_LIBRARY_PATH         : ${LD_LIBRARY_PATH:-<unset>}"
   python - <<'PY'
 import importlib.util
 print(f"  jax currently importable: {importlib.util.find_spec('jax') is not None}")
@@ -144,15 +150,48 @@ if ! python -m pip install "${INSTALL_ARGS[@]}" "${INSTALLED_SPEC}" >> "${MY_SWA
 fi
 
 if [ "${#MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" -gt 0 ] && [ -n "${MY_SWAMP_EXTRA_PACKAGES_ARR[0]}" ]; then
+  if [ "${JAX_FORCE_REINSTALL}" = "1" ]; then
+    echo "Removing existing JAX stack before reinstall"
+    echo "== Uninstall JAX stack ==" >> "${MY_SWAMP_INSTALL_LOG}"
+    python -m pip uninstall -y \
+      jax \
+      jaxlib \
+      jax-cuda13-plugin \
+      jax-cuda13-pjrt \
+      jax-cuda12-plugin \
+      jax-cuda12-pjrt >> "${MY_SWAMP_INSTALL_LOG}" 2>&1 || true
+  fi
+
   echo "Installing explicit runtime dependencies: ${MY_SWAMP_EXTRA_PACKAGES_ARR[*]}"
   echo "== Extra packages: ${MY_SWAMP_EXTRA_PACKAGES_ARR[*]} ==" >> "${MY_SWAMP_INSTALL_LOG}"
-  if ! python -m pip install --no-cache-dir --upgrade "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
+  if ! python -m pip install --no-cache-dir --upgrade "${JAX_PIP_ARGS_ARR[@]}" "${MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
     echo "ERROR: failed installing MY_SWAMP_EXTRA_PACKAGES (${MY_SWAMP_EXTRA_PACKAGES_ARR[*]})"
+    echo "Hint: adjust JAX_PIP_ARGS for your cluster package mirror/index policy."
     echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
     tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
     exit 1
   fi
 fi
+
+echo "Installed JAX package summary:"
+python -m pip show jax jaxlib jax-cuda13-plugin jax-cuda13-pjrt 2>/dev/null || true
+python - <<'PY'
+import importlib
+import importlib.util
+
+mods = ["jax", "jaxlib", "jax_cuda13_plugin", "jax_cuda13_pjrt"]
+for name in mods:
+    spec = importlib.util.find_spec(name)
+    print(f"module {name}: {'FOUND' if spec is not None else 'MISSING'}")
+    if spec is not None:
+        print(f"  origin={spec.origin}")
+
+try:
+    import jaxlib
+    print(f"jaxlib version: {getattr(jaxlib, '__version__', '<unknown>')}")
+except Exception as exc:
+    print(f"jaxlib import error: {exc!r}")
+PY
 
 if ! python - <<'PY'
 import my_swamp
