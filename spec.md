@@ -59,17 +59,22 @@ Fixed canonical parameter ordering is:
   - `--train`
 - Loads config path (`--config` or default `config.json`).
 - Enforces no-TPU JAX policy before any runtime work.
+- Applies generation-safe JAX defaults unless user-overridden:
+  - `SWAMPE_JAX_ENABLE_X64=0`
+  - `XLA_PYTHON_CLIENT_PREALLOCATE=false`
 
 ### 4.2 Dataset Generation (`src/data_generation.py`)
 1. Ensure MY_SWAMP can be imported.
 2. Resolve output dataset directory.
 3. Sample `n_sims` parameter sets from config distributions.
-4. For each simulation:
-   - run MY_SWAMP to terminal time,
-   - stack 5 fields,
-   - apply geometry conventions,
-   - write `sim_XXXXXX.npz`.
-5. Write `manifest.json` with run metadata.
+4. Run MY_SWAMP terminal solves either:
+   - scalar (`GCMULATOR_JAX_SIM_BATCH=1`, default), or
+   - batched via JAX `vmap` (`GCMULATOR_JAX_SIM_BATCH>1`, only when `generation_workers==1`).
+5. Each solve uses terminal-only MY_SWAMP integration with:
+   - `jit_scan=True`
+   - `donate_state=True`
+6. Stack 5 fields, apply geometry conventions, and write `sim_XXXXXX.npz`.
+7. Write `manifest.json` with run metadata.
 
 ### 4.3 Preprocessing (`src/training.py`, `preprocess_dataset`)
 1. Read raw `sim_*.npz`.
@@ -198,6 +203,11 @@ Contains:
 
 ### 9.2 Raw Manifest (`manifest.json`)
 Contains run metadata, solver settings, sampling settings, and item list.
+Sampling metadata includes:
+- `generation_workers_requested`
+- `generation_workers_used`
+- `jax_backend`
+- `jax_sim_batch_size`
 
 ### 9.3 Processed File (`*_train.npz` / `*_val.npz`)
 Contains:
@@ -260,6 +270,10 @@ Import strategy:
 - Optionally runs generation only when raw sims are missing (`RUN_GEN_IF_MISSING=1`).
 - Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
 - Reinstalls only `my_swamp` with `--no-deps` so existing environment package versions remain unchanged.
+- Exposes generation/runtime defaults via environment:
+  - `SWAMPE_JAX_ENABLE_X64` (default `0`)
+  - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
+  - `GCMULATOR_JAX_SIM_BATCH` (default `1`)
 - Runs training.
 
 ### 11.3 PBS Convenience Script (`run.pbs`)
@@ -268,6 +282,10 @@ Import strategy:
 - Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
 - Reinstalls only `my_swamp` with `--no-deps` so existing environment package versions remain unchanged.
 - Enforces runtime GPU preflight by default (`REQUIRE_TORCH_CUDA=1`, `REQUIRE_JAX_GPU=1`) and records periodic `nvidia-smi` samples (`ENABLE_GPU_MONITOR=1`).
+- Exposes generation/runtime defaults via environment:
+  - `SWAMPE_JAX_ENABLE_X64` (default `0`)
+  - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
+  - `GCMULATOR_JAX_SIM_BATCH` (default `1`)
 - Uses generation/training flow control `RUN_GEN_IF_MISSING` consistent with `run.sh`.
 
 ### 11.4 SWAMPE Parity Check
@@ -287,7 +305,7 @@ Import strategy:
 1. Processed data is always rebuilt from raw simulations; no cache validation path is used.
 2. All training samples in a batch must share the same `time_days`; mixed values in one batch are rejected.
 3. Validation split is file-level random split, not stratified.
-4. Generation and preprocessing rely on fixed field/parameter ordering contracts across files.
+4. Batched generation (`GCMULATOR_JAX_SIM_BATCH>1`) is currently only applied in single-worker generation mode (`generation_workers==1`).
 5. Post-training scripts are globals-only by design.
 6. Post-training prediction figure is intentionally `Phi`-only and uses the max-`time_days` sample in the chosen split (unless a specific sample is forced).
 7. Any normalization change (for example switching `Phi` from `log10` to `signed_log1p` or changing z-score epsilons) requires retraining artifacts from preprocessing onward; old checkpoints/processed files are not cross-compatible for scientific comparison.

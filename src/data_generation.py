@@ -21,6 +21,7 @@ from .my_swamp_backend import (
     param_names_extended9,
     params_to_json_dict,
     params_to_ordered_vector,
+    run_terminal_state_batch,
     run_terminal_state,
 )
 from .sampling import EXTENDED9_PARAM_NAMES, sample_parameter_dict, to_extended9
@@ -50,23 +51,28 @@ def _resolve_generation_workers(*, requested_workers: int, n_sims: int, jax_back
     return 1
 
 
-def _write_one_sim(
+def _resolve_sim_batch_size(*, n_sims: int) -> int:
+    """Resolve per-call JAX batch size for independent terminal simulations."""
+    raw = os.environ.get("GCMULATOR_JAX_SIM_BATCH", "1").strip()
+    try:
+        batch = int(raw)
+    except Exception as exc:
+        raise ValueError(f"GCMULATOR_JAX_SIM_BATCH must be an integer >= 1, got {raw!r}") from exc
+    if batch < 1:
+        raise ValueError(f"GCMULATOR_JAX_SIM_BATCH must be >= 1, got {batch}")
+    return min(batch, int(n_sims))
+
+
+def _write_sim_record(
     *,
     sim_idx: int,
     params: Extended9Params,
+    state: Any,
     cfg: GCMulatorConfig,
     dataset_dir: Path,
     param_names: List[str],
 ) -> Dict[str, Any]:
-    """Run one simulation and write one ``sim_XXXXXX.npz`` output file."""
-    state = run_terminal_state(
-        params,
-        M=cfg.solver.M,
-        dt_seconds=cfg.solver.dt_seconds,
-        time_days=cfg.solver.default_time_days,
-        starttime_index=cfg.solver.starttime_index,
-    )
-
+    """Write one terminal state into a ``sim_XXXXXX.npz`` file and metadata record."""
     state_chw = state.as_stacked().astype(np.float32, copy=False)
     state_chw, geom_info = apply_geometry_state(
         state_chw,
@@ -112,6 +118,32 @@ def _write_one_sim(
     }
 
 
+def _write_one_sim(
+    *,
+    sim_idx: int,
+    params: Extended9Params,
+    cfg: GCMulatorConfig,
+    dataset_dir: Path,
+    param_names: List[str],
+) -> Dict[str, Any]:
+    """Run one simulation and write one ``sim_XXXXXX.npz`` output file."""
+    state = run_terminal_state(
+        params,
+        M=cfg.solver.M,
+        dt_seconds=cfg.solver.dt_seconds,
+        time_days=cfg.solver.default_time_days,
+        starttime_index=cfg.solver.starttime_index,
+    )
+    return _write_sim_record(
+        sim_idx=sim_idx,
+        params=params,
+        state=state,
+        cfg=cfg,
+        dataset_dir=dataset_dir,
+        param_names=param_names,
+    )
+
+
 def _log_progress(*, completed: int, total: int, start_t: float) -> None:
     """Log elapsed runtime and ETA for dataset generation."""
     elapsed = time.time() - start_t
@@ -153,12 +185,14 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         n_sims=n_sims,
         jax_backend=jax_backend,
     )
+    sim_batch_size = _resolve_sim_batch_size(n_sims=n_sims)
     compress_raw = os.environ.get("GCMULATOR_COMPRESS_RAW", "0") == "1"
     LOGGER.info(
-        "Dataset generation backend=%s | generation_workers=%d (requested=%d) | raw_compression=%s",
+        "Dataset generation backend=%s | generation_workers=%d (requested=%d) | sim_batch_size=%d | raw_compression=%s",
         jax_backend,
         generation_workers,
         int(cfg.sampling.generation_workers),
+        sim_batch_size,
         "on" if compress_raw else "off",
     )
     if jax_backend.lower() in GPU_BACKENDS and generation_workers > 1:
@@ -180,17 +214,62 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
     completed = 0
 
     if generation_workers == 1:
-        for sim_idx, params in enumerate(sampled_params):
-            written_by_idx[sim_idx] = _write_one_sim(
-                sim_idx=sim_idx,
-                params=params,
-                cfg=cfg,
-                dataset_dir=dataset_dir,
-                param_names=param_names,
-            )
-            completed += 1
-            if (completed % log_every) == 0 or completed == n_sims:
-                _log_progress(completed=completed, total=n_sims, start_t=start_t)
+        if sim_batch_size == 1:
+            for sim_idx, params in enumerate(sampled_params):
+                written_by_idx[sim_idx] = _write_one_sim(
+                    sim_idx=sim_idx,
+                    params=params,
+                    cfg=cfg,
+                    dataset_dir=dataset_dir,
+                    param_names=param_names,
+                )
+                completed += 1
+                if (completed % log_every) == 0 or completed == n_sims:
+                    _log_progress(completed=completed, total=n_sims, start_t=start_t)
+        else:
+            full_batches = n_sims // sim_batch_size
+            for batch_idx in range(full_batches):
+                i0 = batch_idx * sim_batch_size
+                i1 = i0 + sim_batch_size
+                params_batch = sampled_params[i0:i1]
+                states = run_terminal_state_batch(
+                    params_batch,
+                    M=cfg.solver.M,
+                    dt_seconds=cfg.solver.dt_seconds,
+                    time_days=cfg.solver.default_time_days,
+                    starttime_index=cfg.solver.starttime_index,
+                )
+                if len(states) != len(params_batch):
+                    raise RuntimeError(
+                        f"Batched run returned {len(states)} states for {len(params_batch)} params."
+                    )
+                for offset, (params, state) in enumerate(zip(params_batch, states)):
+                    sim_idx = i0 + offset
+                    written_by_idx[sim_idx] = _write_sim_record(
+                        sim_idx=sim_idx,
+                        params=params,
+                        state=state,
+                        cfg=cfg,
+                        dataset_dir=dataset_dir,
+                        param_names=param_names,
+                    )
+                    completed += 1
+                    if (completed % log_every) == 0 or completed == n_sims:
+                        _log_progress(completed=completed, total=n_sims, start_t=start_t)
+
+            remainder_start = full_batches * sim_batch_size
+            for sim_idx in range(remainder_start, n_sims):
+                params = sampled_params[sim_idx]
+                written_by_idx[sim_idx] = _write_one_sim(
+                    sim_idx=sim_idx,
+                    params=params,
+                    cfg=cfg,
+                    dataset_dir=dataset_dir,
+                    param_names=param_names,
+                )
+                completed += 1
+                if (completed % log_every) == 0 or completed == n_sims:
+                    _log_progress(completed=completed, total=n_sims, start_t=start_t)
     else:
         # Warm-up one simulation before threading so JAX can compile once first.
         written_by_idx[0] = _write_one_sim(
@@ -247,6 +326,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             "jax_backend": str(jax_backend),
             "parameter_names_config": [x.name for x in cfg.sampling.parameters],
             "extended9_param_names": list(EXTENDED9_PARAM_NAMES),
+            "jax_sim_batch_size": int(sim_batch_size),
         },
         "items": written,
     }

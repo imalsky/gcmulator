@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -131,6 +132,7 @@ def run_terminal_state(
         diagnostics=False,
         starttime=int(starttime_index),
         jit_scan=True,
+        donate_state=True,
     )
 
     ls = out["last_state"]
@@ -142,6 +144,111 @@ def run_terminal_state(
         delta=np.asarray(ls.delta_curr, dtype=np.float32),
     )
     return state
+
+
+@lru_cache(maxsize=None)
+def _get_batched_terminal_runner(
+    *,
+    M: int,
+    dt_seconds: float,
+    tmax: int,
+    starttime_index: int,
+):
+    """Build and cache a vmapped terminal-state runner for fixed solver settings."""
+    import jax
+    import jax.numpy as jnp
+    from my_swamp.model import run_model_scan_final
+
+    def _one(theta: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        out = run_model_scan_final(
+            M=int(M),
+            dt=float(dt_seconds),
+            tmax=int(tmax),
+            Phibar=theta[2],
+            omega=theta[1],
+            a=theta[0],
+            test=None,
+            g=theta[6],
+            forcflag=True,
+            taurad=theta[4],
+            taudrag=theta[5],
+            DPhieq=theta[3],
+            diffflag=True,
+            modalflag=True,
+            expflag=False,
+            K6=theta[7],
+            K6Phi=theta[8],
+            diagnostics=False,
+            starttime=int(starttime_index),
+            jit_scan=True,
+            donate_state=True,
+        )
+        ls = out["last_state"]
+        return ls.Phi_curr, ls.U_curr, ls.V_curr, ls.eta_curr, ls.delta_curr
+
+    return jax.vmap(_one, in_axes=0, out_axes=0)
+
+
+def run_terminal_state_batch(
+    params_batch: List[Extended9Params],
+    *,
+    M: int,
+    dt_seconds: float,
+    time_days: float,
+    starttime_index: int,
+) -> List[TerminalState]:
+    """Run MY_SWAMP for a batch of independent parameter sets using JAX vmap."""
+    if not params_batch:
+        return []
+    if time_days <= 0:
+        raise ValueError("time_days must be > 0")
+    if dt_seconds <= 0:
+        raise ValueError("dt_seconds must be > 0")
+
+    n_steps = int(round(float(time_days) * SECONDS_PER_DAY / float(dt_seconds)))
+    n_steps = max(MIN_ROLLOUT_STEPS, n_steps)
+    tmax = int(starttime_index + n_steps)
+
+    # [a, omega, Phibar, DPhieq, taurad, taudrag, g, K6, K6Phi_eff]
+    # For compatibility with scalar path semantics, map K6Phi=None -> K6.
+    theta_rows: List[List[float]] = []
+    for p in params_batch:
+        k6phi_eff = float(p.K6) if p.K6Phi is None else float(p.K6Phi)
+        theta_rows.append(
+            [
+                float(p.a_m),
+                float(p.omega_rad_s),
+                float(p.Phibar),
+                float(p.DPhieq),
+                float(p.taurad_s),
+                float(p.taudrag_s),
+                float(p.g_m_s2),
+                float(p.K6),
+                k6phi_eff,
+            ]
+        )
+    theta = np.asarray(theta_rows, dtype=np.float32)
+
+    runner = _get_batched_terminal_runner(
+        M=int(M),
+        dt_seconds=float(dt_seconds),
+        tmax=int(tmax),
+        starttime_index=int(starttime_index),
+    )
+
+    phi_b, u_b, v_b, eta_b, delta_b = runner(theta)
+    states = []
+    for i in range(len(params_batch)):
+        states.append(
+            TerminalState(
+                phi=np.asarray(phi_b[i], dtype=np.float32),
+                u=np.asarray(u_b[i], dtype=np.float32),
+                v=np.asarray(v_b[i], dtype=np.float32),
+                eta=np.asarray(eta_b[i], dtype=np.float32),
+                delta=np.asarray(delta_b[i], dtype=np.float32),
+            )
+        )
+    return states
 
 
 def param_names_extended9() -> Tuple[str, ...]:
