@@ -25,6 +25,7 @@ MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple
 TORCH_HARMONICS_PACKAGE_SPEC="${TORCH_HARMONICS_PACKAGE_SPEC:-git+https://github.com/NVIDIA/torch-harmonics.git}"
 TORCH_HARMONICS_PIP_ARGS="${TORCH_HARMONICS_PIP_ARGS:---no-deps --no-build-isolation}"
 TORCH_HARMONICS_FORCE_CPU_BUILD="${TORCH_HARMONICS_FORCE_CPU_BUILD:-1}"
+TORCH_HARMONICS_FORCE_REINSTALL="${TORCH_HARMONICS_FORCE_REINSTALL:-0}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
 read -r -a TORCH_HARMONICS_PIP_ARGS_ARR <<< "${TORCH_HARMONICS_PIP_ARGS}"
 
@@ -76,24 +77,31 @@ then
   exit 1
 fi
 
-if [[ "${TORCH_HARMONICS_PACKAGE_SPEC}" == git+* ]] && ! command -v git >/dev/null 2>&1; then
-  echo "ERROR: git is required to install TORCH_HARMONICS_PACKAGE_SPEC='${TORCH_HARMONICS_PACKAGE_SPEC}'."
-  exit 1
-fi
-echo "Reinstalling torch_harmonics package: ${TORCH_HARMONICS_PACKAGE_SPEC}"
-python -m pip uninstall -y torch_harmonics torch-harmonics >/dev/null 2>&1 || true
-if [ "${TORCH_HARMONICS_FORCE_CPU_BUILD}" = "1" ]; then
-  TH_INSTALL_PREFIX=(env CUDA_VISIBLE_DEVICES= FORCE_CUDA_EXTENSION=0)
-else
-  TH_INSTALL_PREFIX=()
-fi
-"${TH_INSTALL_PREFIX[@]}" python -m pip install --upgrade "${TORCH_HARMONICS_PIP_ARGS_ARR[@]}" "${TORCH_HARMONICS_PACKAGE_SPEC}"
-if ! python - <<'PY' >/dev/null 2>&1
+if [ "${TORCH_HARMONICS_FORCE_REINSTALL}" != "1" ] && python - <<'PY' >/dev/null 2>&1
 import torch_harmonics  # noqa: F401
 PY
 then
-  echo "ERROR: torch_harmonics import failed after package install (${TORCH_HARMONICS_PACKAGE_SPEC})"
-  exit 1
+  echo "Using existing torch_harmonics install; skipping reinstall."
+else
+  if [[ "${TORCH_HARMONICS_PACKAGE_SPEC}" == git+* ]] && ! command -v git >/dev/null 2>&1; then
+    echo "ERROR: git is required to install TORCH_HARMONICS_PACKAGE_SPEC='${TORCH_HARMONICS_PACKAGE_SPEC}'."
+    exit 1
+  fi
+  echo "Reinstalling torch_harmonics package: ${TORCH_HARMONICS_PACKAGE_SPEC}"
+  python -m pip uninstall -y torch_harmonics torch-harmonics >/dev/null 2>&1 || true
+  if [ "${TORCH_HARMONICS_FORCE_CPU_BUILD}" = "1" ]; then
+    TH_INSTALL_PREFIX=(env CUDA_VISIBLE_DEVICES= FORCE_CUDA_EXTENSION=0)
+  else
+    TH_INSTALL_PREFIX=()
+  fi
+  "${TH_INSTALL_PREFIX[@]}" python -m pip install --upgrade "${TORCH_HARMONICS_PIP_ARGS_ARR[@]}" "${TORCH_HARMONICS_PACKAGE_SPEC}"
+  if ! python - <<'PY' >/dev/null 2>&1
+import torch_harmonics  # noqa: F401
+PY
+  then
+    echo "ERROR: torch_harmonics import failed after package install (${TORCH_HARMONICS_PACKAGE_SPEC})"
+    exit 1
+  fi
 fi
 
 if [ "$RUN_GEN_IF_MISSING" = "1" ]; then

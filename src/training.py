@@ -795,11 +795,6 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         torch.cuda.manual_seed_all(cfg.training.seed)
 
     if preload_to_gpu:
-        if int(cfg.training.num_workers) != 0:
-            LOGGER.warning(
-                "training.preload_to_gpu=true uses in-process loading only; overriding num_workers=%d -> 0.",
-                int(cfg.training.num_workers),
-            )
         loader_common: Dict[str, Any] = {
             "num_workers": 0,
             "pin_memory": False,
