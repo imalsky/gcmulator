@@ -468,22 +468,31 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.training.seed)
 
+    loader_common: Dict[str, Any] = {
+        "num_workers": cfg.training.num_workers,
+        "pin_memory": cfg.training.pin_memory,
+    }
+    if int(cfg.training.num_workers) > 0:
+        # Keep workers alive across epochs and prefetch small batches to reduce loader stalls.
+        loader_common["persistent_workers"] = True
+        loader_common["prefetch_factor"] = 2
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.training.batch_size,
         shuffle=cfg.training.shuffle,
-        num_workers=cfg.training.num_workers,
-        pin_memory=cfg.training.pin_memory,
+        **loader_common,
         drop_last=True,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=cfg.training.num_workers,
-        pin_memory=cfg.training.pin_memory,
+        **loader_common,
         drop_last=False,
     )
+
+    use_non_blocking = bool(cfg.training.pin_memory) and device.type == "cuda"
 
     sample_params, sample_state, _sample_time = train_ds[0]
     state_chans = int(sample_state.shape[0])
@@ -542,8 +551,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         train_count = 0
 
         for pb, yb, tb in train_loader:
-            pb = pb.to(device=device)
-            yb = yb.to(device=device)
+            pb = pb.to(device=device, non_blocking=use_non_blocking)
+            yb = yb.to(device=device, non_blocking=use_non_blocking)
             _check_finite_tensor(pb, name="train params batch")
             _check_finite_tensor(yb, name="train target batch")
             steps = _batch_steps(
@@ -594,8 +603,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         val_count = 0
         with torch.no_grad():
             for pb, yb, tb in val_loader:
-                pb = pb.to(device=device)
-                yb = yb.to(device=device)
+                pb = pb.to(device=device, non_blocking=use_non_blocking)
+                yb = yb.to(device=device, non_blocking=use_non_blocking)
                 steps = _batch_steps(
                     tb,
                     default_time_days=cfg.solver.default_time_days,

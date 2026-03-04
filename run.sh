@@ -22,10 +22,7 @@ MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
-# Match my_swamp's JAX 0.6.x dependency family (cuda12 extra is the GPU-enabled path).
-MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax[cuda12]}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
-read -r -a MY_SWAMP_EXTRA_PACKAGES_ARR <<< "${MY_SWAMP_EXTRA_PACKAGES}"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda not found on PATH."
@@ -37,6 +34,9 @@ conda activate "$CONDA_ENV"
 
 export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT:${PYTHONPATH:-}"
 export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
+# Raw sim files default to uncompressed .npz during generation for higher throughput.
+export GCMULATOR_COMPRESS_RAW="${GCMULATOR_COMPRESS_RAW:-0}"
+export PIP_DISABLE_PIP_VERSION_CHECK=1
 
 if [ -n "${SLURM_JOB_ID:-}" ]; then
   echo "SLURM_JOB_ID: ${SLURM_JOB_ID}"
@@ -62,11 +62,7 @@ fi
 # Always refresh my_swamp from package source.
 echo "Reinstalling my_swamp package: ${MY_SWAMP_PACKAGE_SPEC}"
 python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
-python -m pip install --no-cache-dir --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_PACKAGE_SPEC}"
-if [ "${#MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" -gt 0 ] && [ -n "${MY_SWAMP_EXTRA_PACKAGES_ARR[0]}" ]; then
-  echo "Installing explicit runtime dependencies: ${MY_SWAMP_EXTRA_PACKAGES_ARR[*]}"
-  python -m pip install --no-cache-dir --upgrade "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_EXTRA_PACKAGES_ARR[@]}"
-fi
+python -m pip install --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_PACKAGE_SPEC}"
 if ! python - <<'PY' >/dev/null 2>&1
 import my_swamp  # noqa: F401
 PY

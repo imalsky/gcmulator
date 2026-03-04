@@ -45,7 +45,8 @@ def _resolve_generation_workers(*, requested_workers: int, n_sims: int, jax_back
     if requested_workers > 0:
         return min(int(requested_workers), int(n_sims))
     if jax_backend.lower() in GPU_BACKENDS:
-        return min(int(n_sims), 4)
+        # For one GPU, single simulation worker is usually fastest and most stable.
+        return 1
     return 1
 
 
@@ -74,21 +75,25 @@ def _write_one_sim(
     )
 
     sim_file = dataset_dir / f"sim_{sim_idx:06d}.npz"
-    np.savez_compressed(
-        sim_file,
-        state_final=state_chw,
-        fields=np.asarray(FIELDS_5, dtype=object),
-        params=params_to_ordered_vector(params),
-        param_names=np.asarray(param_names, dtype=object),
-        time_days=np.asarray(float(cfg.solver.default_time_days), dtype=np.float64),
-        dt_seconds=np.asarray(float(cfg.solver.dt_seconds), dtype=np.float64),
-        M=np.asarray(int(cfg.solver.M), dtype=np.int64),
-        nlat=np.asarray(int(state_chw.shape[-2]), dtype=np.int64),
-        nlon=np.asarray(int(state_chw.shape[-1]), dtype=np.int64),
-        lat_order=np.asarray(geom_info["lat_order"], dtype=object),
-        lon_origin=np.asarray(geom_info["lon_origin"], dtype=object),
-        lon_shift=np.asarray(int(geom_info["lon_shift"]), dtype=np.int64),
-    )
+    payload = {
+        "state_final": state_chw,
+        "fields": np.asarray(FIELDS_5, dtype=object),
+        "params": params_to_ordered_vector(params),
+        "param_names": np.asarray(param_names, dtype=object),
+        "time_days": np.asarray(float(cfg.solver.default_time_days), dtype=np.float64),
+        "dt_seconds": np.asarray(float(cfg.solver.dt_seconds), dtype=np.float64),
+        "M": np.asarray(int(cfg.solver.M), dtype=np.int64),
+        "nlat": np.asarray(int(state_chw.shape[-2]), dtype=np.int64),
+        "nlon": np.asarray(int(state_chw.shape[-1]), dtype=np.int64),
+        "lat_order": np.asarray(geom_info["lat_order"], dtype=object),
+        "lon_origin": np.asarray(geom_info["lon_origin"], dtype=object),
+        "lon_shift": np.asarray(int(geom_info["lon_shift"]), dtype=np.int64),
+    }
+    compress_raw = os.environ.get("GCMULATOR_COMPRESS_RAW", "0") == "1"
+    if compress_raw:
+        np.savez_compressed(sim_file, **payload)
+    else:
+        np.savez(sim_file, **payload)
 
     return {
         "sim_idx": int(sim_idx),
@@ -148,12 +153,20 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         n_sims=n_sims,
         jax_backend=jax_backend,
     )
+    compress_raw = os.environ.get("GCMULATOR_COMPRESS_RAW", "0") == "1"
     LOGGER.info(
-        "Dataset generation backend=%s | generation_workers=%d (requested=%d)",
+        "Dataset generation backend=%s | generation_workers=%d (requested=%d) | raw_compression=%s",
         jax_backend,
         generation_workers,
         int(cfg.sampling.generation_workers),
+        "on" if compress_raw else "off",
     )
+    if jax_backend.lower() in GPU_BACKENDS and generation_workers > 1:
+        LOGGER.warning(
+            "generation_workers=%d on a single GPU may reduce throughput due to contention. "
+            "Consider generation_workers=1.",
+            generation_workers,
+        )
     require_jax_gpu = os.environ.get("GCMULATOR_REQUIRE_JAX_GPU", "0") == "1"
     if require_jax_gpu and jax_backend.lower() not in GPU_BACKENDS:
         raise RuntimeError(

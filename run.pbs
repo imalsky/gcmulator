@@ -9,11 +9,9 @@
 
 set -euo pipefail
 
-# PBS equivalent of SLURM_SUBMIT_DIR.
 PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 cd -P "${PROJECT_ROOT}"
 
-# ---- Conda / module stack for this supercomputer ----
 module purge
 module use -a /swbuild/analytix/tools/modulefiles
 module load miniconda3/gh2
@@ -34,57 +32,35 @@ rc=$?
 set -e
 if [ "${rc}" -ne 0 ]; then
   echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
-  echo "Available envs are:"
   conda info --envs || true
   exit 2
-fi
-
-# GH200-specific package correction (enable with FIX_H5PY_ARM=1).
-# Use --no-deps to avoid unintended solver/package drift on strict systems.
-FIX_H5PY_ARM="${FIX_H5PY_ARM:-0}"
-H5PY_SPEC="${H5PY_SPEC:-h5py}"
-if [ "${FIX_H5PY_ARM}" = "1" ]; then
-  python -m pip uninstall -y h5py >/dev/null 2>&1 || true
-  python -m pip install --no-cache-dir --no-deps "${H5PY_SPEC}"
 fi
 
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
 MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
-DEBUG_MY_SWAMP_INSTALL="${DEBUG_MY_SWAMP_INSTALL:-1}"
 MY_SWAMP_INSTALL_LOG="${MY_SWAMP_INSTALL_LOG:-${PROJECT_ROOT}/my_swamp_install.log}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
-MY_SWAMP_INSTALL_NO_DEPS="${MY_SWAMP_INSTALL_NO_DEPS:-0}"
-# my_swamp currently resolves JAX 0.6.x where CUDA wheels are exposed via cuda12 extras.
-MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax[cuda12]}"
-JAX_FORCE_REINSTALL="${JAX_FORCE_REINSTALL:-1}"
-JAX_PIP_ARGS="${JAX_PIP_ARGS:---index-url https://pypi.org/simple/}"
-JAX_EXPECTED_PLUGIN_MODULE="${JAX_EXPECTED_PLUGIN_MODULE:-jax_cuda12_plugin}"
 REQUIRE_TORCH_CUDA="${REQUIRE_TORCH_CUDA:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
 GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
 GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
-read -r -a MY_SWAMP_EXTRA_PACKAGES_ARR <<< "${MY_SWAMP_EXTRA_PACKAGES}"
-read -r -a JAX_PIP_ARGS_ARR <<< "${JAX_PIP_ARGS}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
+export GCMULATOR_COMPRESS_RAW="${GCMULATOR_COMPRESS_RAW:-0}"
 export REQUIRE_TORCH_CUDA
 export REQUIRE_JAX_GPU
 export GCMULATOR_REQUIRE_JAX_GPU="${GCMULATOR_REQUIRE_JAX_GPU:-${REQUIRE_JAX_GPU}}"
-export JAX_EXPECTED_PLUGIN_MODULE
+export PIP_DISABLE_PIP_VERSION_CHECK=1
 
 if [ -n "${PBS_JOBID:-}" ]; then
   echo "PBS_JOBID: ${PBS_JOBID}"
-  if ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo "ERROR: nvidia-smi not found; cannot verify GPU allocation."
-    exit 1
-  fi
-  if ! nvidia-smi >/dev/null 2>&1; then
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
     echo "ERROR: No visible NVIDIA GPU in this PBS job."
     exit 1
   fi
@@ -99,133 +75,13 @@ if [ ! -f "${MAIN_PY}" ]; then
   exit 1
 fi
 
-# Always refresh my_swamp from package source in this environment.
-if [ "${DEBUG_MY_SWAMP_INSTALL}" = "1" ]; then
-  echo "my_swamp install debug:"
-  echo "  python executable: $(command -v python)"
-  echo "  pip module path  : $(python - <<'PY'
-import pip
-print(pip.__file__)
-PY
-)"
-  echo "  python version   : $(python --version 2>&1)"
-  echo "  pip version      : $(python -m pip --version 2>&1)"
-  if [ -n "${PIP_INDEX_URL:-}" ]; then
-    echo "  PIP_INDEX_URL    : set"
-  else
-    echo "  PIP_INDEX_URL    : unset"
-  fi
-  if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then
-    echo "  PIP_EXTRA_INDEX_URL: set"
-  else
-    echo "  PIP_EXTRA_INDEX_URL: unset"
-  fi
-  echo "  MY_SWAMP_INSTALL_NO_DEPS: ${MY_SWAMP_INSTALL_NO_DEPS}"
-  echo "  MY_SWAMP_EXTRA_PACKAGES : ${MY_SWAMP_EXTRA_PACKAGES:-<none>}"
-  echo "  JAX_FORCE_REINSTALL     : ${JAX_FORCE_REINSTALL}"
-  echo "  JAX_PIP_ARGS            : ${JAX_PIP_ARGS}"
-  echo "  JAX_EXPECTED_PLUGIN_MODULE: ${JAX_EXPECTED_PLUGIN_MODULE}"
-  echo "  LD_LIBRARY_PATH         : ${LD_LIBRARY_PATH:-<unset>}"
-  python - <<'PY'
-import importlib.util
-print(f"  jax currently importable: {importlib.util.find_spec('jax') is not None}")
-PY
-fi
-
-echo "Reinstalling my_swamp package (primary spec): ${MY_SWAMP_PACKAGE_SPEC}"
+echo "Reinstalling my_swamp package only: ${MY_SWAMP_PACKAGE_SPEC}"
 python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
-
 : > "${MY_SWAMP_INSTALL_LOG}"
-INSTALLED_SPEC="${MY_SWAMP_PACKAGE_SPEC}"
-echo "Attempting my_swamp install spec: ${INSTALLED_SPEC}"
-echo "== Attempt: ${INSTALLED_SPEC} ==" >> "${MY_SWAMP_INSTALL_LOG}"
-INSTALL_ARGS=(--no-cache-dir --upgrade "${MY_SWAMP_PIP_ARGS_ARR[@]}")
-if [ "${MY_SWAMP_INSTALL_NO_DEPS}" = "1" ]; then
-  INSTALL_ARGS+=(--no-deps)
-fi
-if ! python -m pip install "${INSTALL_ARGS[@]}" "${INSTALLED_SPEC}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
-  echo "ERROR: failed to install my_swamp from spec: ${INSTALLED_SPEC}"
-  echo "Hint: set MY_SWAMP_PACKAGE_SPEC to a valid wheel/URL/private-index name."
-  echo "Hint: pass index args via MY_SWAMP_PIP_ARGS, e.g."
-  echo "      MY_SWAMP_PIP_ARGS='--index-url <url> --extra-index-url <url> --trusted-host <host>'"
-  echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
+if ! python -m pip install --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_PACKAGE_SPEC}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
+  echo "ERROR: failed to install my_swamp from spec: ${MY_SWAMP_PACKAGE_SPEC}"
   tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
   exit 1
-fi
-
-if [ "${#MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" -gt 0 ] && [ -n "${MY_SWAMP_EXTRA_PACKAGES_ARR[0]}" ]; then
-  if [ "${JAX_FORCE_REINSTALL}" = "1" ]; then
-    echo "Removing existing JAX stack before reinstall"
-    echo "== Uninstall JAX stack ==" >> "${MY_SWAMP_INSTALL_LOG}"
-    python -m pip uninstall -y \
-      jax \
-      jaxlib \
-      jax-cuda13-plugin \
-      jax-cuda13-pjrt \
-      jax-cuda12-plugin \
-      jax-cuda12-pjrt >> "${MY_SWAMP_INSTALL_LOG}" 2>&1 || true
-  fi
-
-  echo "Installing explicit runtime dependencies: ${MY_SWAMP_EXTRA_PACKAGES_ARR[*]}"
-  echo "== Extra packages: ${MY_SWAMP_EXTRA_PACKAGES_ARR[*]} ==" >> "${MY_SWAMP_INSTALL_LOG}"
-  if ! python -m pip install --no-cache-dir --upgrade "${JAX_PIP_ARGS_ARR[@]}" "${MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
-    echo "ERROR: failed installing MY_SWAMP_EXTRA_PACKAGES (${MY_SWAMP_EXTRA_PACKAGES_ARR[*]})"
-    echo "Hint: adjust JAX_PIP_ARGS for your cluster package mirror/index policy."
-    echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
-    tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
-    exit 1
-  fi
-fi
-
-echo "Installed JAX package summary:"
-python -m pip show jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt 2>/dev/null || true
-python - <<'PY'
-import importlib
-import importlib.util
-
-mods = [
-    "jax",
-    "jaxlib",
-    "jax_cuda12_plugin",
-    "jax_cuda12_pjrt",
-    "jax_cuda13_plugin",
-    "jax_cuda13_pjrt",
-]
-for name in mods:
-    spec = importlib.util.find_spec(name)
-    print(f"module {name}: {'FOUND' if spec is not None else 'MISSING'}")
-    if spec is not None:
-        print(f"  origin={spec.origin}")
-
-try:
-    import jaxlib
-    print(f"jaxlib version: {getattr(jaxlib, '__version__', '<unknown>')}")
-except Exception as exc:
-    print(f"jaxlib import error: {exc!r}")
-PY
-
-if [ "${REQUIRE_JAX_GPU}" = "1" ]; then
-  if ! python - <<'PY'
-import importlib.util
-import os
-
-mod = os.environ.get("JAX_EXPECTED_PLUGIN_MODULE", "").strip()
-if not mod:
-    raise SystemExit(0)
-
-spec = importlib.util.find_spec(mod)
-print(f"Expected JAX GPU plugin module ({mod}): {'FOUND' if spec is not None else 'MISSING'}")
-if spec is not None:
-    print(f"  origin={spec.origin}")
-raise SystemExit(0 if spec is not None else 1)
-PY
-  then
-    echo "ERROR: required JAX GPU plugin module is missing: ${JAX_EXPECTED_PLUGIN_MODULE}"
-    echo "Hint: keep MY_SWAMP_EXTRA_PACKAGES at default jax[cuda12] unless your site provides another supported spec."
-    echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
-    tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
-    exit 1
-  fi
 fi
 
 if ! python - <<'PY'
@@ -235,8 +91,7 @@ print(f"my_swamp import OK from: {getattr(my_swamp, '__file__', '<namespace>')}"
 print(f"python executable: {sys.executable}")
 PY
 then
-  echo "ERROR: my_swamp import failed after package install (${INSTALLED_SPEC})"
-  echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
+  echo "ERROR: my_swamp import failed after package install (${MY_SWAMP_PACKAGE_SPEC})"
   tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
   exit 1
 fi
@@ -247,56 +102,36 @@ if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
   sort -u "${PBS_NODEFILE}" || true
 fi
 if ! python - <<'PY'
-import json
 import os
 import sys
 
-summary = {}
 ok = True
-
+torch_cuda_available = False
+jax_backend = "unknown"
 try:
     import torch
-
-    summary["torch_version"] = torch.__version__
-    summary["torch_cuda_version"] = str(getattr(torch.version, "cuda", None))
-    summary["torch_cuda_available"] = bool(torch.cuda.is_available())
-    summary["torch_device_count"] = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
-    if torch.cuda.is_available():
-        summary["torch_device_0"] = str(torch.cuda.get_device_name(0))
+    torch_cuda_available = bool(torch.cuda.is_available())
+    print(f"torch_cuda_available={torch_cuda_available}")
 except Exception as exc:
-    summary["torch_error"] = repr(exc)
+    print(f"torch_error={exc!r}")
     ok = False
-
 try:
     import jax
-
     jax_backend = str(jax.default_backend()).lower()
-    summary["jax_version"] = jax.__version__
-    summary["jax_backend"] = jax_backend
-    summary["jax_devices"] = [str(d) for d in jax.devices()]
+    print(f"jax_backend={jax_backend}")
 except Exception as exc:
-    summary["jax_error"] = repr(exc)
-    jax_backend = "unknown"
+    print(f"jax_error={exc!r}")
     ok = False
-
-print("Runtime backend summary:")
-print(json.dumps(summary, indent=2))
-
-require_torch_cuda = os.environ.get("REQUIRE_TORCH_CUDA", "0") == "1"
-require_jax_gpu = os.environ.get("REQUIRE_JAX_GPU", "0") == "1"
-
-if require_torch_cuda and not summary.get("torch_cuda_available", False):
+if os.environ.get("REQUIRE_TORCH_CUDA", "0") == "1" and not torch_cuda_available:
     print("ERROR: REQUIRE_TORCH_CUDA=1 but torch.cuda.is_available() is False", file=sys.stderr)
     ok = False
-
-if require_jax_gpu and jax_backend not in {"gpu", "cuda", "rocm", "metal"}:
+if os.environ.get("REQUIRE_JAX_GPU", "0") == "1" and jax_backend not in {"gpu", "cuda", "rocm", "metal"}:
     print(f"ERROR: REQUIRE_JAX_GPU=1 but jax backend is '{jax_backend}'", file=sys.stderr)
     ok = False
-
 raise SystemExit(0 if ok else 1)
 PY
 then
-  echo "ERROR: runtime preflight failed. Check backend summary above."
+  echo "ERROR: runtime preflight failed."
   exit 1
 fi
 
