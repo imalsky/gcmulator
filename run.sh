@@ -38,8 +38,6 @@ conda activate "$CONDA_ENV"
 
 export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT:${PYTHONPATH:-}"
 export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
-# Raw sim files default to uncompressed .npz during generation for higher throughput.
-export GCMULATOR_COMPRESS_RAW="${GCMULATOR_COMPRESS_RAW:-0}"
 export GCMULATOR_JAX_SIM_BATCH="${GCMULATOR_JAX_SIM_BATCH:-auto}"
 export SWAMPE_JAX_ENABLE_X64="${SWAMPE_JAX_ENABLE_X64:-0}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
@@ -112,7 +110,7 @@ PY
   })"
   SIM_COUNT=0
   if [ -d "$DATASET_DIR" ]; then
-    SIM_COUNT="$(find "$DATASET_DIR" -maxdepth 1 -type f -name 'sim_*.npz' | wc -l | tr -d ' ')"
+    SIM_COUNT="$(find "$DATASET_DIR" -maxdepth 1 -type f \( -name 'sim_*.npy' -o -name 'sim_*.npz' \) | wc -l | tr -d ' ')"
   fi
   if [ "$SIM_COUNT" -eq 0 ]; then
     # Generate only when raw terminal states are not already present.

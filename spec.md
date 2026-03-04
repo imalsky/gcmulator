@@ -74,15 +74,17 @@ Fixed canonical parameter ordering is:
 5. Each solve uses terminal-only MY_SWAMP integration with:
    - `jit_scan=True`
    - `donate_state=True`
-6. Stack 5 fields, apply geometry conventions, and write `sim_XXXXXX.npz`.
+6. Stack 5 fields, apply geometry conventions, and write `sim_XXXXXX.npy`.
+   - Raw saves use uncompressed `.npy` dictionary payloads (no zip/deflate compression).
 7. Write `manifest.json` with run metadata.
 
 ### 4.3 Preprocessing (`src/training.py`, `preprocess_dataset`)
-1. Read raw `sim_*.npz`.
+1. Read raw `sim_*.npy` (legacy `sim_*.npz` is auto-migrated to `.npy` on first preprocess).
 2. Validate raw geometry metadata consistency and ensure it matches `config.geometry`.
 3. Train/val split by `training.split_seed` and `training.val_fraction`.
 4. Fit normalization stats on train split only (streaming moments).
-5. Write normalized per-simulation processed files (`*_train.npz`, `*_val.npz`).
+5. Write normalized per-simulation processed files (`*_train.npy`, `*_val.npy`).
+   - Processed saves are written as uncompressed `.npy` dictionary payloads.
 6. Write `processed_meta.json` with shape, splits, normalization, geometry, and time-mapping metadata.
 7. Reuse cached processed files when raw-file signatures and preprocessing config fingerprint match.
 
@@ -148,6 +150,7 @@ Validation enforces finite positive values and minimum step count `>= 1`.
 - `scheduler.type`: `cosine_warmup`, `plateau`, `none`.
 - AMP modes: `none`, `bf16`, `fp16` (fp16 scaler only on CUDA).
 - Device: `auto`, `cpu`, `cuda`.
+- `training.preload_to_gpu`: when `true`, preloads train/val tensors onto CUDA memory before epoch loops (requires `training.num_workers=0`).
 
 ## 6. Geometry Convention
 `src/geometry.py` applies two optional conversions:
@@ -204,7 +207,7 @@ Current default SFNO profile is intentionally moderate-large and aligned with to
 Compatibility note: the installed `torch_harmonics` SFNO currently accepts `encoder_layers` but internally hard-codes a one-layer encoder. `gcmulator` therefore reapplies encoder construction after SFNO init so configured `encoder_layers` is actually enforced.
 
 ## 9. Data and Artifact Contracts
-### 9.1 Raw Simulation File (`sim_XXXXXX.npz`)
+### 9.1 Raw Simulation File (`sim_XXXXXX.npy`)
 Contains:
 - `state_final` `[C,H,W]`
 - `fields`
@@ -215,6 +218,7 @@ Contains:
 - `M`
 - `nlat`, `nlon`
 - geometry metadata (`lat_order`, `lon_origin`, `lon_shift`)
+- stored as a pickled `.npy` dictionary payload for zero-compression writes
 
 ### 9.2 Raw Manifest (`manifest.json`)
 Contains run metadata, solver settings, sampling settings, and item list.
@@ -224,11 +228,12 @@ Sampling metadata includes:
 - `jax_backend`
 - `jax_sim_batch_size`
 
-### 9.3 Processed File (`*_train.npz` / `*_val.npz`)
+### 9.3 Processed File (`*_train.npy` / `*_val.npy`)
 Contains:
 - `state_final_norm`
 - `params_norm`
 - `time_days`
+- written as uncompressed `.npy` dictionary payload (no zip/deflate compression)
 
 ### 9.4 Processed Metadata (`processed_meta.json`)
 Contains:
@@ -250,6 +255,7 @@ Contain model weights plus enough metadata to reconstruct inference:
 
 ### 9.6 Additional Outputs
 - `training_history.json`
+- `training_history.csv`
 - `val_metrics.json`
 - `config_used.resolved.json`
 - `config_used.original.<ext>`
@@ -297,7 +303,7 @@ Local environment requirement:
   - `SWAMPE_JAX_ENABLE_X64` (default `0`)
   - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
   - `GCMULATOR_JAX_SIM_BATCH` (default `auto`)
-- When generation already produced `sim_*.npz`, reruns skip regeneration and reuse existing raw data.
+- When generation already produced `sim_*.npy` (or legacy `sim_*.npz`), reruns skip regeneration and reuse existing raw data.
 - Runs training.
 
 ### 11.3 PBS Convenience Script (`run.pbs`)
@@ -314,7 +320,8 @@ Local environment requirement:
   - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
   - `GCMULATOR_JAX_SIM_BATCH` (default `auto`)
 - Uses generation/training flow control `RUN_GEN_IF_MISSING` consistent with `run.sh`.
-- When generation already produced `sim_*.npz`, reruns skip regeneration and reuse existing raw data.
+- When generation already produced `sim_*.npy` (or legacy `sim_*.npz`), reruns skip regeneration and reuse existing raw data.
+- Mirrors training stdout/stderr into a dedicated file via `TRAIN_LOG` (default `${PROJECT_ROOT}/training_${PBS_JOBID}.log`) while still streaming to terminal/PBS output.
 
 ### 11.4 SWAMPE Parity Check
 - `python extra/swampe_parity_compare.py`

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import csv
 import json
 import logging
 import math
@@ -36,15 +37,43 @@ LOGGER = logging.getLogger("src.train")
 # Lower bound used when computing z-score denominators from empirical variance.
 STD_FLOOR = 1.0e-12
 FINITE_CHECK_INTERVAL = 25
-PREPROCESS_FINGERPRINT_VERSION = 1
+PREPROCESS_FINGERPRINT_VERSION = 3
+
+
+def _load_npy_payload_dict(file_path: Path) -> Dict[str, Any]:
+    """Load a dictionary payload stored via ``np.save(..., allow_pickle=True)``."""
+    obj = np.load(file_path, allow_pickle=True)
+    if isinstance(obj, np.ndarray) and obj.shape == () and obj.dtype == object:
+        payload = obj.item()
+    else:
+        payload = obj
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected dict payload in {file_path}, got {type(payload).__name__}")
+    return payload
 
 
 def _list_raw_dataset_files(dataset_dir: Path) -> List[Path]:
     """List raw simulation files and fail when dataset is empty."""
-    files = sorted(dataset_dir.glob("sim_*.npz"))
-    if not files:
-        raise FileNotFoundError(f"No sim_*.npz files found in {dataset_dir}")
-    return files
+    files_npy = sorted(dataset_dir.glob("sim_*.npy"))
+    if files_npy:
+        return files_npy
+    files_npz = sorted(dataset_dir.glob("sim_*.npz"))
+    if files_npz:
+        LOGGER.warning(
+            "Migrating %d legacy raw .npz files to .npy in %s.",
+            len(files_npz),
+            dataset_dir,
+        )
+        migrated: List[Path] = []
+        for fp in files_npz:
+            with np.load(fp, allow_pickle=True) as z:
+                payload = {k: z[k] for k in z.files}
+            out = fp.with_suffix(".npy")
+            np.save(out, payload, allow_pickle=True)
+            fp.unlink()
+            migrated.append(out)
+        return sorted(migrated)
+    raise FileNotFoundError(f"No sim_*.npy or sim_*.npz files found in {dataset_dir}")
 
 
 def _split_files(files: Sequence[Path], *, seed: int, val_fraction: float) -> Tuple[List[Path], List[Path]]:
@@ -73,20 +102,36 @@ def _split_files(files: Sequence[Path], *, seed: int, val_fraction: float) -> Tu
 
 def _load_raw_metadata(file_path: Path) -> Dict[str, Any]:
     """Load metadata from one raw simulation file without touching state arrays."""
-    with np.load(file_path, allow_pickle=True) as z:
+    if file_path.suffix.lower() == ".npy":
+        z = _load_npy_payload_dict(file_path)
         try:
             lat_order = str(np.asarray(z["lat_order"], dtype=object).item())
             lon_origin = str(np.asarray(z["lon_origin"], dtype=object).item())
             lon_shift = int(np.asarray(z["lon_shift"], dtype=np.int64).item())
             nlat = int(np.asarray(z["nlat"], dtype=np.int64).item())
             nlon = int(np.asarray(z["nlon"], dtype=np.int64).item())
+            fields = [str(x) for x in np.asarray(z["fields"], dtype=object).tolist()]
+            param_names = [str(x) for x in np.asarray(z["param_names"], dtype=object).tolist()]
         except KeyError as exc:
             raise ValueError(
                 f"Raw file {file_path} is missing geometry metadata key '{exc.args[0]}'. "
                 "Regenerate the raw dataset with current data_generation.py."
             ) from exc
-        fields = [str(x) for x in np.asarray(z["fields"], dtype=object).tolist()]
-        param_names = [str(x) for x in np.asarray(z["param_names"], dtype=object).tolist()]
+    else:
+        with np.load(file_path, allow_pickle=True) as z:
+            try:
+                lat_order = str(np.asarray(z["lat_order"], dtype=object).item())
+                lon_origin = str(np.asarray(z["lon_origin"], dtype=object).item())
+                lon_shift = int(np.asarray(z["lon_shift"], dtype=np.int64).item())
+                nlat = int(np.asarray(z["nlat"], dtype=np.int64).item())
+                nlon = int(np.asarray(z["nlon"], dtype=np.int64).item())
+            except KeyError as exc:
+                raise ValueError(
+                    f"Raw file {file_path} is missing geometry metadata key '{exc.args[0]}'. "
+                    "Regenerate the raw dataset with current data_generation.py."
+                ) from exc
+            fields = [str(x) for x in np.asarray(z["fields"], dtype=object).tolist()]
+            param_names = [str(x) for x in np.asarray(z["param_names"], dtype=object).tolist()]
     return {
         "lat_order": lat_order,
         "lon_origin": lon_origin,
@@ -205,12 +250,20 @@ def _processed_cache_is_valid(*, meta: Dict[str, Any], fingerprint: Dict[str, An
 
 def _load_raw_state_and_params(file_path: Path) -> Tuple[np.ndarray, np.ndarray, float, List[str], List[str]]:
     """Load one raw simulation file and extract state, params, and metadata."""
-    with np.load(file_path, allow_pickle=True) as z:
+    if file_path.suffix.lower() == ".npy":
+        z = _load_npy_payload_dict(file_path)
         state = np.asarray(z["state_final"], dtype=np.float32)
         params = np.asarray(z["params"], dtype=np.float64)
         time_days = float(np.asarray(z["time_days"]).item())
         fields = [str(x) for x in np.asarray(z["fields"], dtype=object).tolist()]
         param_names = [str(x) for x in np.asarray(z["param_names"], dtype=object).tolist()]
+    else:
+        with np.load(file_path, allow_pickle=True) as z:
+            state = np.asarray(z["state_final"], dtype=np.float32)
+            params = np.asarray(z["params"], dtype=np.float64)
+            time_days = float(np.asarray(z["time_days"]).item())
+            fields = [str(x) for x in np.asarray(z["fields"], dtype=object).tolist()]
+            param_names = [str(x) for x in np.asarray(z["param_names"], dtype=object).tolist()]
     return state, params, time_days, fields, param_names
 
 
@@ -318,18 +371,18 @@ def _write_processed_file(
     dst_file: Path,
     stats: NormalizationStats,
 ) -> str:
-    """Normalize one raw sample and write one processed ``.npz`` file."""
+    """Normalize one raw sample and write one processed ``.npy`` file."""
     st, p, time_days, _fields, _pnames = _load_raw_state_and_params(src_file)
 
     st_norm = normalize_states(st[None, ...], stats)[0]
     p_norm = normalize_params(p[None, ...], stats)[0]
 
-    np.savez_compressed(
-        dst_file,
-        state_final_norm=st_norm.astype(np.float32),
-        params_norm=p_norm.astype(np.float32),
-        time_days=np.asarray(time_days, dtype=np.float64),
-    )
+    payload = {
+        "state_final_norm": st_norm.astype(np.float32),
+        "params_norm": p_norm.astype(np.float32),
+        "time_days": np.asarray(time_days, dtype=np.float64),
+    }
+    np.save(dst_file, payload, allow_pickle=True)
     return dst_file.name
 
 
@@ -388,14 +441,14 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
     written_val: List[str] = []
 
     for fp in train_files:
-        dst = processed_dir / f"{fp.stem}_train.npz"
+        dst = processed_dir / f"{fp.stem}_train.npy"
         written_train.append(_write_processed_file(src_file=fp, dst_file=dst, stats=stats))
     for fp in val_files:
-        dst = processed_dir / f"{fp.stem}_val.npz"
+        dst = processed_dir / f"{fp.stem}_val.npy"
         written_val.append(_write_processed_file(src_file=fp, dst_file=dst, stats=stats))
 
-    with np.load(processed_dir / written_train[0], allow_pickle=True) as z:
-        st0 = np.asarray(z["state_final_norm"], dtype=np.float32)
+    z0 = _load_npy_payload_dict(processed_dir / written_train[0])
+    st0 = np.asarray(z0["state_final_norm"], dtype=np.float32)
 
     meta: Dict[str, Any] = {
         "fields": fields,
@@ -436,11 +489,73 @@ class TerminalProcessedDataset(Dataset):
 
     def __getitem__(self, idx: int):
         fp = self.processed_dir / self.file_names[idx]
-        with np.load(fp, allow_pickle=True) as z:
+        if fp.suffix.lower() == ".npy":
+            z = _load_npy_payload_dict(fp)
             state = np.asarray(z["state_final_norm"], dtype=np.float32)
             params = np.asarray(z["params_norm"], dtype=np.float32)
             time_days = float(np.asarray(z["time_days"]).item())
+        else:
+            with np.load(fp, allow_pickle=True) as z:
+                state = np.asarray(z["state_final_norm"], dtype=np.float32)
+                params = np.asarray(z["params_norm"], dtype=np.float32)
+                time_days = float(np.asarray(z["time_days"]).item())
         return torch.from_numpy(params), torch.from_numpy(state), torch.tensor(time_days, dtype=torch.float32)
+
+
+class PreloadedTerminalDataset(Dataset):
+    """Dataset backed by already-loaded tensors (typically on GPU)."""
+
+    def __init__(self, *, params: torch.Tensor, states: torch.Tensor, time_days: torch.Tensor) -> None:
+        if params.ndim != 2:
+            raise ValueError(f"params must have shape [N,P], got {tuple(params.shape)}")
+        if states.ndim != 4:
+            raise ValueError(f"states must have shape [N,C,H,W], got {tuple(states.shape)}")
+        if time_days.ndim != 1:
+            raise ValueError(f"time_days must have shape [N], got {tuple(time_days.shape)}")
+        n = int(params.shape[0])
+        if int(states.shape[0]) != n or int(time_days.shape[0]) != n:
+            raise ValueError(
+                "Preloaded tensor batch sizes must match: "
+                f"params={tuple(params.shape)}, states={tuple(states.shape)}, time_days={tuple(time_days.shape)}"
+            )
+        self.params = params
+        self.states = states
+        self.time_days = time_days
+
+    def __len__(self) -> int:
+        return int(self.params.shape[0])
+
+    def __getitem__(self, idx: int):
+        return self.params[idx], self.states[idx], self.time_days[idx]
+
+
+def _preload_split_to_device(
+    *,
+    processed_dir: Path,
+    file_names: Sequence[str],
+    device: torch.device,
+) -> PreloadedTerminalDataset:
+    """Load one split into contiguous tensors and move them to ``device``."""
+    params_rows: List[np.ndarray] = []
+    state_rows: List[np.ndarray] = []
+    time_rows: List[float] = []
+    for name in file_names:
+        fp = processed_dir / str(name)
+        if fp.suffix.lower() == ".npy":
+            z = _load_npy_payload_dict(fp)
+            state_rows.append(np.asarray(z["state_final_norm"], dtype=np.float32))
+            params_rows.append(np.asarray(z["params_norm"], dtype=np.float32))
+            time_rows.append(float(np.asarray(z["time_days"]).item()))
+        else:
+            with np.load(fp, allow_pickle=True) as z:
+                state_rows.append(np.asarray(z["state_final_norm"], dtype=np.float32))
+                params_rows.append(np.asarray(z["params_norm"], dtype=np.float32))
+                time_rows.append(float(np.asarray(z["time_days"]).item()))
+
+    params_t = torch.from_numpy(np.stack(params_rows, axis=0)).to(device=device)
+    states_t = torch.from_numpy(np.stack(state_rows, axis=0)).to(device=device)
+    time_t = torch.tensor(time_rows, dtype=torch.float32, device=device)
+    return PreloadedTerminalDataset(params=params_t, states=states_t, time_days=time_t)
 
 
 def _batch_steps(time_days_tensor: torch.Tensor, *, default_time_days: float, rollout_steps_at_default_time: int) -> int:
@@ -510,6 +625,23 @@ def _compute_gate_metrics(
     }
 
 
+def _write_training_history_csv(*, history: Sequence[Dict[str, float]], csv_path: Path) -> None:
+    """Write per-epoch training history rows to CSV."""
+    fieldnames = ["epoch", "train_loss", "val_loss", "lr"]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in history:
+            writer.writerow(
+                {
+                    "epoch": int(round(float(row["epoch"]))),
+                    "train_loss": f"{float(row['train_loss']):.8e}",
+                    "val_loss": f"{float(row['val_loss']):.8e}",
+                    "lr": f"{float(row['lr']):.8e}",
+                }
+            )
+
+
 def _check_finite_tensor(t: torch.Tensor, *, name: str) -> None:
     """Raise if tensor contains NaN/Inf values."""
     if not torch.isfinite(t).all():
@@ -525,6 +657,14 @@ def _should_run_finite_check(step_idx: int) -> bool:
 def _abs_max_tensor(t: torch.Tensor) -> float:
     """Return absolute max value from tensor as Python float."""
     return float(t.detach().abs().max().item())
+
+
+def _fmt_sci(value: float, *, width: int = 11, sig_figs: int = 3) -> str:
+    """Format scalar in compact scientific notation with fixed field width."""
+    if sig_figs < 1:
+        raise ValueError(f"sig_figs must be >= 1, got {sig_figs}")
+    decimals = max(0, int(sig_figs) - 1)
+    return f"{float(value):{int(width)}.{decimals}e}"
 
 
 def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
@@ -573,7 +713,7 @@ def _cosine_warmup_lr(
 def _warn_if_raw_dataset_count_mismatch(cfg: GCMulatorConfig, *, config_path: Path) -> None:
     """Warn when fewer raw files exist than ``sampling.n_sims`` expects."""
     dataset_dir = resolve_path(config_path, cfg.paths.dataset_dir)
-    raw_files = sorted(dataset_dir.glob("sim_*.npz"))
+    raw_files = sorted(list(dataset_dir.glob("sim_*.npy")) + list(dataset_dir.glob("sim_*.npz")))
     if not raw_files:
         return
 
@@ -581,7 +721,7 @@ def _warn_if_raw_dataset_count_mismatch(cfg: GCMulatorConfig, *, config_path: Pa
     n_expected = int(cfg.sampling.n_sims)
     if n_found < n_expected:
         LOGGER.warning(
-            "Raw dataset has %d files but config.sampling.n_sims=%d. "
+            "Raw dataset has %4d files but config.sampling.n_sims=%4d. "
             "Training will proceed on existing files only.",
             n_found,
             n_expected,
@@ -615,8 +755,34 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     lat_order = str(processed_geometry.get("lat_order", "north_to_south"))
     lon_origin = str(processed_geometry.get("lon_origin", "0_to_2pi"))
 
-    train_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["train"])
-    val_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["val"])
+    device = choose_device(cfg.training.device)
+    preload_to_gpu = bool(cfg.training.preload_to_gpu)
+    if preload_to_gpu and device.type != "cuda":
+        raise RuntimeError(
+            "training.preload_to_gpu=true requires CUDA device. "
+            f"Resolved device is '{device}'."
+        )
+
+    if preload_to_gpu:
+        train_ds = _preload_split_to_device(
+            processed_dir=processed_dir,
+            file_names=processed_meta["splits"]["train"],
+            device=device,
+        )
+        val_ds = _preload_split_to_device(
+            processed_dir=processed_dir,
+            file_names=processed_meta["splits"]["val"],
+            device=device,
+        )
+        LOGGER.info(
+            "Preloaded processed splits to %s | n_train=%d | n_val=%d",
+            device,
+            len(train_ds),
+            len(val_ds),
+        )
+    else:
+        train_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["train"])
+        val_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["val"])
 
     if len(train_ds) < int(cfg.training.batch_size):
         raise ValueError(
@@ -624,20 +790,29 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             f"n_train={len(train_ds)}, batch_size={cfg.training.batch_size}"
         )
 
-    device = choose_device(cfg.training.device)
-
     torch.manual_seed(cfg.training.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.training.seed)
 
-    loader_common: Dict[str, Any] = {
-        "num_workers": cfg.training.num_workers,
-        "pin_memory": cfg.training.pin_memory,
-    }
-    if int(cfg.training.num_workers) > 0:
-        # Keep workers alive across epochs and prefetch small batches to reduce loader stalls.
-        loader_common["persistent_workers"] = True
-        loader_common["prefetch_factor"] = 2
+    if preload_to_gpu:
+        if int(cfg.training.num_workers) != 0:
+            LOGGER.warning(
+                "training.preload_to_gpu=true uses in-process loading only; overriding num_workers=%d -> 0.",
+                int(cfg.training.num_workers),
+            )
+        loader_common: Dict[str, Any] = {
+            "num_workers": 0,
+            "pin_memory": False,
+        }
+    else:
+        loader_common = {
+            "num_workers": cfg.training.num_workers,
+            "pin_memory": cfg.training.pin_memory,
+        }
+        if int(cfg.training.num_workers) > 0:
+            # Keep workers alive across epochs and prefetch small batches to reduce loader stalls.
+            loader_common["persistent_workers"] = True
+            loader_common["prefetch_factor"] = 2
 
     train_loader = DataLoader(
         train_ds,
@@ -654,7 +829,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         drop_last=False,
     )
 
-    use_non_blocking = bool(cfg.training.pin_memory) and device.type == "cuda"
+    use_non_blocking = bool(cfg.training.pin_memory) and device.type == "cuda" and not preload_to_gpu
 
     sample_params, sample_state, _sample_time = train_ds[0]
     state_chans = int(sample_state.shape[0])
@@ -741,10 +916,10 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 target_abs_max = _abs_max_tensor(yb)
                 pred_abs_max = _abs_max_tensor(yhat)
                 LOGGER.info(
-                    "Epoch 1 batch 1 scales | params_abs_max=%.3e | target_abs_max=%.3e | pred_abs_max=%.3e",
-                    param_abs_max,
-                    target_abs_max,
-                    pred_abs_max,
+                    "ScaleCheck | params_abs_max=%s | target_abs_max=%s | pred_abs_max=%s",
+                    _fmt_sci(param_abs_max),
+                    _fmt_sci(target_abs_max),
+                    _fmt_sci(pred_abs_max),
                 )
                 if pred_abs_max > 1.0e8 and target_abs_max < 1.0e4:
                     raise RuntimeError(
@@ -800,12 +975,12 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
 
         lr_now = float(optimizer.param_groups[0]["lr"])
         LOGGER.info(
-            "Epoch %d/%d | train=%.6e | val=%.6e | lr=%.3e",
+            "Epoch %4d/%4d | train=%s | val=%s | lr=%s",
             epoch,
             epochs,
-            train_loss,
-            val_loss,
-            lr_now,
+            _fmt_sci(train_loss),
+            _fmt_sci(val_loss),
+            _fmt_sci(lr_now, width=10, sig_figs=2),
         )
 
         history.append({"epoch": float(epoch), "train_loss": train_loss, "val_loss": val_loss, "lr": lr_now})
@@ -852,6 +1027,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     val_metrics = _compute_gate_metrics(pred_norm=pred_norm, tar_norm=tar_norm, field_names=field_names)
 
     (model_dir / "training_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    _write_training_history_csv(history=history, csv_path=model_dir / "training_history.csv")
     (model_dir / "val_metrics.json").write_text(json.dumps(val_metrics, indent=2), encoding="utf-8")
 
     summary = {
@@ -859,6 +1035,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         "last_checkpoint": str(last_path),
         "best_val_loss": float(best_val),
         "history_path": str(model_dir / "training_history.json"),
+        "history_csv_path": str(model_dir / "training_history.csv"),
         "val_metrics": val_metrics,
         "processed_meta": str(processed_dir / "processed_meta.json"),
         "resolved_config_path": str(resolved_cfg_path),

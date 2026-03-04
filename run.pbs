@@ -51,13 +51,13 @@ REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
 GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
 GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
+TRAIN_LOG="${TRAIN_LOG:-${PROJECT_ROOT}/training_${PBS_JOBID:-manual}.log}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
 read -r -a TORCH_HARMONICS_PIP_ARGS_ARR <<< "${TORCH_HARMONICS_PIP_ARGS}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
-export GCMULATOR_COMPRESS_RAW="${GCMULATOR_COMPRESS_RAW:-0}"
 export GCMULATOR_JAX_SIM_BATCH="${GCMULATOR_JAX_SIM_BATCH:-auto}"
 export SWAMPE_JAX_ENABLE_X64="${SWAMPE_JAX_ENABLE_X64:-0}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
@@ -219,7 +219,7 @@ PY
   })"
   SIM_COUNT=0
   if [ -d "${DATASET_DIR}" ]; then
-    SIM_COUNT="$(find "${DATASET_DIR}" -maxdepth 1 -type f -name 'sim_*.npz' | wc -l | tr -d ' ')"
+    SIM_COUNT="$(find "${DATASET_DIR}" -maxdepth 1 -type f \( -name 'sim_*.npy' -o -name 'sim_*.npz' \) | wc -l | tr -d ' ')"
   fi
   if [ "${SIM_COUNT}" -eq 0 ]; then
     echo "Stage: generating dataset"
@@ -230,4 +230,7 @@ PY
 fi
 
 echo "Stage: training"
-python -u "${MAIN_PY}" --train --config "${CONFIG_PATH}"
+echo "Training log file: ${TRAIN_LOG}"
+mkdir -p "$(dirname "${TRAIN_LOG}")"
+: > "${TRAIN_LOG}"
+python -u "${MAIN_PY}" --train --config "${CONFIG_PATH}" 2>&1 | tee -a "${TRAIN_LOG}"

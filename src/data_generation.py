@@ -32,6 +32,8 @@ GPU_BACKENDS = {"gpu", "cuda", "rocm", "metal"}
 
 def _clear_dataset_dir(dataset_dir: Path) -> None:
     """Remove existing generated simulation files and manifest."""
+    for p in dataset_dir.glob("sim_*.npy"):
+        p.unlink()
     for p in dataset_dir.glob("sim_*.npz"):
         p.unlink()
     manifest = dataset_dir / "manifest.json"
@@ -100,7 +102,7 @@ def _write_sim_record(
     dataset_dir: Path,
     param_names: List[str],
 ) -> Dict[str, Any]:
-    """Write one terminal state into a ``sim_XXXXXX.npz`` file and metadata record."""
+    """Write one terminal state into a ``sim_XXXXXX.npy`` file and metadata record."""
     state_chw = state.as_stacked().astype(np.float32, copy=False)
     state_chw, geom_info = apply_geometry_state(
         state_chw,
@@ -108,7 +110,7 @@ def _write_sim_record(
         roll_longitude_to_0_2pi=cfg.geometry.roll_longitude_to_0_2pi,
     )
 
-    sim_file = dataset_dir / f"sim_{sim_idx:06d}.npz"
+    sim_file = dataset_dir / f"sim_{sim_idx:06d}.npy"
     payload = {
         "state_final": state_chw,
         "fields": np.asarray(FIELDS_5, dtype=object),
@@ -123,11 +125,7 @@ def _write_sim_record(
         "lon_origin": np.asarray(geom_info["lon_origin"], dtype=object),
         "lon_shift": np.asarray(int(geom_info["lon_shift"]), dtype=np.int64),
     }
-    compress_raw = os.environ.get("GCMULATOR_COMPRESS_RAW", "0") == "1"
-    if compress_raw:
-        np.savez_compressed(sim_file, **payload)
-    else:
-        np.savez(sim_file, **payload)
+    np.save(sim_file, payload, allow_pickle=True)
 
     return {
         "sim_idx": int(sim_idx),
@@ -154,7 +152,7 @@ def _write_one_sim(
     dataset_dir: Path,
     param_names: List[str],
 ) -> Dict[str, Any]:
-    """Run one simulation and write one ``sim_XXXXXX.npz`` output file."""
+    """Run one simulation and write one ``sim_XXXXXX.npy`` output file."""
     state = run_terminal_state(
         params,
         M=cfg.solver.M,
@@ -178,7 +176,7 @@ def _log_progress(*, completed: int, total: int, start_t: float) -> None:
     avg = elapsed / float(completed)
     remain = avg * float(total - completed)
     LOGGER.info(
-        "Generated %d/%d terminal sims | elapsed=%.1fs | ETA=%.1fs",
+        "Generated %4d/%4d terminal sims | elapsed=%8.1fs | ETA=%8.1fs",
         completed,
         total,
         elapsed,
@@ -196,7 +194,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
     if cfg.paths.overwrite_dataset:
         _clear_dataset_dir(dataset_dir)
     else:
-        existing = list(dataset_dir.glob("sim_*.npz"))
+        existing = sorted(list(dataset_dir.glob("sim_*.npy")) + list(dataset_dir.glob("sim_*.npz")))
         if existing:
             raise FileExistsError(
                 f"Dataset directory already contains {len(existing)} simulation files and overwrite_dataset=false: {dataset_dir}"
@@ -218,14 +216,13 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         jax_backend=jax_backend,
         generation_workers=generation_workers,
     )
-    compress_raw = os.environ.get("GCMULATOR_COMPRESS_RAW", "0") == "1"
     LOGGER.info(
-        "Dataset generation backend=%s | generation_workers=%d (requested=%d) | sim_batch_size=%d | raw_compression=%s",
+        "Dataset generation | backend=%-6s | workers=%2d (requested=%2d) | sim_batch=%2d | raw_format=%-3s",
         jax_backend,
         generation_workers,
         int(cfg.sampling.generation_workers),
         sim_batch_size,
-        "on" if compress_raw else "off",
+        "npy",
     )
     if generation_workers == 1 and sim_batch_size > 1:
         LOGGER.info(

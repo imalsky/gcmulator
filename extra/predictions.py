@@ -37,7 +37,7 @@ CHECKPOINT_NAME = "best.pt"
 
 DEVICE_MODE = "auto"
 SPLIT_NAME = "val"
-PICKED_PROCESSED_NAME: str | None = None  # Example: "sim_000042_val.npz"
+PICKED_PROCESSED_NAME: str | None = None  # Example: "sim_000042_val.npy"
 PLOTS_DIR_NAME = "plots"
 FIGURE_NAME = "phi_true_vs_pred_max_days.png"
 FIGURE_DPI = 180
@@ -94,11 +94,27 @@ def _resolve_device(mode: str) -> torch.device:
 def _processed_to_raw_file_name(processed_name: str) -> str:
     """Map processed split filename back to corresponding raw simulation filename."""
     p = str(processed_name)
+    if p.endswith("_train.npy"):
+        return p[: -len("_train.npy")] + ".npy"
+    if p.endswith("_val.npy"):
+        return p[: -len("_val.npy")] + ".npy"
     if p.endswith("_train.npz"):
         return p[: -len("_train.npz")] + ".npz"
     if p.endswith("_val.npz"):
         return p[: -len("_val.npz")] + ".npz"
     raise ValueError(f"Unexpected processed filename format: {processed_name}")
+
+
+def _load_sim_payload(path: Path) -> Dict[str, Any]:
+    """Load raw simulation payload from .npy (preferred) or legacy .npz."""
+    if path.suffix.lower() == ".npy":
+        obj = np.load(path, allow_pickle=True)
+        payload = obj.item() if isinstance(obj, np.ndarray) and obj.shape == () and obj.dtype == object else obj
+        if not isinstance(payload, dict):
+            raise ValueError(f"Expected dict payload in {path}, got {type(payload).__name__}")
+        return payload
+    with np.load(path, allow_pickle=True) as z:
+        return {k: z[k] for k in z.files}
 
 
 def _apply_plot_style() -> None:
@@ -123,8 +139,8 @@ def _pick_max_days_sample(*, dataset_dir: Path, split_files: List[str]) -> Tuple
         if not raw_file.is_file():
             raise FileNotFoundError(f"Raw simulation file not found: {raw_file}")
 
-        with np.load(raw_file, allow_pickle=True) as z:
-            time_days = float(np.asarray(z["time_days"]).item())
+        z = _load_sim_payload(raw_file)
+        time_days = float(np.asarray(z["time_days"]).item())
 
         is_new_max = time_days > best_days + 1.0e-12
         is_tie_break = abs(time_days - best_days) <= 1.0e-12 and best_raw is not None and raw_file.name < best_raw.name
@@ -280,12 +296,12 @@ def main() -> None:
             )
         picked_processed = str(PICKED_PROCESSED_NAME)
         raw_file = (dataset_dir / _processed_to_raw_file_name(picked_processed)).resolve()
-        with np.load(raw_file, allow_pickle=True) as z:
-            time_days = float(np.asarray(z["time_days"]).item())
+        z = _load_sim_payload(raw_file)
+        time_days = float(np.asarray(z["time_days"]).item())
 
-    with np.load(raw_file, allow_pickle=True) as z:
-        true_state = np.asarray(z["state_final"], dtype=np.float32)  # [C,H,W]
-        raw_params = np.asarray(z["params"], dtype=np.float64)  # [P]
+    z = _load_sim_payload(raw_file)
+    true_state = np.asarray(z["state_final"], dtype=np.float32)  # [C,H,W]
+    raw_params = np.asarray(z["params"], dtype=np.float64)  # [P]
 
     if true_state.shape != (state_chans, h, w):
         raise ValueError(f"Unexpected state shape in {raw_file}: {true_state.shape} vs expected {(state_chans, h, w)}")

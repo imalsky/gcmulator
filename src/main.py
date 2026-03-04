@@ -23,7 +23,11 @@ from src.training import train_emulator
 
 def _setup_logging() -> None:
     """Configure process-wide logging format and level."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-5s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 def _setup_warning_filters() -> None:

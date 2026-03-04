@@ -218,6 +218,7 @@ class TrainingConfig:
     num_workers: int = 0
     shuffle: bool = True
     pin_memory: bool = False
+    preload_to_gpu: bool = True
     learning_rate: float = 3e-4
     weight_decay: float = 0.0
     val_fraction: float = 0.2
@@ -310,6 +311,7 @@ TRAINING_KEYS = {
     "num_workers",
     "shuffle",
     "pin_memory",
+    "preload_to_gpu",
     "learning_rate",
     "weight_decay",
     "val_fraction",
@@ -532,6 +534,7 @@ def _parse_training(d: Dict[str, Any]) -> TrainingConfig:
         num_workers=int(d.get("num_workers", 0)),
         shuffle=_parse_bool(d.get("shuffle", True), field="training.shuffle"),
         pin_memory=_parse_bool(d.get("pin_memory", False), field="training.pin_memory"),
+        preload_to_gpu=_parse_bool(d.get("preload_to_gpu", True), field="training.preload_to_gpu"),
         learning_rate=float(d.get("learning_rate", 3e-4)),
         weight_decay=float(d.get("weight_decay", 0.0)),
         val_fraction=float(d.get("val_fraction", 0.2)),
@@ -608,6 +611,11 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("training.batch_size must be >= 1")
     if cfg.training.num_workers < 0:
         raise ValueError("training.num_workers must be >= 0")
+    if cfg.training.preload_to_gpu and cfg.training.num_workers != 0:
+        raise ValueError(
+            "training.num_workers must be 0 when training.preload_to_gpu=true "
+            "(GPU preload bypasses multi-worker host loading)."
+        )
     if cfg.training.learning_rate <= 0:
         raise ValueError("training.learning_rate must be > 0")
     if cfg.training.weight_decay < 0:
