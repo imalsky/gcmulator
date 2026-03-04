@@ -1,9 +1,13 @@
+"""CLI entrypoint for dataset generation and emulator training."""
+
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import sys
+import warnings
 from pathlib import Path
 
 
@@ -18,17 +22,33 @@ from src.training import train_emulator
 
 
 def _setup_logging() -> None:
+    """Configure process-wide logging format and level."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 
+def _setup_warning_filters() -> None:
+    """Silence known benign warnings when suppression is enabled."""
+    if os.environ.get("GCMULATOR_SUPPRESS_KNOWN_WARNINGS", "1") != "1":
+        return
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"An output with one or more elements was resized since it had shape \[\],.*",
+        category=UserWarning,
+    )
+
+
 def _resolve_config_path(config_arg: str | None) -> Path:
+    """Resolve CLI config path or fall back to repository ``config.json``."""
     if config_arg is None:
         return (PROJECT_ROOT / "config.json").resolve()
     return Path(config_arg).resolve()
 
 
 def main() -> None:
+    """Execute one CLI mode: generate dataset or train emulator."""
     enforce_no_tpu_backend()
+    _setup_warning_filters()
 
     parser = argparse.ArgumentParser(description="Run GCMulator data generation or training")
     group = parser.add_mutually_exclusive_group(required=True)

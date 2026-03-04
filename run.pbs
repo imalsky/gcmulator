@@ -1,0 +1,112 @@
+#!/bin/bash
+#PBS -N gcmulator
+#PBS -q gpu_long
+#PBS -W group_list=s2458
+#PBS -l select=1:ncpus=32:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=72:00:00
+#PBS -j oe
+#PBS -m abe
+
+set -euo pipefail
+
+# PBS equivalent of SLURM_SUBMIT_DIR.
+PROJECT_ROOT="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+cd -P "${PROJECT_ROOT}"
+
+# ---- Conda / module stack for this supercomputer ----
+module purge
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+
+if ! command -v conda >/dev/null 2>&1; then
+  echo "ERROR: conda not found after module load."
+  exit 1
+fi
+
+CONDA_BASE="$(conda info --base)"
+# shellcheck disable=SC1090
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
+set +e
+conda activate "${CONDA_ENV}"
+rc=$?
+set -e
+if [ "${rc}" -ne 0 ]; then
+  echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
+  echo "Available envs are:"
+  conda info --envs || true
+  exit 2
+fi
+
+# GH200-specific package correction (disable with FIX_H5PY_ARM=0).
+# Use --no-deps to avoid unintended solver/package drift on strict systems.
+FIX_H5PY_ARM="${FIX_H5PY_ARM:-1}"
+H5PY_SPEC="${H5PY_SPEC:-h5py}"
+if [ "${FIX_H5PY_ARM}" = "1" ]; then
+  python -m pip uninstall -y h5py >/dev/null 2>&1 || true
+  python -m pip install --no-cache-dir --no-deps "${H5PY_SPEC}"
+fi
+
+CONFIG_PATH="${CONFIG_PATH:-config.json}"
+MAIN_PY="${MAIN_PY:-src/main.py}"
+RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
+REINSTALL_MY_SWAMP="${REINSTALL_MY_SWAMP:-1}"
+MY_SWAMP_PATH="${MY_SWAMP_PATH:-${PROJECT_ROOT}/../MY_SWAMP}"
+
+export HDF5_USE_FILE_LOCKING=FALSE
+export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
+export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
+
+if [ -n "${PBS_JOBID:-}" ]; then
+  echo "PBS_JOBID: ${PBS_JOBID}"
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: nvidia-smi not found; cannot verify GPU allocation."
+    exit 1
+  fi
+  if ! nvidia-smi >/dev/null 2>&1; then
+    echo "ERROR: No visible NVIDIA GPU in this PBS job."
+    exit 1
+  fi
+fi
+
+if [ ! -f "${CONFIG_PATH}" ]; then
+  echo "ERROR: config not found: ${CONFIG_PATH}"
+  exit 1
+fi
+if [ ! -f "${MAIN_PY}" ]; then
+  echo "ERROR: main script not found: ${MAIN_PY}"
+  exit 1
+fi
+
+if [ "${REINSTALL_MY_SWAMP}" = "1" ]; then
+  if [ ! -d "${MY_SWAMP_PATH}" ]; then
+    echo "ERROR: MY_SWAMP source path not found: ${MY_SWAMP_PATH}"
+    exit 1
+  fi
+  echo "Reinstalling my_swamp from: ${MY_SWAMP_PATH}"
+  python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
+  python -m pip install --no-deps -e "${MY_SWAMP_PATH}"
+fi
+
+if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
+  DATASET_DIR="$({ python - "${CONFIG_PATH}" <<'PY'
+from pathlib import Path
+import sys
+from src.config import load_config, resolve_path
+
+config_path = Path(sys.argv[1]).resolve()
+cfg = load_config(config_path)
+print(resolve_path(config_path, cfg.paths.dataset_dir))
+PY
+  })"
+  SIM_COUNT=0
+  if [ -d "${DATASET_DIR}" ]; then
+    SIM_COUNT="$(find "${DATASET_DIR}" -maxdepth 1 -type f -name 'sim_*.npz' | wc -l | tr -d ' ')"
+  fi
+  if [ "${SIM_COUNT}" -eq 0 ]; then
+    python -u "${MAIN_PY}" --gen --config "${CONFIG_PATH}"
+  fi
+fi
+
+python -u "${MAIN_PY}" --train --config "${CONFIG_PATH}"

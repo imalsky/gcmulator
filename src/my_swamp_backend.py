@@ -1,3 +1,5 @@
+"""Integration helpers for MY_SWAMP runtime execution and metadata conversion."""
+
 from __future__ import annotations
 
 import os
@@ -7,7 +9,10 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .config import Extended9Params, TerminalState
-from .constants import CANONICAL_VORTICITY_FACTOR, MIN_ROLLOUT_STEPS, SECONDS_PER_DAY
+
+# Integration timing constants.
+MIN_ROLLOUT_STEPS = 1
+SECONDS_PER_DAY = 86400.0
 
 FIELDS_5 = ["Phi", "U", "V", "eta", "delta"]
 
@@ -76,59 +81,6 @@ def ensure_my_swamp_importable(config_dir: Path) -> None:
     raise RuntimeError("Could not import my_swamp. Install it or place MY_SWAMP/src near this config.")
 
 
-def _build_static(params: Extended9Params, *, M: int, dt_seconds: float):
-    from my_swamp.model import build_static
-    import jax.numpy as jnp
-
-    k6phi = None if params.K6Phi is None else jnp.asarray(float(params.K6Phi), dtype=jnp.float64)
-
-    return build_static(
-        M=int(M),
-        dt=jnp.asarray(float(dt_seconds), dtype=jnp.float64),
-        a=jnp.asarray(float(params.a_m), dtype=jnp.float64),
-        omega=jnp.asarray(float(params.omega_rad_s), dtype=jnp.float64),
-        g=jnp.asarray(float(params.g_m_s2), dtype=jnp.float64),
-        Phibar=jnp.asarray(float(params.Phibar), dtype=jnp.float64),
-        taurad=jnp.asarray(float(params.taurad_s), dtype=jnp.float64),
-        taudrag=jnp.asarray(float(params.taudrag_s), dtype=jnp.float64),
-        DPhieq=jnp.asarray(float(params.DPhieq), dtype=jnp.float64),
-        K6=jnp.asarray(float(params.K6), dtype=jnp.float64),
-        K6Phi=k6phi,
-        test=None,
-    )
-
-
-def build_canonical_initial_state(
-    params: Extended9Params,
-    *,
-    M: int,
-    dt_seconds: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Deterministic canonical IC based on MY_SWAMP static state.
-
-    Mirrors the rest-state pattern used in MY_SWAMP retrieval script.
-    Returns (eta0, delta0, Phi0, U0, V0) each [J,I].
-    """
-    static = _build_static(params, M=M, dt_seconds=dt_seconds)
-
-    mus = np.asarray(static.mus, dtype=np.float64)
-    omega = float(np.asarray(static.omega, dtype=np.float64))
-    J = int(getattr(static, "J"))
-    I = int(getattr(static, "I"))
-
-    eta1d = CANONICAL_VORTICITY_FACTOR * omega * mus
-    eta0 = eta1d[:, None] * np.ones((J, I), dtype=np.float64)
-    delta0 = np.zeros((J, I), dtype=np.float64)
-    U0 = np.zeros((J, I), dtype=np.float64)
-    V0 = np.zeros((J, I), dtype=np.float64)
-
-    phieq = np.asarray(static.Phieq, dtype=np.float64)
-    phibar = float(np.asarray(static.Phibar, dtype=np.float64))
-    phi0 = phieq - phibar
-
-    return eta0, delta0, phi0, U0, V0
-
-
 def run_terminal_state(
     params: Extended9Params,
     *,
@@ -137,7 +89,11 @@ def run_terminal_state(
     time_days: float,
     starttime_index: int,
 ) -> TerminalState:
-    """Run MY_SWAMP to terminal time and return full 5-field state."""
+    """Run MY_SWAMP to terminal time and return full 5-field state.
+
+    Uses MY_SWAMP/SWAMPE built-in analytic initialization (`test=None`) with the
+    model's native two-level startup rather than overriding explicit IC fields.
+    """
     from my_swamp.model import run_model_scan_final
 
     if time_days <= 0:
@@ -148,8 +104,6 @@ def run_terminal_state(
     n_steps = int(round(float(time_days) * SECONDS_PER_DAY / float(dt_seconds)))
     n_steps = max(MIN_ROLLOUT_STEPS, n_steps)
     tmax = int(starttime_index + n_steps)
-
-    eta0, delta0, phi0, u0, v0 = build_canonical_initial_state(params, M=M, dt_seconds=dt_seconds)
 
     out = run_model_scan_final(
         M=int(M),
@@ -171,11 +125,6 @@ def run_terminal_state(
         K6Phi=params.K6Phi,
         diagnostics=False,
         starttime=int(starttime_index),
-        eta0_init=eta0,
-        delta0_init=delta0,
-        Phi0_init=phi0,
-        U0_init=u0,
-        V0_init=v0,
         jit_scan=True,
     )
 
@@ -191,6 +140,7 @@ def run_terminal_state(
 
 
 def param_names_extended9() -> Tuple[str, ...]:
+    """Return canonical parameter-name ordering used in stored arrays."""
     return (
         "a_m",
         "omega_rad_s",
@@ -205,10 +155,12 @@ def param_names_extended9() -> Tuple[str, ...]:
 
 
 def params_to_ordered_vector(params: Extended9Params) -> np.ndarray:
+    """Serialize dataclass parameters to canonical float64 vector order."""
     return params.to_vector().astype(np.float64)
 
 
 def params_to_json_dict(params: Extended9Params) -> Dict[str, float | None]:
+    """Serialize parameters to JSON-friendly name-value mapping."""
     return {
         "a_m": params.a_m,
         "omega_rad_s": params.omega_rad_s,

@@ -1,3 +1,5 @@
+"""Configuration schema, parsing, and validation for GCMulator runs."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -8,7 +10,10 @@ from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 
-from .constants import MIN_ROLLOUT_STEPS, PROBABILITY_MAX, PROBABILITY_MIN
+# Local numeric constraints used by config validation.
+MIN_ROLLOUT_STEPS = 1
+PROBABILITY_MIN = 0.0
+PROBABILITY_MAX = 1.0
 
 
 TransformName = Literal["none", "log10", "signed_log1p"]
@@ -29,6 +34,7 @@ class Extended9Params:
     K6Phi: Optional[float]
 
     def to_vector(self) -> np.ndarray:
+        """Return the canonical 9-parameter vector used in saved datasets."""
         k6phi = 0.0 if self.K6Phi is None else float(self.K6Phi)
         return np.array(
             [
@@ -57,6 +63,7 @@ class TerminalState:
     delta: np.ndarray
 
     def as_stacked(self) -> np.ndarray:
+        """Return state channels stacked as [C,H,W] in fixed field order."""
         return np.stack([self.phi, self.u, self.v, self.eta, self.delta], axis=0)
 
 
@@ -73,22 +80,25 @@ class NormalizationConfig:
             "delta": "none",
         }
     )
-    zscore_eps: float = 1e-6
+    zscore_eps: float = 1e-8
     log10_eps: float = 1e-30
     signed_log1p_scale: float = 1.0
 
 
 @dataclass(frozen=True)
 class PathsConfig:
+    """Filesystem paths for raw data, processed data, and model artifacts."""
+
     dataset_dir: str = "data/raw"
     processed_dir: str = "data/processed"
-    model_dir: str = "data/model"
+    model_dir: str = "models"
     overwrite_dataset: bool = False
-    overwrite_processed: bool = False
 
 
 @dataclass(frozen=True)
 class SolverConfig:
+    """MY_SWAMP integration controls used for data generation."""
+
     M: int = 42
     dt_seconds: float = 60.0
     default_time_days: float = 100.0
@@ -97,12 +107,16 @@ class SolverConfig:
 
 @dataclass(frozen=True)
 class GeometryConfig:
+    """Grid-orientation conventions applied before storing states."""
+
     flip_latitude_to_north_south: bool = True
     roll_longitude_to_0_2pi: bool = True
 
 
 @dataclass(frozen=True)
 class ParameterSpec:
+    """One sampling rule for a single physical parameter."""
+
     name: str
     dist: str
     min: Optional[float] = None
@@ -116,6 +130,8 @@ class ParameterSpec:
 
 @dataclass(frozen=True)
 class SamplingConfig:
+    """Sampling strategy for raw simulation generation."""
+
     seed: int = 0
     n_sims: int = 500
     generation_workers: int = 0
@@ -124,18 +140,24 @@ class SamplingConfig:
 
 @dataclass(frozen=True)
 class ParamNormConfig:
+    """Normalization settings for the conditioning parameter vector."""
+
     mode: str = "zscore"
-    eps: float = 1e-6
+    eps: float = 1e-8
 
 
 @dataclass(frozen=True)
 class NormalizationSettings:
+    """Container for state and parameter normalization settings."""
+
     state: NormalizationConfig = field(default_factory=NormalizationConfig)
     params: ParamNormConfig = field(default_factory=ParamNormConfig)
 
 
 @dataclass(frozen=True)
 class ICConfig:
+    """IC-network basis and MLP architecture controls."""
+
     basis: List[str] = field(default_factory=lambda: ["const", "sin_lat", "cos_lat", "sin_lon", "cos_lon"])
     hidden_dim: int = 128
     num_layers: int = 2
@@ -148,20 +170,23 @@ class ICConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    """Rollout-model architecture and channel-conditioning options."""
+
     grid: str = "legendre-gauss"
     grid_internal: str = "legendre-gauss"
-    scale_factor: int = 1
-    embed_dim: int = 32
-    num_layers: int = 4
-    encoder_layers: int = 1
+    scale_factor: int = 2
+    embed_dim: int = 128
+    num_layers: int = 6
+    encoder_layers: int = 2
     activation_function: str = "gelu"
     use_mlp: bool = True
     mlp_ratio: float = 2.0
     drop_rate: float = 0.0
-    drop_path_rate: float = 0.0
-    normalization_layer: str = "none"
+    drop_path_rate: float = 0.05
+    normalization_layer: str = "instance_norm"
     hard_thresholding_fraction: float = 1.0
     residual_prediction: bool = True
+    residual_init_scale: float = 1.0e-2
     pos_embed: str = "spectral"
     bias: bool = False
     include_param_maps: bool = True
@@ -172,7 +197,10 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    type: str = "plateau"
+    """Learning-rate scheduler hyperparameters."""
+
+    type: str = "cosine_warmup"
+    warmup_epochs: int = 5
     factor: float = 0.5
     patience: int = 10
     min_lr: float = 1e-6
@@ -180,6 +208,8 @@ class SchedulerConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    """Optimization, data-loader, and split settings for training."""
+
     seed: int = 0
     device: str = "auto"
     amp_mode: str = "none"
@@ -190,7 +220,6 @@ class TrainingConfig:
     pin_memory: bool = False
     learning_rate: float = 3e-4
     weight_decay: float = 0.0
-    grad_clip_norm: float = 1.0
     val_fraction: float = 0.2
     split_seed: int = 0
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
@@ -198,6 +227,8 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class GCMulatorConfig:
+    """Top-level runtime configuration object."""
+
     paths: PathsConfig = field(default_factory=PathsConfig)
     solver: SolverConfig = field(default_factory=SolverConfig)
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
@@ -228,7 +259,7 @@ TOP_LEVEL_CONFIG_KEYS = {
     "model",
     "training",
 }
-PATHS_KEYS = {"dataset_dir", "processed_dir", "model_dir", "overwrite_dataset", "overwrite_processed"}
+PATHS_KEYS = {"dataset_dir", "processed_dir", "model_dir", "overwrite_dataset"}
 SOLVER_KEYS = {"M", "dt_seconds", "default_time_days", "starttime_index"}
 GEOMETRY_KEYS = {"flip_latitude_to_north_south", "roll_longitude_to_0_2pi"}
 SAMPLING_KEYS = {"seed", "n_sims", "generation_workers", "parameters"}
@@ -252,6 +283,7 @@ MODEL_KEYS = {
     "normalization_layer",
     "hard_thresholding_fraction",
     "residual_prediction",
+    "residual_init_scale",
     "pos_embed",
     "bias",
     "include_param_maps",
@@ -280,15 +312,15 @@ TRAINING_KEYS = {
     "pin_memory",
     "learning_rate",
     "weight_decay",
-    "grad_clip_norm",
     "val_fraction",
     "split_seed",
     "scheduler",
 }
-SCHEDULER_KEYS = {"type", "factor", "patience", "min_lr"}
+SCHEDULER_KEYS = {"type", "warmup_epochs", "factor", "patience", "min_lr"}
 
 
 def _merge_dicts(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge mapping values from ``update`` into ``base``."""
     out = dict(base)
     for k, v in update.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -298,7 +330,15 @@ def _merge_dicts(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 
+def _parse_bool(value: Any, *, field: str) -> bool:
+    """Accept only explicit booleans to prevent implicit truthy coercion."""
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field} must be a boolean, got {type(value).__name__}")
+
+
 def _load_raw_config(path: Path) -> Dict[str, Any]:
+    """Load JSON/YAML config text into a raw dictionary."""
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
     if suffix in {".yaml", ".yml"}:
@@ -315,16 +355,17 @@ def _load_raw_config(path: Path) -> Dict[str, Any]:
 
 
 def _parse_paths(d: Dict[str, Any]) -> PathsConfig:
+    """Parse the ``paths`` section."""
     return PathsConfig(
         dataset_dir=str(d.get("dataset_dir", "data/raw")),
         processed_dir=str(d.get("processed_dir", "data/processed")),
-        model_dir=str(d.get("model_dir", "data/model")),
-        overwrite_dataset=bool(d.get("overwrite_dataset", False)),
-        overwrite_processed=bool(d.get("overwrite_processed", False)),
+        model_dir=str(d.get("model_dir", "models")),
+        overwrite_dataset=_parse_bool(d.get("overwrite_dataset", False), field="paths.overwrite_dataset"),
     )
 
 
 def _parse_solver(d: Dict[str, Any]) -> SolverConfig:
+    """Parse the ``solver`` section."""
     return SolverConfig(
         M=int(d.get("M", 42)),
         dt_seconds=float(d.get("dt_seconds", 60.0)),
@@ -334,13 +375,21 @@ def _parse_solver(d: Dict[str, Any]) -> SolverConfig:
 
 
 def _parse_geometry(d: Dict[str, Any]) -> GeometryConfig:
+    """Parse the ``geometry`` section."""
     return GeometryConfig(
-        flip_latitude_to_north_south=bool(d.get("flip_latitude_to_north_south", True)),
-        roll_longitude_to_0_2pi=bool(d.get("roll_longitude_to_0_2pi", True)),
+        flip_latitude_to_north_south=_parse_bool(
+            d.get("flip_latitude_to_north_south", True),
+            field="geometry.flip_latitude_to_north_south",
+        ),
+        roll_longitude_to_0_2pi=_parse_bool(
+            d.get("roll_longitude_to_0_2pi", True),
+            field="geometry.roll_longitude_to_0_2pi",
+        ),
     )
 
 
 def _parse_parameter_specs(v: Any) -> List[ParameterSpec]:
+    """Parse user-provided sampling parameter specs."""
     if not isinstance(v, list):
         raise ValueError("sampling.parameters must be a list")
     items = v
@@ -369,6 +418,7 @@ def _parse_parameter_specs(v: Any) -> List[ParameterSpec]:
 
 
 def _parse_sampling(d: Dict[str, Any]) -> SamplingConfig:
+    """Parse the ``sampling`` section."""
     specs = _parse_parameter_specs(d.get("parameters", []))
     if not specs:
         raise ValueError(
@@ -384,6 +434,7 @@ def _parse_sampling(d: Dict[str, Any]) -> SamplingConfig:
 
 
 def _parse_norm(d: Dict[str, Any]) -> NormalizationSettings:
+    """Parse normalization sections for state channels and parameter vectors."""
     state = d.get("state", {}) if isinstance(d.get("state", {}), dict) else {}
     params = d.get("params", {}) if isinstance(d.get("params", {}), dict) else {}
 
@@ -399,17 +450,18 @@ def _parse_norm(d: Dict[str, Any]) -> NormalizationSettings:
             "eta": str(field_transforms.get("eta", "none")),
             "delta": str(field_transforms.get("delta", "none")),
         },
-        zscore_eps=float(state.get("zscore_eps", 1e-6)),
+        zscore_eps=float(state.get("zscore_eps", 1e-8)),
         log10_eps=float(state.get("log10_eps", 1e-30)),
         signed_log1p_scale=float(state.get("signed_log1p_scale", 1.0)),
     )
 
-    params_cfg = ParamNormConfig(mode=str(params.get("mode", "zscore")), eps=float(params.get("eps", 1e-6)))
+    params_cfg = ParamNormConfig(mode=str(params.get("mode", "zscore")), eps=float(params.get("eps", 1e-8)))
 
     return NormalizationSettings(state=state_cfg, params=params_cfg)
 
 
 def _parse_ic(d: Dict[str, Any]) -> ICConfig:
+    """Parse IC MLP configuration."""
     return ICConfig(
         basis=[str(x) for x in d.get("basis", ["const", "sin_lat", "cos_lat", "sin_lon", "cos_lon"])],
         hidden_dim=int(d.get("hidden_dim", 128)),
@@ -418,38 +470,51 @@ def _parse_ic(d: Dict[str, Any]) -> ICConfig:
         rand_basis_seed=int(d.get("rand_basis_seed", 1234)),
         rand_basis_count=int(d.get("rand_basis_count", 2)),
         rand_basis_max_k=int(d.get("rand_basis_max_k", 3)),
-        out_tanh=bool(d.get("out_tanh", True)),
+        out_tanh=_parse_bool(d.get("out_tanh", True), field="model.ic.out_tanh"),
     )
 
 
 def _parse_model(d: Dict[str, Any]) -> ModelConfig:
+    """Parse model architecture settings."""
     return ModelConfig(
         grid=str(d.get("grid", "legendre-gauss")),
         grid_internal=str(d.get("grid_internal", "legendre-gauss")),
-        scale_factor=int(d.get("scale_factor", 1)),
-        embed_dim=int(d.get("embed_dim", 32)),
-        num_layers=int(d.get("num_layers", 4)),
-        encoder_layers=int(d.get("encoder_layers", 1)),
+        scale_factor=int(d.get("scale_factor", 2)),
+        embed_dim=int(d.get("embed_dim", 128)),
+        num_layers=int(d.get("num_layers", 6)),
+        encoder_layers=int(d.get("encoder_layers", 2)),
         activation_function=str(d.get("activation_function", "gelu")),
-        use_mlp=bool(d.get("use_mlp", True)),
+        use_mlp=_parse_bool(d.get("use_mlp", True), field="model.use_mlp"),
         mlp_ratio=float(d.get("mlp_ratio", 2.0)),
         drop_rate=float(d.get("drop_rate", 0.0)),
-        drop_path_rate=float(d.get("drop_path_rate", 0.0)),
-        normalization_layer=str(d.get("normalization_layer", "none")),
+        drop_path_rate=float(d.get("drop_path_rate", 0.05)),
+        normalization_layer=str(d.get("normalization_layer", "instance_norm")),
         hard_thresholding_fraction=float(d.get("hard_thresholding_fraction", 1.0)),
-        residual_prediction=bool(d.get("residual_prediction", True)),
+        residual_prediction=_parse_bool(
+            d.get("residual_prediction", True),
+            field="model.residual_prediction",
+        ),
+        residual_init_scale=float(d.get("residual_init_scale", 1.0e-2)),
         pos_embed=str(d.get("pos_embed", "spectral")),
-        bias=bool(d.get("bias", False)),
-        include_param_maps=bool(d.get("include_param_maps", True)),
-        include_coord_channels=bool(d.get("include_coord_channels", True)),
+        bias=_parse_bool(d.get("bias", False), field="model.bias"),
+        include_param_maps=_parse_bool(
+            d.get("include_param_maps", True),
+            field="model.include_param_maps",
+        ),
+        include_coord_channels=_parse_bool(
+            d.get("include_coord_channels", True),
+            field="model.include_coord_channels",
+        ),
         rollout_steps_at_default_time=int(d.get("rollout_steps_at_default_time", 16)),
         ic=_parse_ic(d.get("ic", {}) if isinstance(d.get("ic", {}), dict) else {}),
     )
 
 
 def _parse_scheduler(d: Dict[str, Any]) -> SchedulerConfig:
+    """Parse scheduler settings."""
     return SchedulerConfig(
-        type=str(d.get("type", "plateau")),
+        type=str(d.get("type", "cosine_warmup")),
+        warmup_epochs=int(d.get("warmup_epochs", 5)),
         factor=float(d.get("factor", 0.5)),
         patience=int(d.get("patience", 10)),
         min_lr=float(d.get("min_lr", 1e-6)),
@@ -457,6 +522,7 @@ def _parse_scheduler(d: Dict[str, Any]) -> SchedulerConfig:
 
 
 def _parse_training(d: Dict[str, Any]) -> TrainingConfig:
+    """Parse training loop settings."""
     return TrainingConfig(
         seed=int(d.get("seed", 0)),
         device=str(d.get("device", "auto")),
@@ -464,11 +530,10 @@ def _parse_training(d: Dict[str, Any]) -> TrainingConfig:
         epochs=int(d.get("epochs", 50)),
         batch_size=int(d.get("batch_size", 8)),
         num_workers=int(d.get("num_workers", 0)),
-        shuffle=bool(d.get("shuffle", True)),
-        pin_memory=bool(d.get("pin_memory", False)),
+        shuffle=_parse_bool(d.get("shuffle", True), field="training.shuffle"),
+        pin_memory=_parse_bool(d.get("pin_memory", False), field="training.pin_memory"),
         learning_rate=float(d.get("learning_rate", 3e-4)),
         weight_decay=float(d.get("weight_decay", 0.0)),
-        grad_clip_norm=float(d.get("grad_clip_norm", 1.0)),
         val_fraction=float(d.get("val_fraction", 0.2)),
         split_seed=int(d.get("split_seed", 0)),
         scheduler=_parse_scheduler(d.get("scheduler", {}) if isinstance(d.get("scheduler", {}), dict) else {}),
@@ -476,6 +541,7 @@ def _parse_training(d: Dict[str, Any]) -> TrainingConfig:
 
 
 def load_config(config_path: Path) -> GCMulatorConfig:
+    """Load, merge with defaults, and validate an experiment config."""
     raw = _load_raw_config(config_path)
     _validate_raw_config_keys(raw)
 
@@ -497,10 +563,12 @@ def load_config(config_path: Path) -> GCMulatorConfig:
 
 
 def resolve_path(config_path: Path, path_value: str) -> Path:
+    """Resolve a config-relative path into an absolute path."""
     return (config_path.parent / path_value).resolve()
 
 
 def validate_config(cfg: GCMulatorConfig) -> None:
+    """Validate cross-field constraints and supported option domains."""
     if cfg.solver.M not in (42, 63, 106):
         raise ValueError("solver.M must be one of [42, 63, 106]")
     if cfg.solver.dt_seconds <= 0:
@@ -532,8 +600,8 @@ def validate_config(cfg: GCMulatorConfig) -> None:
 
     if cfg.training.amp_mode not in {"none", "bf16", "fp16"}:
         raise ValueError("training.amp_mode must be one of ['none','bf16','fp16']")
-    if cfg.training.device not in {"auto", "cpu", "cuda", "mps"}:
-        raise ValueError("training.device must be one of ['auto','cpu','cuda','mps']")
+    if cfg.training.device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("training.device must be one of ['auto','cpu','cuda']")
     if cfg.training.epochs < 1:
         raise ValueError("training.epochs must be >= 1")
     if cfg.training.batch_size < 1:
@@ -544,19 +612,46 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("training.learning_rate must be > 0")
     if cfg.training.weight_decay < 0:
         raise ValueError("training.weight_decay must be >= 0")
-    if cfg.training.grad_clip_norm < 0:
-        raise ValueError("training.grad_clip_norm must be >= 0")
     if not (0.0 < cfg.training.val_fraction < 1.0):
         raise ValueError("training.val_fraction must be in (0,1)")
-    if cfg.training.scheduler.type not in {"plateau", "none"}:
-        raise ValueError("training.scheduler.type must be one of ['plateau','none']")
+    if cfg.training.scheduler.type not in {"cosine_warmup", "plateau", "none"}:
+        raise ValueError("training.scheduler.type must be one of ['cosine_warmup','plateau','none']")
+    if cfg.training.scheduler.warmup_epochs < 0:
+        raise ValueError("training.scheduler.warmup_epochs must be >= 0")
+    if cfg.training.scheduler.min_lr < 0:
+        raise ValueError("training.scheduler.min_lr must be >= 0")
+    if cfg.training.scheduler.min_lr > cfg.training.learning_rate:
+        raise ValueError("training.scheduler.min_lr must be <= training.learning_rate")
     if cfg.training.scheduler.type == "plateau":
         if cfg.training.scheduler.factor <= 0 or cfg.training.scheduler.factor >= 1:
             raise ValueError("training.scheduler.factor must be in (0,1)")
         if cfg.training.scheduler.patience < 0:
             raise ValueError("training.scheduler.patience must be >= 0")
-        if cfg.training.scheduler.min_lr < 0:
-            raise ValueError("training.scheduler.min_lr must be >= 0")
+
+    if cfg.model.scale_factor < 1:
+        raise ValueError("model.scale_factor must be >= 1")
+    if cfg.model.embed_dim < 1:
+        raise ValueError("model.embed_dim must be >= 1")
+    if cfg.model.num_layers < 1:
+        raise ValueError("model.num_layers must be >= 1")
+    if cfg.model.encoder_layers < 1:
+        raise ValueError("model.encoder_layers must be >= 1")
+    if cfg.model.activation_function not in {"relu", "gelu", "identity"}:
+        raise ValueError("model.activation_function must be one of ['relu','gelu','identity']")
+    if cfg.model.mlp_ratio <= 0:
+        raise ValueError("model.mlp_ratio must be > 0")
+    if not (0 <= cfg.model.drop_rate < 1):
+        raise ValueError("model.drop_rate must be in [0,1)")
+    if not (0 <= cfg.model.drop_path_rate < 1):
+        raise ValueError("model.drop_path_rate must be in [0,1)")
+    if cfg.model.normalization_layer not in {"none", "layer_norm", "instance_norm"}:
+        raise ValueError("model.normalization_layer must be one of ['none','layer_norm','instance_norm']")
+    if not (0 < cfg.model.hard_thresholding_fraction <= 1):
+        raise ValueError("model.hard_thresholding_fraction must be in (0,1]")
+    if cfg.model.pos_embed not in {"none", "sequence", "spectral", "learnable lat", "learnable latlon"}:
+        raise ValueError(
+            "model.pos_embed must be one of ['none','sequence','spectral','learnable lat','learnable latlon']"
+        )
 
     if cfg.model.rollout_steps_at_default_time < MIN_ROLLOUT_STEPS:
         raise ValueError(
@@ -574,9 +669,12 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("model.ic.rand_basis_max_k must be >= 1")
     if not cfg.model.ic.basis and cfg.model.ic.rand_basis_count == 0:
         raise ValueError("model.ic.basis cannot be empty when rand_basis_count is 0")
+    if cfg.model.residual_init_scale <= 0:
+        raise ValueError("model.residual_init_scale must be > 0")
 
 
 def _validate_parameter_specs(specs: List[ParameterSpec]) -> None:
+    """Validate parameter specification semantics and alias constraints."""
     names = [spec.name for spec in specs]
     dupes = sorted({n for n in names if names.count(n) > 1})
     if dupes:
@@ -637,10 +735,12 @@ def _validate_parameter_specs(specs: List[ParameterSpec]) -> None:
 
 
 def _is_finite(v: float | int) -> bool:
+    """Return ``True`` when ``v`` is a finite real number."""
     return math.isfinite(float(v))
 
 
 def _require_finite(name: str, value: float) -> float:
+    """Cast to float and raise with context if non-finite."""
     v = float(value)
     if not math.isfinite(v):
         raise ValueError(f"{name} must be finite, got {value}")
@@ -653,6 +753,7 @@ def time_days_to_rollout_steps(
     default_time_days: float,
     rollout_steps_at_default_time: int,
 ) -> int:
+    """Map physical horizon in days to integer rollout steps."""
     days = _require_finite("time_days", time_days)
     default_days = _require_finite("default_time_days", default_time_days)
     if days <= 0:
@@ -692,6 +793,7 @@ def time_days_to_rollout_steps(
 
 
 def _validate_raw_config_keys(raw: Dict[str, Any]) -> None:
+    """Reject unknown top-level and section keys before parsing values."""
     _reject_unknown_keys(raw, TOP_LEVEL_CONFIG_KEYS, "config")
 
     _validate_optional_section(raw, "paths", PATHS_KEYS)
@@ -704,6 +806,7 @@ def _validate_raw_config_keys(raw: Dict[str, Any]) -> None:
 
 
 def _validate_optional_section(raw: Dict[str, Any], section: str, allowed_keys: set[str]) -> None:
+    """Validate optional object-shaped config sections against an allowlist."""
     if section not in raw:
         return
     section_obj = raw[section]
@@ -713,6 +816,7 @@ def _validate_optional_section(raw: Dict[str, Any], section: str, allowed_keys: 
 
 
 def _validate_sampling_keys(raw: Dict[str, Any]) -> None:
+    """Validate ``sampling`` keys and each parameter item key set."""
     if "sampling" not in raw:
         return
     sampling_obj = raw["sampling"]
@@ -730,6 +834,7 @@ def _validate_sampling_keys(raw: Dict[str, Any]) -> None:
 
 
 def _validate_normalization_keys(raw: Dict[str, Any]) -> None:
+    """Validate nested key sets in normalization configuration."""
     if "normalization" not in raw:
         return
     norm_obj = raw["normalization"]
@@ -754,6 +859,7 @@ def _validate_normalization_keys(raw: Dict[str, Any]) -> None:
 
 
 def _validate_model_keys(raw: Dict[str, Any]) -> None:
+    """Validate model-section keys including nested IC configuration."""
     if "model" not in raw:
         return
     model_obj = raw["model"]
@@ -768,6 +874,7 @@ def _validate_model_keys(raw: Dict[str, Any]) -> None:
 
 
 def _validate_training_keys(raw: Dict[str, Any]) -> None:
+    """Validate training-section keys including nested scheduler settings."""
     if "training" not in raw:
         return
     train_obj = raw["training"]
@@ -782,12 +889,7 @@ def _validate_training_keys(raw: Dict[str, Any]) -> None:
 
 
 def _reject_unknown_keys(obj: Dict[str, Any], allowed_keys: set[str], path: str) -> None:
+    """Raise when an object contains non-private keys outside ``allowed_keys``."""
     unknown = sorted(k for k in obj.keys() if not str(k).startswith("_") and k not in allowed_keys)
     if unknown:
         raise ValueError(f"{path} contains unknown keys: {unknown}")
-
-
-def dump_config(cfg: GCMulatorConfig, path: Path) -> None:
-    d = asdict(cfg)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(d, indent=2), encoding="utf-8")

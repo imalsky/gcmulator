@@ -1,6 +1,8 @@
+"""Model-building utilities for conditional spherical rollout emulation."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -9,9 +11,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .constants import RANDOM_BASIS_AMP_MAX, RANDOM_BASIS_AMP_MIN, TWO_PI
+# Basis construction constants.
+TWO_PI = 2.0 * np.pi
+RANDOM_BASIS_AMP_MIN = 0.25
+RANDOM_BASIS_AMP_MAX = 1.0
 
 def ensure_torch_harmonics_importable(config_dir: Path) -> None:
+    """Ensure ``torch_harmonics`` is importable from install or nearby checkout."""
     try:
         import torch_harmonics  # noqa: F401
         return
@@ -37,30 +43,105 @@ def ensure_torch_harmonics_importable(config_dir: Path) -> None:
 
 
 def import_sfno() -> type[nn.Module]:
-    from torch_harmonics.examples.models.sfno import SphericalFourierNeuralOperator  # type: ignore
+    """Import the SFNO model class with cross-version compatibility shim."""
+    import torch_harmonics.examples.models.sfno as sfno_mod  # type: ignore
+    # Compatibility shim for torch-harmonics versions where SFNO references
+    # DropPath but does not import it in sfno.py.
+    if not hasattr(sfno_mod, "DropPath"):
+        from torch_harmonics.examples.models._layers import DropPath  # type: ignore
+
+        sfno_mod.DropPath = DropPath
+    SphericalFourierNeuralOperator = sfno_mod.SphericalFourierNeuralOperator
 
     return SphericalFourierNeuralOperator
 
 
+def _count_pointwise_convs(seq: nn.Module) -> Optional[int]:
+    """Count 1x1 Conv2d layers in an ``nn.Sequential`` encoder block."""
+    if not isinstance(seq, nn.Sequential):
+        return None
+    return sum(1 for m in seq if isinstance(m, nn.Conv2d) and m.kernel_size == (1, 1))
+
+
+def _build_pointwise_stack(
+    *,
+    in_chans: int,
+    out_chans: int,
+    num_layers: int,
+    hidden_dim: int,
+    activation_fn: type[nn.Module],
+    final_bias: bool,
+) -> nn.Sequential:
+    """Build a pointwise Conv2d MLP stack used as SFNO encoder override."""
+    if num_layers < 1:
+        raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+
+    layers: List[nn.Module] = []
+    current_dim = int(in_chans)
+    for _ in range(int(num_layers) - 1):
+        fc = nn.Conv2d(current_dim, int(hidden_dim), 1, bias=True)
+        nn.init.normal_(fc.weight, mean=0.0, std=math.sqrt(2.0 / current_dim))
+        if fc.bias is not None:
+            nn.init.constant_(fc.bias, 0.0)
+        layers.append(fc)
+        layers.append(activation_fn())
+        current_dim = int(hidden_dim)
+
+    fc = nn.Conv2d(current_dim, int(out_chans), 1, bias=bool(final_bias))
+    nn.init.normal_(fc.weight, mean=0.0, std=math.sqrt(1.0 / current_dim))
+    if fc.bias is not None:
+        nn.init.constant_(fc.bias, 0.0)
+    layers.append(fc)
+    return nn.Sequential(*layers)
+
+
+def _ensure_sfno_encoder_depth(
+    *,
+    base: nn.Module,
+    in_chans: int,
+    encoder_layers: int,
+    mlp_ratio: float,
+    bias: bool,
+) -> None:
+    """Patch SFNO encoder depth when library defaults ignore ``encoder_layers``."""
+    desired_layers = max(1, int(encoder_layers))
+    existing_layers = _count_pointwise_convs(getattr(base, "encoder", nn.Identity()))
+    if existing_layers == desired_layers:
+        return
+
+    activation_fn = getattr(base, "activation_function", nn.GELU)
+    if not isinstance(activation_fn, type) or not issubclass(activation_fn, nn.Module):
+        activation_fn = nn.GELU
+
+    embed_dim = int(getattr(base, "embed_dim"))
+    hidden_dim = max(1, int(round(embed_dim * float(mlp_ratio))))
+    base.encoder = _build_pointwise_stack(
+        in_chans=int(in_chans),
+        out_chans=embed_dim,
+        num_layers=desired_layers,
+        hidden_dim=hidden_dim,
+        activation_fn=activation_fn,
+        final_bias=bool(bias),
+    )
+    if hasattr(base, "encoder_layers"):
+        setattr(base, "encoder_layers", desired_layers)
+
+
 def choose_device(device_cfg: str) -> torch.device:
+    """Resolve runtime torch device from config string."""
     if device_cfg == "cpu":
         return torch.device("cpu")
     if device_cfg == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("Requested device='cuda' but CUDA is unavailable")
         return torch.device("cuda")
-    if device_cfg == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("Requested device='mps' but MPS is unavailable")
-        return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     return torch.device("cpu")
 
 
 def autocast_context(device: torch.device, amp_mode: str):
+    """Return autocast context manager for configured AMP mode."""
     if amp_mode == "bf16" and device.type in {"cuda", "cpu"}:
         return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
     if amp_mode == "fp16" and device.type == "cuda":
@@ -79,6 +160,7 @@ class SphereLoss(nn.Module):
         self.register_buffer("quad", q.to(torch.float32))
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute quadrature-weighted mean-squared error on the sphere."""
         if pred.shape != target.shape:
             raise ValueError(f"shape mismatch pred={tuple(pred.shape)} target={tuple(target.shape)}")
         q = self.quad
@@ -91,16 +173,27 @@ class SphereLoss(nn.Module):
 
 
 class ConditionalResidualWrapper(nn.Module):
-    def __init__(self, base: nn.Module, state_chans: int, residual_prediction: bool) -> None:
+    """Wrap one-step model and optionally apply residual state update."""
+
+    def __init__(
+        self,
+        base: nn.Module,
+        state_chans: int,
+        residual_prediction: bool,
+        residual_init_scale: float,
+    ) -> None:
         super().__init__()
         self.base = base
         self.state_chans = int(state_chans)
         self.residual_prediction = bool(residual_prediction)
+        self.residual_scale = nn.Parameter(torch.tensor(float(residual_init_scale), dtype=torch.float32))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, step_scale: float = 1.0) -> torch.Tensor:
+        """Run step model and add scaled residual to state channels when enabled."""
         y = self.base(x)
         if self.residual_prediction:
-            y = y + x[:, : self.state_chans]
+            scale = self.residual_scale.to(device=y.device, dtype=y.dtype) * float(step_scale)
+            y = x[:, : self.state_chans] + scale * y
         return y
 
 
@@ -111,6 +204,7 @@ def build_coord_channels_legendre_gauss(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
+    """Build fixed sin/cos latitude-longitude channels on Legendre-Gauss grid."""
     mu, _ = np.polynomial.legendre.leggauss(int(nlat))
     mu = mu[::-1].copy()
     lat = np.arcsin(mu).astype(np.float32)
@@ -136,6 +230,7 @@ def _make_smooth_random_basis(
     count: int,
     max_k: int,
 ) -> np.ndarray:
+    """Generate smooth random basis maps for IC parameterization."""
     rng = np.random.default_rng(int(seed))
     mu, _ = np.polynomial.legendre.leggauss(int(nlat))
     mu = mu[::-1].copy()
@@ -156,6 +251,8 @@ def _make_smooth_random_basis(
 
 
 class ParamICBasisMLP(nn.Module):
+    """Map normalized parameters to an initial state using spatial basis maps."""
+
     def __init__(
         self,
         *,
@@ -229,8 +326,15 @@ class ParamICBasisMLP(nn.Module):
             in_dim = int(hidden_dim)
         layers.append(nn.Linear(in_dim, self.state_chans * self.nbasis))
         self.mlp = nn.Sequential(*layers)
+        # Start from a neutral IC map so early rollouts are stable; the network learns
+        # non-zero IC structure during training if needed.
+        final = self.mlp[-1]
+        if isinstance(final, nn.Linear):
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
 
     def forward(self, params: torch.Tensor) -> torch.Tensor:
+        """Predict initial state tensor ``[B,C,H,W]`` from parameter vectors."""
         if params.ndim != 2 or params.shape[-1] != self.param_dim:
             raise ValueError(f"params must be [B,{self.param_dim}], got {tuple(params.shape)}")
 
@@ -244,6 +348,8 @@ class ParamICBasisMLP(nn.Module):
 
 
 class ParamRolloutModel(nn.Module):
+    """Autoregressive rollout model with optional static conditioning channels."""
+
     def __init__(
         self,
         *,
@@ -273,10 +379,12 @@ class ParamRolloutModel(nn.Module):
             self.register_buffer("coord_channels", torch.zeros((0, nlat, nlon), dtype=torch.float32), persistent=False)
 
     def _param_maps(self, params: torch.Tensor) -> torch.Tensor:
+        """Broadcast parameter vectors to per-pixel conditioning maps."""
         bsz, p = params.shape
         return params[:, :, None, None].expand(bsz, p, self.nlat, self.nlon)
 
     def rollout(self, params: torch.Tensor, *, steps: int) -> torch.Tensor:
+        """Roll forward for ``steps`` iterations and return terminal state."""
         if steps < 1:
             raise ValueError("rollout steps must be >= 1")
         if params.ndim != 2 or params.shape[-1] != self.param_dim:
@@ -290,6 +398,7 @@ class ParamRolloutModel(nn.Module):
 
         pmap = self._param_maps(params) if self.include_param_maps else None
 
+        step_scale = 1.0 / float(int(steps))
         for _ in range(int(steps)):
             parts = [state]
             if pmap is not None:
@@ -297,11 +406,12 @@ class ParamRolloutModel(nn.Module):
             if coord.numel():
                 parts.append(coord)
             x = torch.cat(parts, dim=1)
-            state = self.stepper(x)
+            state = self.stepper(x, step_scale=step_scale)
 
         return state
 
     def forward(self, params: torch.Tensor, steps: int) -> torch.Tensor:
+        """Alias for ``rollout`` to match standard module call signature."""
         return self.rollout(params, steps=int(steps))
 
 
@@ -312,6 +422,7 @@ def build_rollout_model(
     param_dim: int,
     cfg_model,
 ) -> ParamRolloutModel:
+    """Construct full conditional rollout model from data shape and config."""
     h, w = int(img_size[0]), int(img_size[1])
 
     coord_chans = 4 if cfg_model.include_coord_channels else 0
@@ -340,8 +451,20 @@ def build_rollout_model(
         pos_embed=str(cfg_model.pos_embed),
         bias=bool(cfg_model.bias),
     )
+    _ensure_sfno_encoder_depth(
+        base=base,
+        in_chans=int(in_chans),
+        encoder_layers=int(cfg_model.encoder_layers),
+        mlp_ratio=float(cfg_model.mlp_ratio),
+        bias=bool(cfg_model.bias),
+    )
 
-    stepper = ConditionalResidualWrapper(base, state_chans=state_chans, residual_prediction=bool(cfg_model.residual_prediction))
+    stepper = ConditionalResidualWrapper(
+        base,
+        state_chans=state_chans,
+        residual_prediction=bool(cfg_model.residual_prediction),
+        residual_init_scale=float(cfg_model.residual_init_scale),
+    )
 
     ic = ParamICBasisMLP(
         param_dim=param_dim,

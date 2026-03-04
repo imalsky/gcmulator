@@ -1,8 +1,11 @@
+"""Raw dataset generation pipeline using MY_SWAMP terminal states."""
+
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -27,6 +30,7 @@ GPU_BACKENDS = {"gpu", "cuda", "rocm", "metal"}
 
 
 def _clear_dataset_dir(dataset_dir: Path) -> None:
+    """Remove existing generated simulation files and manifest."""
     for p in dataset_dir.glob("sim_*.npz"):
         p.unlink()
     manifest = dataset_dir / "manifest.json"
@@ -35,6 +39,7 @@ def _clear_dataset_dir(dataset_dir: Path) -> None:
 
 
 def _resolve_generation_workers(*, requested_workers: int, n_sims: int, jax_backend: str) -> int:
+    """Choose safe worker count from config, dataset size, and backend type."""
     if n_sims <= 1:
         return 1
     if requested_workers > 0:
@@ -52,6 +57,7 @@ def _write_one_sim(
     dataset_dir: Path,
     param_names: List[str],
 ) -> Dict[str, Any]:
+    """Run one simulation and write one ``sim_XXXXXX.npz`` output file."""
     state = run_terminal_state(
         params,
         M=cfg.solver.M,
@@ -102,6 +108,7 @@ def _write_one_sim(
 
 
 def _log_progress(*, completed: int, total: int, start_t: float) -> None:
+    """Log elapsed runtime and ETA for dataset generation."""
     elapsed = time.time() - start_t
     avg = elapsed / float(completed)
     remain = avg * float(total - completed)
@@ -147,6 +154,12 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         generation_workers,
         int(cfg.sampling.generation_workers),
     )
+    require_jax_gpu = os.environ.get("GCMULATOR_REQUIRE_JAX_GPU", "0") == "1"
+    if require_jax_gpu and jax_backend.lower() not in GPU_BACKENDS:
+        raise RuntimeError(
+            "GCMULATOR_REQUIRE_JAX_GPU=1 but JAX backend is "
+            f"'{jax_backend}'. Refusing CPU fallback for data generation."
+        )
 
     written_by_idx: Dict[int, Dict[str, Any]] = {}
     start_t = time.time()

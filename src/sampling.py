@@ -1,3 +1,5 @@
+"""Sampling utilities for Extended-9 physical parameters."""
+
 from __future__ import annotations
 
 import math
@@ -6,7 +8,11 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 from .config import Extended9Params, ParameterSpec
-from .constants import PROBABILITY_MAX, PROBABILITY_MIN, SECONDS_PER_HOUR
+
+# Sampling and unit-conversion constants.
+PROBABILITY_MIN = 0.0
+PROBABILITY_MAX = 1.0
+SECONDS_PER_HOUR = 3600.0
 
 
 EXTENDED9_PARAM_NAMES: List[str] = [
@@ -23,6 +29,7 @@ EXTENDED9_PARAM_NAMES: List[str] = [
 
 
 def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
+    """Draw one scalar sample according to one ``ParameterSpec`` distribution."""
     if spec.dist == "uniform":
         if spec.min is None or spec.max is None:
             raise ValueError(f"uniform requires min/max for {spec.name}")
@@ -59,6 +66,7 @@ def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
 
 
 def sample_parameter_dict(rng: np.random.Generator, specs: Sequence[ParameterSpec]) -> Dict[str, float]:
+    """Sample all configured parameters and normalize alias units to seconds."""
     sampled: Dict[str, float] = {}
     for spec in specs:
         sampled[spec.name] = _sample_one(rng, spec)
@@ -73,6 +81,7 @@ def sample_parameter_dict(rng: np.random.Generator, specs: Sequence[ParameterSpe
 
 
 def to_extended9(sampled: Dict[str, float]) -> Extended9Params:
+    """Convert sampled parameter map into validated ``Extended9Params``."""
     missing = [name for name in EXTENDED9_PARAM_NAMES if name not in sampled]
     if missing:
         raise ValueError(f"Missing Extended-9 sampled parameters: {missing}")

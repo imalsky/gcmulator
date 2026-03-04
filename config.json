@@ -1,107 +1,76 @@
 {
   "paths": {
-    "_comment": "Relative to config.json location. dataset_dir: raw MY_SWAMP .npz output, processed_dir: normalized tensors, model_dir: checkpoints.",
     "dataset_dir": "data/raw",
     "processed_dir": "data/processed",
-    "model_dir": "data/model",
-    "overwrite_dataset": false,
-    "overwrite_processed": false
+    "model_dir": "models/model",
+    "overwrite_dataset": false
   },
-
   "solver": {
-    "_comment": "MY_SWAMP solver settings. M: spectral truncation (42/63/106). dt_seconds: time step [s]. default_time_days: simulation length [days]. starttime_index: skip first N outputs for IC stability.",
     "M": 42,
     "dt_seconds": 120.0,
-    "default_time_days": 50.0,
+    "default_time_days": 100.0,
     "starttime_index": 2
   },
-
   "geometry": {
-    "_comment": "Reorder output to match torch-harmonics convention: latitude N->S, longitude [0, 2pi).",
     "flip_latitude_to_north_south": true,
     "roll_longitude_to_0_2pi": true
   },
-
   "sampling": {
-    "_comment": "Parameter sampling for dataset generation. generation_workers: 0=auto (GPU backend -> threaded generation), >=1 forces worker count. Required parameter names: a_m, omega_rad_s, Phibar, DPhieq, g_m_s2, K6, K6Phi, plus exactly one of taurad_s|taurad_hours and exactly one of taudrag_s|taudrag_hours.",
-    "_dist_options": {
-      "uniform": "keys: min, max (finite, min < max)",
-      "loguniform": "keys: min, max (finite, > 0, min < max), sampled in log10 space",
-      "fixed": "keys: value (finite). alias: const",
-      "const": "keys: value (finite). alias: fixed",
-      "mixture_off_loguniform": "keys: p_off, off_value, on_min, on_max (0 <= p_off <= 1, on_min/on_max > 0, on_min < on_max)"
-    },
-    "_time_alias_options": {
-      "taurad": ["taurad_s", "taurad_hours"],
-      "taudrag": ["taudrag_s", "taudrag_hours"]
-    },
-    "_example": "To sweep a parameter, change dist from fixed to uniform/loguniform and provide required keys for that dist.",
     "seed": 42,
-    "n_sims": 100,
+    "n_sims": 1000,
     "generation_workers": 0,
     "parameters": [
-      {"_comment": "Planet radius [m] - fixed", "name": "a_m", "dist": "fixed", "value": 8.2e7},
-      {"_comment": "Rotation rate [rad/s] - fixed", "name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
-      {"_comment": "Mean geopotential [m^2/s^2] - fixed", "name": "Phibar", "dist": "fixed", "value": 3.0e5},
-      {"_comment": "Equilibrium geopotential forcing amplitude [m^2/s^2] - fixed", "name": "DPhieq", "dist": "fixed", "value": 1.0e6},
-      {"_comment": "Radiative relaxation timescale [hours] - VARIED, converted to seconds internally", "name": "taurad_hours", "dist": "uniform", "min": 1.0, "max": 30.0},
-      {"_comment": "Drag timescale [hours] - VARIED, converted to seconds internally", "name": "taudrag_hours", "dist": "uniform", "min": 1.0, "max": 30.0},
-      {"_comment": "Surface gravity [m/s^2] - fixed", "name": "g_m_s2", "dist": "fixed", "value": 9.8},
-      {"_comment": "Hyperviscosity for vorticity/divergence - fixed", "name": "K6", "dist": "fixed", "value": 1.24e33},
-      {"_comment": "Hyperviscosity for geopotential - disabled (0)", "name": "K6Phi", "dist": "fixed", "value": 0.0}
+      { "name": "a_m", "dist": "fixed", "value": 82000000.0 },
+      { "name": "omega_rad_s", "dist": "fixed", "value": 0.000032 },
+      { "name": "Phibar", "dist": "fixed", "value": 300000.0 },
+      { "name": "DPhieq", "dist": "fixed", "value": 1000000.0 },
+      { "name": "taurad_hours", "dist": "uniform", "min": 1.0, "max": 30.0 },
+      { "name": "taudrag_hours", "dist": "uniform", "min": 1.0, "max": 30.0 },
+      { "name": "g_m_s2", "dist": "fixed", "value": 9.8 },
+      { "name": "K6", "dist": "fixed", "value": 1.24e33 },
+      { "name": "K6Phi", "dist": "fixed", "value": 0.0 }
     ]
   },
-
   "normalization": {
-    "_comment": "Pre-training normalization. Phi spans ~1e5 so use log10. eta/delta are small signed quantities so use signed_log1p. U/V are moderate velocity fields, no transform needed. Params get z-score normalization.",
-    "_field_transform_options": ["none", "log10", "signed_log1p"],
-    "_param_mode_options": ["zscore", "none"],
     "state": {
       "field_transforms": {
-        "Phi": "log10",
-        "U": "none",
-        "V": "none",
+        "Phi": "signed_log1p",
+        "U": "signed_log1p",
+        "V": "signed_log1p",
         "eta": "signed_log1p",
         "delta": "signed_log1p"
       },
-      "zscore_eps": 1e-6,
+      "zscore_eps": 1e-8,
       "log10_eps": 1e-30,
       "signed_log1p_scale": 1.0
     },
     "params": {
       "mode": "zscore",
-      "eps": 1e-6
+      "eps": 1e-8
     }
   },
-
   "model": {
-    "_comment": "SFNO architecture. embed_dim/num_layers control capacity. rollout_steps_at_default_time: autoregressive steps at default_time_days. ic: MLP that maps Extended-9 params to initial condition on the sphere.",
-    "_grid_options": ["legendre-gauss"],
-    "_normalization_layer_options": ["none"],
-    "_pos_embed_options": ["spectral"],
     "grid": "legendre-gauss",
     "grid_internal": "legendre-gauss",
-    "scale_factor": 1,
-    "embed_dim": 32,
-    "num_layers": 4,
-    "encoder_layers": 1,
+    "scale_factor": 2,
+    "embed_dim": 128,
+    "num_layers": 6,
+    "encoder_layers": 2,
     "activation_function": "gelu",
     "use_mlp": true,
     "mlp_ratio": 2.0,
     "drop_rate": 0.0,
-    "drop_path_rate": 0.0,
-    "normalization_layer": "none",
+    "drop_path_rate": 0.05,
+    "normalization_layer": "instance_norm",
     "hard_thresholding_fraction": 1.0,
     "residual_prediction": true,
+    "residual_init_scale": 0.01,
     "pos_embed": "spectral",
     "bias": false,
     "include_param_maps": true,
     "include_coord_channels": true,
     "rollout_steps_at_default_time": 16,
     "ic": {
-      "_comment": "ParamICBasisMLP: maps Extended-9 params to [C, H, W] initial condition. basis: spatial basis functions. rand_basis: random spherical harmonic modes for expressivity.",
-      "_activation_options": ["relu", "gelu", "silu"],
-      "_basis_options": ["const", "sin_lat", "cos_lat", "sin_lon", "cos_lon"],
       "basis": ["const", "sin_lat", "cos_lat", "sin_lon", "cos_lon"],
       "hidden_dim": 128,
       "num_layers": 2,
@@ -112,29 +81,22 @@
       "out_tanh": true
     }
   },
-
   "training": {
-    "_comment": "Training hyperparameters. device: auto tries GPU first, falls back to CPU. amp_mode: none|bf16|fp16. val_fraction: held-out validation split. scheduler: LR schedule (plateau|none).",
-    "_device_options": ["auto", "cpu", "cuda", "mps"],
-    "_amp_mode_options": ["none", "bf16", "fp16"],
     "seed": 42,
     "device": "auto",
     "amp_mode": "none",
-    "epochs": 50,
-    "batch_size": 8,
+    "epochs": 100,
+    "batch_size": 32,
     "num_workers": 0,
     "shuffle": true,
     "pin_memory": false,
-    "learning_rate": 0.0003,
-    "weight_decay": 0.0,
-    "grad_clip_norm": 1.0,
+    "learning_rate": 1e-4,
+    "weight_decay": 1e-5,
     "val_fraction": 0.2,
     "split_seed": 42,
     "scheduler": {
-      "_type_options": ["plateau", "none"],
-      "type": "plateau",
-      "factor": 0.5,
-      "patience": 10,
+      "type": "cosine_warmup",
+      "warmup_epochs": 10,
       "min_lr": 1e-6
     }
   }

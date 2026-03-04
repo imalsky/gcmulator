@@ -1,8 +1,11 @@
+"""Preprocessing and training pipeline for terminal-state emulator learning."""
+
 from __future__ import annotations
 
 from dataclasses import asdict
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -11,7 +14,6 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .config import GCMulatorConfig, resolve_path, time_days_to_rollout_steps
-from .constants import STD_FLOOR
 from .modeling import (
     SphereLoss,
     autocast_context,
@@ -30,8 +32,12 @@ from .normalization import (
 
 LOGGER = logging.getLogger("src.train")
 
+# Lower bound used when computing z-score denominators from empirical variance.
+STD_FLOOR = 1.0e-12
+
 
 def _list_raw_dataset_files(dataset_dir: Path) -> List[Path]:
+    """List raw simulation files and fail when dataset is empty."""
     files = sorted(dataset_dir.glob("sim_*.npz"))
     if not files:
         raise FileNotFoundError(f"No sim_*.npz files found in {dataset_dir}")
@@ -39,6 +45,7 @@ def _list_raw_dataset_files(dataset_dir: Path) -> List[Path]:
 
 
 def _split_files(files: Sequence[Path], *, seed: int, val_fraction: float) -> Tuple[List[Path], List[Path]]:
+    """Create reproducible file-level train/validation split."""
     if not (0.0 < float(val_fraction) < 1.0):
         raise ValueError(f"training.val_fraction must be in (0,1), got {val_fraction}")
     idx = np.arange(len(files))
@@ -62,6 +69,7 @@ def _split_files(files: Sequence[Path], *, seed: int, val_fraction: float) -> Tu
 
 
 def _load_raw_state_and_params(file_path: Path) -> Tuple[np.ndarray, np.ndarray, float, List[str], List[str]]:
+    """Load one raw simulation file and extract state, params, and metadata."""
     with np.load(file_path, allow_pickle=True) as z:
         state = np.asarray(z["state_final"], dtype=np.float32)
         params = np.asarray(z["params"], dtype=np.float64)
@@ -77,6 +85,7 @@ def _fit_stats_streaming(
     state_norm_cfg,
     param_norm_cfg,
 ) -> NormalizationStats:
+    """Compute normalization statistics from train split using streaming moments."""
     fields0: List[str] | None = None
     pnames0: List[str] | None = None
 
@@ -84,8 +93,8 @@ def _fit_stats_streaming(
     state_sum2: np.ndarray | None = None
     state_count = 0
 
-    param_sum: np.ndarray | None = None
-    param_sum2: np.ndarray | None = None
+    param_mean_accum: np.ndarray | None = None
+    param_m2: np.ndarray | None = None
     param_count = 0
 
     for fp in train_files:
@@ -114,19 +123,22 @@ def _fit_stats_streaming(
         state_count += n
 
         p64 = p.astype(np.float64, copy=False)
-        if param_sum is None:
-            param_sum = p64.copy()
-            param_sum2 = p64 * p64
+        if param_mean_accum is None:
+            param_mean_accum = p64.copy()
+            param_m2 = np.zeros_like(p64, dtype=np.float64)
+            param_count = 1
         else:
-            param_sum += p64
-            param_sum2 += p64 * p64
-        param_count += 1
+            param_count += 1
+            delta = p64 - param_mean_accum
+            param_mean_accum += delta / float(param_count)
+            delta2 = p64 - param_mean_accum
+            param_m2 += delta * delta2
 
     if fields0 is None or pnames0 is None:
         raise RuntimeError("Could not infer field/parameter names from training files")
     if state_sum is None or state_sum2 is None:
         raise RuntimeError("Failed to accumulate state normalization moments")
-    if param_sum is None or param_sum2 is None:
+    if param_mean_accum is None or param_m2 is None:
         raise RuntimeError("Failed to accumulate parameter normalization moments")
 
     state_mean = state_sum / float(state_count)
@@ -134,12 +146,18 @@ def _fit_stats_streaming(
     state_std = np.maximum(np.sqrt(state_var), STD_FLOOR)
 
     if param_norm_cfg.mode == "zscore":
-        param_mean = param_sum / float(param_count)
-        param_var = np.maximum(param_sum2 / float(param_count) - param_mean * param_mean, 0.0)
-        param_std = np.maximum(np.sqrt(param_var), STD_FLOOR)
+        param_mean = param_mean_accum
+        if param_count > 1:
+            param_var = np.maximum(param_m2 / float(param_count), 0.0)
+        else:
+            param_var = np.zeros_like(param_mean, dtype=np.float64)
+        param_std_raw = np.sqrt(param_var)
+        param_is_constant = param_std_raw <= STD_FLOOR
+        param_std = np.where(param_is_constant, 1.0, np.maximum(param_std_raw, STD_FLOOR))
     elif param_norm_cfg.mode == "none":
-        param_mean = np.zeros_like(param_sum)
-        param_std = np.ones_like(param_sum)
+        param_mean = np.zeros_like(param_mean_accum)
+        param_std = np.ones_like(param_mean_accum)
+        param_is_constant = np.zeros_like(param_mean_accum, dtype=bool)
     else:
         raise ValueError(f"Unsupported param normalization mode: {param_norm_cfg.mode}")
 
@@ -151,6 +169,7 @@ def _fit_stats_streaming(
         state_std=state_std.astype(np.float64),
         param_mean=param_mean.astype(np.float64),
         param_std=param_std.astype(np.float64),
+        param_is_constant=np.asarray(param_is_constant, dtype=bool),
         state_zscore_eps=float(state_norm_cfg.zscore_eps),
         param_zscore_eps=float(param_norm_cfg.eps),
         log10_eps=float(state_norm_cfg.log10_eps),
@@ -164,6 +183,7 @@ def _write_processed_file(
     dst_file: Path,
     stats: NormalizationStats,
 ) -> str:
+    """Normalize one raw sample and write one processed ``.npz`` file."""
     st, p, time_days, _fields, _pnames = _load_raw_state_and_params(src_file)
 
     st_norm = normalize_states(st[None, ...], stats)[0]
@@ -178,42 +198,14 @@ def _write_processed_file(
     return dst_file.name
 
 
-def _validate_existing_processed_meta(meta: Dict[str, Any], *, processed_dir: Path) -> None:
-    required_top = {"fields", "param_names", "shape", "splits", "normalization"}
-    missing_top = sorted(required_top.difference(meta))
-    if missing_top:
-        raise KeyError(f"processed_meta.json missing required keys: {missing_top}")
-
-    splits_obj = meta["splits"]
-    if not isinstance(splits_obj, dict):
-        raise ValueError("processed_meta.json 'splits' must be an object")
-
-    for split_name in ("train", "val"):
-        split_files = splits_obj.get(split_name)
-        if not isinstance(split_files, list) or not split_files:
-            raise ValueError(f"processed_meta.json splits.{split_name} must be a non-empty list")
-        missing_files = [str(name) for name in split_files if not (processed_dir / str(name)).is_file()]
-        if missing_files:
-            raise FileNotFoundError(
-                f"processed_meta.json splits.{split_name} references missing files in {processed_dir}: "
-                f"{missing_files[:5]}{'...' if len(missing_files) > 5 else ''}"
-            )
-
-
 def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
+    """Build processed dataset split and write ``processed_meta.json``."""
     dataset_dir = resolve_path(config_path, cfg.paths.dataset_dir)
     processed_dir = resolve_path(config_path, cfg.paths.processed_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
     meta_path = processed_dir / "processed_meta.json"
-    if meta_path.exists() and not cfg.paths.overwrite_processed:
-        cached_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if not isinstance(cached_meta, dict):
-            raise ValueError(f"processed_meta.json must contain an object: {meta_path}")
-        _validate_existing_processed_meta(cached_meta, processed_dir=processed_dir)
-        return cached_meta
-
-    if cfg.paths.overwrite_processed and processed_dir.exists():
+    if processed_dir.exists():
         for p in processed_dir.glob("*"):
             if p.is_file():
                 p.unlink()
@@ -228,6 +220,22 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
     )
     fields = list(stats.field_names)
     param_names = list(stats.param_names)
+    const_param_names = [
+        str(param_names[i]) for i, is_const in enumerate(np.asarray(stats.param_is_constant, dtype=bool)) if is_const
+    ]
+    varying_param_count = len(param_names) - len(const_param_names)
+    if varying_param_count <= 0:
+        raise ValueError(
+            "All parameters are constant in this dataset split. "
+            "At least one varying parameter is required for conditional emulation."
+        )
+    if const_param_names:
+        LOGGER.warning(
+            "Constant parameters detected and zeroed in normalization (%d/%d): %s",
+            len(const_param_names),
+            len(param_names),
+            const_param_names,
+        )
 
     written_train: List[str] = []
     written_val: List[str] = []
@@ -248,6 +256,7 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
         "shape": {"C": int(st0.shape[0]), "H": int(st0.shape[1]), "W": int(st0.shape[2])},
         "splits": {"train": written_train, "val": written_val},
         "normalization": stats_to_json(stats),
+        "constant_param_names": const_param_names,
         "solver": {
             "M": int(cfg.solver.M),
             "dt_seconds": float(cfg.solver.dt_seconds),
@@ -263,6 +272,8 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
 
 
 class TerminalProcessedDataset(Dataset):
+    """PyTorch dataset wrapper over processed terminal-state files."""
+
     def __init__(self, *, processed_dir: Path, file_names: Sequence[str]) -> None:
         self.processed_dir = processed_dir
         self.file_names = list(file_names)
@@ -280,6 +291,7 @@ class TerminalProcessedDataset(Dataset):
 
 
 def _batch_steps(time_days_tensor: torch.Tensor, *, default_time_days: float, rollout_steps_at_default_time: int) -> int:
+    """Convert batch ``time_days`` tensor into one shared integer rollout count."""
     flat = time_days_tensor.reshape(-1)
     if flat.numel() == 0:
         raise ValueError("time_days batch is empty")
@@ -308,6 +320,7 @@ def _collect_validation_predictions(
     rollout_steps_at_default_time: int,
     amp_mode: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Run model on validation loader and collect predictions/targets as NumPy."""
     preds: List[np.ndarray] = []
     tars: List[np.ndarray] = []
     model.eval()
@@ -333,6 +346,7 @@ def _compute_gate_metrics(
     tar_norm: np.ndarray,
     field_names: Sequence[str],
 ) -> Dict[str, Any]:
+    """Compute global and per-channel RMSE in normalized space."""
     diff = pred_norm - tar_norm
     global_rmse = float(np.sqrt(np.mean(diff**2)))
     per_channel = np.sqrt(np.mean(diff**2, axis=(0, 2, 3)))
@@ -343,8 +357,82 @@ def _compute_gate_metrics(
     }
 
 
+def _check_finite_tensor(t: torch.Tensor, *, name: str) -> None:
+    """Raise if tensor contains NaN/Inf values."""
+    if not torch.isfinite(t).all():
+        raise RuntimeError(f"{name} contains non-finite values")
+
+
+def _abs_max_tensor(t: torch.Tensor) -> float:
+    """Return absolute max value from tensor as Python float."""
+    return float(t.detach().abs().max().item())
+
+
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    """Set learning rate for all optimizer parameter groups."""
+    lr_val = float(lr)
+    for group in optimizer.param_groups:
+        group["lr"] = lr_val
+
+
+def _cosine_warmup_lr(
+    *,
+    epoch: int,
+    total_epochs: int,
+    base_lr: float,
+    min_lr: float,
+    warmup_epochs: int,
+) -> float:
+    """Compute cosine schedule with optional linear warmup."""
+    if total_epochs < 1:
+        raise ValueError(f"total_epochs must be >= 1, got {total_epochs}")
+    if warmup_epochs < 0:
+        raise ValueError(f"warmup_epochs must be >= 0, got {warmup_epochs}")
+    if base_lr <= 0:
+        raise ValueError(f"base_lr must be > 0, got {base_lr}")
+    if min_lr < 0:
+        raise ValueError(f"min_lr must be >= 0, got {min_lr}")
+    if min_lr > base_lr:
+        raise ValueError(f"min_lr must be <= base_lr, got min_lr={min_lr}, base_lr={base_lr}")
+
+    warmup = min(int(warmup_epochs), int(total_epochs))
+    e = int(epoch)
+    if warmup > 0 and e <= warmup:
+        return float(base_lr) * (float(e) / float(warmup))
+
+    if total_epochs == warmup:
+        return float(base_lr)
+
+    steps_after_warmup = int(total_epochs - warmup)
+    denom = max(1, steps_after_warmup - 1)
+    progress = float(e - warmup - 1) / float(denom)
+    progress = max(0.0, min(1.0, progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(min_lr) + (float(base_lr) - float(min_lr)) * cosine
+
+
+def _warn_if_raw_dataset_count_mismatch(cfg: GCMulatorConfig, *, config_path: Path) -> None:
+    """Warn when fewer raw files exist than ``sampling.n_sims`` expects."""
+    dataset_dir = resolve_path(config_path, cfg.paths.dataset_dir)
+    raw_files = sorted(dataset_dir.glob("sim_*.npz"))
+    if not raw_files:
+        return
+
+    n_found = len(raw_files)
+    n_expected = int(cfg.sampling.n_sims)
+    if n_found < n_expected:
+        LOGGER.warning(
+            "Raw dataset has %d files but config.sampling.n_sims=%d. "
+            "Training will proceed on existing files only.",
+            n_found,
+            n_expected,
+        )
+
+
 def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
+    """Train rollout emulator end-to-end and persist checkpoints/metrics."""
     ensure_torch_harmonics_importable(config_path.parent)
+    _warn_if_raw_dataset_count_mismatch(cfg, config_path=config_path)
 
     processed_meta = preprocess_dataset(cfg, config_path=config_path)
     processed_dir = resolve_path(config_path, cfg.paths.processed_dir)
@@ -413,9 +501,11 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     loss_fn = SphereLoss(nlat=h, nlon=w, grid=cfg.model.grid).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
+    scheduler_type = str(cfg.training.scheduler.type)
+    base_learning_rate = float(cfg.training.learning_rate)
 
     scheduler = None
-    if cfg.training.scheduler.type == "plateau":
+    if scheduler_type == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
@@ -437,6 +527,16 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     history: List[Dict[str, float]] = []
 
     for epoch in range(1, epochs + 1):
+        if scheduler_type == "cosine_warmup":
+            lr_epoch = _cosine_warmup_lr(
+                epoch=epoch,
+                total_epochs=epochs,
+                base_lr=base_learning_rate,
+                min_lr=float(cfg.training.scheduler.min_lr),
+                warmup_epochs=int(cfg.training.scheduler.warmup_epochs),
+            )
+            _set_optimizer_lr(optimizer, lr_epoch)
+
         model.train()
         train_loss_sum = 0.0
         train_count = 0
@@ -444,6 +544,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         for pb, yb, tb in train_loader:
             pb = pb.to(device=device)
             yb = yb.to(device=device)
+            _check_finite_tensor(pb, name="train params batch")
+            _check_finite_tensor(yb, name="train target batch")
             steps = _batch_steps(
                 tb,
                 default_time_days=cfg.solver.default_time_days,
@@ -453,19 +555,35 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, cfg.training.amp_mode):
                 yhat = model(pb, steps=steps)
+                _check_finite_tensor(yhat, name="train prediction batch")
                 loss = loss_fn(yhat, yb)
+            if not torch.isfinite(loss).item():
+                raise RuntimeError("Training loss became non-finite")
+
+            if epoch == 1 and train_count == 0:
+                param_abs_max = _abs_max_tensor(pb)
+                target_abs_max = _abs_max_tensor(yb)
+                pred_abs_max = _abs_max_tensor(yhat)
+                LOGGER.info(
+                    "Epoch 1 batch 1 scales | params_abs_max=%.3e | target_abs_max=%.3e | pred_abs_max=%.3e",
+                    param_abs_max,
+                    target_abs_max,
+                    pred_abs_max,
+                )
+                if pred_abs_max > 1.0e8 and target_abs_max < 1.0e4:
+                    raise RuntimeError(
+                        "Detected exploding first-batch predictions in normalized space. "
+                        f"pred_abs_max={pred_abs_max:.3e}, target_abs_max={target_abs_max:.3e}. "
+                        "Consider reducing model.rollout_steps_at_default_time and/or reducing "
+                        "model.residual_init_scale (or disabling residual_prediction)."
+                    )
 
             if scaler is not None:
                 scaler.scale(loss).backward()
-                if cfg.training.grad_clip_norm > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                if cfg.training.grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip_norm)
                 optimizer.step()
 
             train_loss_sum += float(loss.detach().item())
@@ -485,7 +603,10 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 )
                 with autocast_context(device, cfg.training.amp_mode):
                     yhat = model(pb, steps=steps)
+                    _check_finite_tensor(yhat, name="val prediction batch")
                     vloss = loss_fn(yhat, yb)
+                if not torch.isfinite(vloss).item():
+                    raise RuntimeError("Validation loss became non-finite")
                 val_loss_sum += float(vloss.detach().item())
                 val_count += 1
 

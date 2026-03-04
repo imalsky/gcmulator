@@ -1,3 +1,5 @@
+"""Grid-orientation helpers for latitude/longitude convention alignment."""
+
 from __future__ import annotations
 
 from typing import Dict, Tuple
@@ -6,6 +8,7 @@ import numpy as np
 
 
 def geometry_shift_for_nlon(nlon: int, roll_longitude_to_0_2pi: bool) -> int:
+    """Return longitude roll offset needed to move origin from [-pi,pi) to [0,2pi)."""
     if not roll_longitude_to_0_2pi:
         return 0
     if nlon % 2 != 0:
@@ -40,4 +43,3 @@ def apply_geometry_state(
         "nlon": int(nlon),
     }
     return out, info
-
