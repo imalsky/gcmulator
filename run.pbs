@@ -57,12 +57,20 @@ MY_SWAMP_INSTALL_LOG="${MY_SWAMP_INSTALL_LOG:-${PROJECT_ROOT}/my_swamp_install.l
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
 MY_SWAMP_INSTALL_NO_DEPS="${MY_SWAMP_INSTALL_NO_DEPS:-0}"
 MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax}"
+REQUIRE_TORCH_CUDA="${REQUIRE_TORCH_CUDA:-1}"
+REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
+ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-0}"
+GPU_MONITOR_INTERVAL_SEC="${GPU_MONITOR_INTERVAL_SEC:-30}"
+GPU_MONITOR_LOG="${GPU_MONITOR_LOG:-${PROJECT_ROOT}/gpu_monitor.log}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
 read -r -a MY_SWAMP_EXTRA_PACKAGES_ARR <<< "${MY_SWAMP_EXTRA_PACKAGES}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
+export REQUIRE_TORCH_CUDA
+export REQUIRE_JAX_GPU
+export GCMULATOR_REQUIRE_JAX_GPU="${GCMULATOR_REQUIRE_JAX_GPU:-${REQUIRE_JAX_GPU}}"
 
 if [ -n "${PBS_JOBID:-}" ]; then
   echo "PBS_JOBID: ${PBS_JOBID}"
@@ -159,6 +167,90 @@ then
   exit 1
 fi
 
+echo "Runtime preflight on host: $(hostname)"
+if [ -n "${PBS_NODEFILE:-}" ] && [ -f "${PBS_NODEFILE}" ]; then
+  echo "Allocated nodes:"
+  sort -u "${PBS_NODEFILE}" || true
+fi
+if ! python - <<'PY'
+import json
+import os
+import sys
+
+summary = {}
+ok = True
+
+try:
+    import torch
+
+    summary["torch_version"] = torch.__version__
+    summary["torch_cuda_version"] = str(getattr(torch.version, "cuda", None))
+    summary["torch_cuda_available"] = bool(torch.cuda.is_available())
+    summary["torch_device_count"] = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    if torch.cuda.is_available():
+        summary["torch_device_0"] = str(torch.cuda.get_device_name(0))
+except Exception as exc:
+    summary["torch_error"] = repr(exc)
+    ok = False
+
+try:
+    import jax
+
+    jax_backend = str(jax.default_backend()).lower()
+    summary["jax_version"] = jax.__version__
+    summary["jax_backend"] = jax_backend
+    summary["jax_devices"] = [str(d) for d in jax.devices()]
+except Exception as exc:
+    summary["jax_error"] = repr(exc)
+    jax_backend = "unknown"
+    ok = False
+
+print("Runtime backend summary:")
+print(json.dumps(summary, indent=2))
+
+require_torch_cuda = os.environ.get("REQUIRE_TORCH_CUDA", "0") == "1"
+require_jax_gpu = os.environ.get("REQUIRE_JAX_GPU", "0") == "1"
+
+if require_torch_cuda and not summary.get("torch_cuda_available", False):
+    print("ERROR: REQUIRE_TORCH_CUDA=1 but torch.cuda.is_available() is False", file=sys.stderr)
+    ok = False
+
+if require_jax_gpu and jax_backend not in {"gpu", "cuda", "rocm", "metal"}:
+    print(f"ERROR: REQUIRE_JAX_GPU=1 but jax backend is '{jax_backend}'", file=sys.stderr)
+    ok = False
+
+raise SystemExit(0 if ok else 1)
+PY
+then
+  echo "ERROR: runtime preflight failed. Check backend summary above."
+  exit 1
+fi
+
+GPU_MONITOR_PID=""
+if [ "${ENABLE_GPU_MONITOR}" = "1" ]; then
+  : > "${GPU_MONITOR_LOG}"
+  (
+    while true; do
+      {
+        echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
+        nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits
+        nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true
+      } >> "${GPU_MONITOR_LOG}" 2>&1
+      sleep "${GPU_MONITOR_INTERVAL_SEC}"
+    done
+  ) &
+  GPU_MONITOR_PID=$!
+  echo "GPU monitor enabled: ${GPU_MONITOR_LOG} (pid=${GPU_MONITOR_PID})"
+fi
+
+cleanup() {
+  if [ -n "${GPU_MONITOR_PID}" ]; then
+    kill "${GPU_MONITOR_PID}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+echo "Stage: dataset generation check (RUN_GEN_IF_MISSING=${RUN_GEN_IF_MISSING})"
 if [ "${RUN_GEN_IF_MISSING}" = "1" ]; then
   DATASET_DIR="$({ python - "${CONFIG_PATH}" <<'PY'
 from pathlib import Path
@@ -175,8 +267,12 @@ PY
     SIM_COUNT="$(find "${DATASET_DIR}" -maxdepth 1 -type f -name 'sim_*.npz' | wc -l | tr -d ' ')"
   fi
   if [ "${SIM_COUNT}" -eq 0 ]; then
+    echo "Stage: generating dataset"
     python -u "${MAIN_PY}" --gen --config "${CONFIG_PATH}"
+  else
+    echo "Stage: dataset already present (${SIM_COUNT} files), skipping generation"
   fi
 fi
 
+echo "Stage: training"
 python -u "${MAIN_PY}" --train --config "${CONFIG_PATH}"
