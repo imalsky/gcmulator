@@ -290,7 +290,7 @@ Local environment requirement:
 - Optionally runs generation only when raw sims are missing (`RUN_GEN_IF_MISSING=1`).
 - Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
 - Reinstalls only `my_swamp` with `--no-deps` so existing environment package versions remain unchanged.
-- Always refreshes `torch_harmonics` before training (`TORCH_HARMONICS_PACKAGE_SPEC`, default `git+https://github.com/NVIDIA/torch-harmonics.git`, configurable pip args via `TORCH_HARMONICS_PIP_ARGS`).
+- Always refreshes `torch_harmonics` before training (`TORCH_HARMONICS_PACKAGE_SPEC`, default `git+https://github.com/NVIDIA/torch-harmonics.git`, configurable pip args via `TORCH_HARMONICS_PIP_ARGS`, default `--no-deps --no-build-isolation`).
 - Verifies `torch_harmonics` import immediately after install and fails early if unavailable.
 - Exposes generation/runtime defaults via environment:
   - `SWAMPE_JAX_ENABLE_X64` (default `0`)
@@ -304,7 +304,7 @@ Local environment requirement:
 - Loads module stack (`miniconda3/gh2`) and activates conda env (`CONDA_ENV`, default `pyt2_8_gh`).
 - Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
 - Reinstalls only `my_swamp` with `--no-deps` so existing environment package versions remain unchanged.
-- Always refreshes `torch_harmonics` before training (`TORCH_HARMONICS_PACKAGE_SPEC`, default `git+https://github.com/NVIDIA/torch-harmonics.git`, configurable pip args via `TORCH_HARMONICS_PIP_ARGS`).
+- Always refreshes `torch_harmonics` before training (`TORCH_HARMONICS_PACKAGE_SPEC`, default `git+https://github.com/NVIDIA/torch-harmonics.git`, configurable pip args via `TORCH_HARMONICS_PIP_ARGS`, default `--no-deps --no-build-isolation`).
 - Verifies `torch_harmonics` import immediately after install and includes it in runtime preflight checks.
 - Enforces runtime GPU preflight by default (`REQUIRE_TORCH_CUDA=1`, `REQUIRE_JAX_GPU=1`) and records periodic `nvidia-smi` samples (`ENABLE_GPU_MONITOR=1`).
 - Exposes generation/runtime defaults via environment:

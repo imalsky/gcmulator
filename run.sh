@@ -23,7 +23,7 @@ RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
 TORCH_HARMONICS_PACKAGE_SPEC="${TORCH_HARMONICS_PACKAGE_SPEC:-git+https://github.com/NVIDIA/torch-harmonics.git}"
-TORCH_HARMONICS_PIP_ARGS="${TORCH_HARMONICS_PIP_ARGS:---no-deps}"
+TORCH_HARMONICS_PIP_ARGS="${TORCH_HARMONICS_PIP_ARGS:---no-deps --no-build-isolation}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
 read -r -a TORCH_HARMONICS_PIP_ARGS_ARR <<< "${TORCH_HARMONICS_PIP_ARGS}"
 
