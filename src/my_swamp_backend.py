@@ -18,11 +18,16 @@ FIELDS_5 = ["Phi", "U", "V", "eta", "delta"]
 
 
 def enforce_no_tpu_backend() -> None:
-    """Force JAX backend selection to exclude TPU.
+    """Force JAX backend selection to exclude TPU and set safe runtime defaults.
 
     Keeps existing user selection when possible, but removes `tpu`.
     Falls back to JAX auto-selection when no explicit non-TPU platform remains.
+    Also defaults MY_SWAMP generation to float32 and disables aggressive
+    XLA preallocation unless the user has explicitly configured these.
     """
+    os.environ.setdefault("SWAMPE_JAX_ENABLE_X64", "0")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
     raw_platforms = os.environ.get("JAX_PLATFORMS", "")
     if raw_platforms.strip():
         parts = [p.strip() for p in raw_platforms.split(",") if p.strip()]
