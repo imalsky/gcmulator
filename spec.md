@@ -259,7 +259,7 @@ Import strategy:
 - Uses `MAIN_PY` (default `src/main.py`).
 - Optionally runs generation only when raw sims are missing (`RUN_GEN_IF_MISSING=1`).
 - Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
-- Installs explicit runtime deps for `my_swamp` (`MY_SWAMP_EXTRA_PACKAGES`, default `jax[cuda13]`).
+- Installs explicit runtime deps for `my_swamp` (`MY_SWAMP_EXTRA_PACKAGES`, default `jax[cuda12]`).
 - Runs training.
 
 ### 11.3 PBS Convenience Script (`run.pbs`)
@@ -267,7 +267,7 @@ Import strategy:
 - Loads module stack (`miniconda3/gh2`) and activates conda env (`CONDA_ENV`, default `pyt2_8_gh`).
 - Supports optional GH200 package correction path for `h5py` (`FIX_H5PY_ARM`, `H5PY_SPEC`).
 - Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
-- Installs explicit runtime deps for `my_swamp` (`MY_SWAMP_EXTRA_PACKAGES`, default `jax[cuda13]`).
+- Installs explicit runtime deps for `my_swamp` (`MY_SWAMP_EXTRA_PACKAGES`, default `jax[cuda12]`).
 - Enforces runtime GPU preflight by default (`REQUIRE_TORCH_CUDA=1`, `REQUIRE_JAX_GPU=1`) and records periodic `nvidia-smi` samples (`ENABLE_GPU_MONITOR=1`).
 - Uses generation/training flow control `RUN_GEN_IF_MISSING` consistent with `run.sh`.
 

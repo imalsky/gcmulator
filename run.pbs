@@ -56,9 +56,11 @@ DEBUG_MY_SWAMP_INSTALL="${DEBUG_MY_SWAMP_INSTALL:-1}"
 MY_SWAMP_INSTALL_LOG="${MY_SWAMP_INSTALL_LOG:-${PROJECT_ROOT}/my_swamp_install.log}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
 MY_SWAMP_INSTALL_NO_DEPS="${MY_SWAMP_INSTALL_NO_DEPS:-0}"
-MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax[cuda13]}"
+# my_swamp currently resolves JAX 0.6.x where CUDA wheels are exposed via cuda12 extras.
+MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax[cuda12]}"
 JAX_FORCE_REINSTALL="${JAX_FORCE_REINSTALL:-1}"
-JAX_PIP_ARGS="${JAX_PIP_ARGS:---find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html --extra-index-url https://pypi.org/simple/}"
+JAX_PIP_ARGS="${JAX_PIP_ARGS:---index-url https://pypi.org/simple/}"
+JAX_EXPECTED_PLUGIN_MODULE="${JAX_EXPECTED_PLUGIN_MODULE:-jax_cuda12_plugin}"
 REQUIRE_TORCH_CUDA="${REQUIRE_TORCH_CUDA:-1}"
 REQUIRE_JAX_GPU="${REQUIRE_JAX_GPU:-1}"
 ENABLE_GPU_MONITOR="${ENABLE_GPU_MONITOR:-1}"
@@ -74,6 +76,7 @@ export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1
 export REQUIRE_TORCH_CUDA
 export REQUIRE_JAX_GPU
 export GCMULATOR_REQUIRE_JAX_GPU="${GCMULATOR_REQUIRE_JAX_GPU:-${REQUIRE_JAX_GPU}}"
+export JAX_EXPECTED_PLUGIN_MODULE
 
 if [ -n "${PBS_JOBID:-}" ]; then
   echo "PBS_JOBID: ${PBS_JOBID}"
@@ -121,6 +124,7 @@ PY
   echo "  MY_SWAMP_EXTRA_PACKAGES : ${MY_SWAMP_EXTRA_PACKAGES:-<none>}"
   echo "  JAX_FORCE_REINSTALL     : ${JAX_FORCE_REINSTALL}"
   echo "  JAX_PIP_ARGS            : ${JAX_PIP_ARGS}"
+  echo "  JAX_EXPECTED_PLUGIN_MODULE: ${JAX_EXPECTED_PLUGIN_MODULE}"
   echo "  LD_LIBRARY_PATH         : ${LD_LIBRARY_PATH:-<unset>}"
   python - <<'PY'
 import importlib.util
@@ -174,12 +178,19 @@ if [ "${#MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" -gt 0 ] && [ -n "${MY_SWAMP_EXTRA_PACK
 fi
 
 echo "Installed JAX package summary:"
-python -m pip show jax jaxlib jax-cuda13-plugin jax-cuda13-pjrt 2>/dev/null || true
+python -m pip show jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt 2>/dev/null || true
 python - <<'PY'
 import importlib
 import importlib.util
 
-mods = ["jax", "jaxlib", "jax_cuda13_plugin", "jax_cuda13_pjrt"]
+mods = [
+    "jax",
+    "jaxlib",
+    "jax_cuda12_plugin",
+    "jax_cuda12_pjrt",
+    "jax_cuda13_plugin",
+    "jax_cuda13_pjrt",
+]
 for name in mods:
     spec = importlib.util.find_spec(name)
     print(f"module {name}: {'FOUND' if spec is not None else 'MISSING'}")
@@ -192,6 +203,30 @@ try:
 except Exception as exc:
     print(f"jaxlib import error: {exc!r}")
 PY
+
+if [ "${REQUIRE_JAX_GPU}" = "1" ]; then
+  if ! python - <<'PY'
+import importlib.util
+import os
+
+mod = os.environ.get("JAX_EXPECTED_PLUGIN_MODULE", "").strip()
+if not mod:
+    raise SystemExit(0)
+
+spec = importlib.util.find_spec(mod)
+print(f"Expected JAX GPU plugin module ({mod}): {'FOUND' if spec is not None else 'MISSING'}")
+if spec is not None:
+    print(f"  origin={spec.origin}")
+raise SystemExit(0 if spec is not None else 1)
+PY
+  then
+    echo "ERROR: required JAX GPU plugin module is missing: ${JAX_EXPECTED_PLUGIN_MODULE}"
+    echo "Hint: keep MY_SWAMP_EXTRA_PACKAGES at default jax[cuda12] unless your site provides another supported spec."
+    echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
+    tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
+    exit 1
+  fi
+fi
 
 if ! python - <<'PY'
 import my_swamp

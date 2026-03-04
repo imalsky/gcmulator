@@ -22,7 +22,8 @@ MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
-MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax[cuda13]}"
+# Match my_swamp's JAX 0.6.x dependency family (cuda12 extra is the GPU-enabled path).
+MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax[cuda12]}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
 read -r -a MY_SWAMP_EXTRA_PACKAGES_ARR <<< "${MY_SWAMP_EXTRA_PACKAGES}"
 
