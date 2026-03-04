@@ -22,7 +22,9 @@ MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
+MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax[cuda13]}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
+read -r -a MY_SWAMP_EXTRA_PACKAGES_ARR <<< "${MY_SWAMP_EXTRA_PACKAGES}"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda not found on PATH."
@@ -60,6 +62,10 @@ fi
 echo "Reinstalling my_swamp package: ${MY_SWAMP_PACKAGE_SPEC}"
 python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
 python -m pip install --no-cache-dir --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_PACKAGE_SPEC}"
+if [ "${#MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" -gt 0 ] && [ -n "${MY_SWAMP_EXTRA_PACKAGES_ARR[0]}" ]; then
+  echo "Installing explicit runtime dependencies: ${MY_SWAMP_EXTRA_PACKAGES_ARR[*]}"
+  python -m pip install --no-cache-dir --upgrade "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_EXTRA_PACKAGES_ARR[@]}"
+fi
 if ! python - <<'PY' >/dev/null 2>&1
 import my_swamp  # noqa: F401
 PY
