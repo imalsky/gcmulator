@@ -55,7 +55,10 @@ MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 DEBUG_MY_SWAMP_INSTALL="${DEBUG_MY_SWAMP_INSTALL:-1}"
 MY_SWAMP_INSTALL_LOG="${MY_SWAMP_INSTALL_LOG:-${PROJECT_ROOT}/my_swamp_install.log}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
+MY_SWAMP_INSTALL_NO_DEPS="${MY_SWAMP_INSTALL_NO_DEPS:-0}"
+MY_SWAMP_EXTRA_PACKAGES="${MY_SWAMP_EXTRA_PACKAGES:-jax}"
 read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
+read -r -a MY_SWAMP_EXTRA_PACKAGES_ARR <<< "${MY_SWAMP_EXTRA_PACKAGES}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -103,6 +106,12 @@ PY
   else
     echo "  PIP_EXTRA_INDEX_URL: unset"
   fi
+  echo "  MY_SWAMP_INSTALL_NO_DEPS: ${MY_SWAMP_INSTALL_NO_DEPS}"
+  echo "  MY_SWAMP_EXTRA_PACKAGES : ${MY_SWAMP_EXTRA_PACKAGES:-<none>}"
+  python - <<'PY'
+import importlib.util
+print(f"  jax currently importable: {importlib.util.find_spec('jax') is not None}")
+PY
 fi
 
 echo "Reinstalling my_swamp package (primary spec): ${MY_SWAMP_PACKAGE_SPEC}"
@@ -112,14 +121,29 @@ python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
 INSTALLED_SPEC="${MY_SWAMP_PACKAGE_SPEC}"
 echo "Attempting my_swamp install spec: ${INSTALLED_SPEC}"
 echo "== Attempt: ${INSTALLED_SPEC} ==" >> "${MY_SWAMP_INSTALL_LOG}"
-if ! python -m pip install --no-cache-dir --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${INSTALLED_SPEC}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
+INSTALL_ARGS=(--no-cache-dir --upgrade "${MY_SWAMP_PIP_ARGS_ARR[@]}")
+if [ "${MY_SWAMP_INSTALL_NO_DEPS}" = "1" ]; then
+  INSTALL_ARGS+=(--no-deps)
+fi
+if ! python -m pip install "${INSTALL_ARGS[@]}" "${INSTALLED_SPEC}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
   echo "ERROR: failed to install my_swamp from spec: ${INSTALLED_SPEC}"
   echo "Hint: set MY_SWAMP_PACKAGE_SPEC to a valid wheel/URL/private-index name."
   echo "Hint: pass index args via MY_SWAMP_PIP_ARGS, e.g."
-  echo "      MY_SWAMP_PIP_ARGS='--extra-index-url <url> --trusted-host <host>'"
+  echo "      MY_SWAMP_PIP_ARGS='--index-url <url> --extra-index-url <url> --trusted-host <host>'"
   echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
   tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
   exit 1
+fi
+
+if [ "${#MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" -gt 0 ] && [ -n "${MY_SWAMP_EXTRA_PACKAGES_ARR[0]}" ]; then
+  echo "Installing explicit runtime dependencies: ${MY_SWAMP_EXTRA_PACKAGES_ARR[*]}"
+  echo "== Extra packages: ${MY_SWAMP_EXTRA_PACKAGES_ARR[*]} ==" >> "${MY_SWAMP_INSTALL_LOG}"
+  if ! python -m pip install --no-cache-dir --upgrade "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_EXTRA_PACKAGES_ARR[@]}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
+    echo "ERROR: failed installing MY_SWAMP_EXTRA_PACKAGES (${MY_SWAMP_EXTRA_PACKAGES_ARR[*]})"
+    echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
+    tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
+    exit 1
+  fi
 fi
 
 if ! python - <<'PY'
