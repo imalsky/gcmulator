@@ -51,7 +51,11 @@ fi
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
 MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
-MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my_swamp}"
+MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
+DEBUG_MY_SWAMP_INSTALL="${DEBUG_MY_SWAMP_INSTALL:-1}"
+MY_SWAMP_INSTALL_LOG="${MY_SWAMP_INSTALL_LOG:-${PROJECT_ROOT}/my_swamp_install.log}"
+MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
+read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
 
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -79,14 +83,55 @@ if [ ! -f "${MAIN_PY}" ]; then
 fi
 
 # Always refresh my_swamp from package source in this environment.
-echo "Reinstalling my_swamp package: ${MY_SWAMP_PACKAGE_SPEC}"
+if [ "${DEBUG_MY_SWAMP_INSTALL}" = "1" ]; then
+  echo "my_swamp install debug:"
+  echo "  python executable: $(command -v python)"
+  echo "  pip module path  : $(python - <<'PY'
+import pip
+print(pip.__file__)
+PY
+)"
+  echo "  python version   : $(python --version 2>&1)"
+  echo "  pip version      : $(python -m pip --version 2>&1)"
+  if [ -n "${PIP_INDEX_URL:-}" ]; then
+    echo "  PIP_INDEX_URL    : set"
+  else
+    echo "  PIP_INDEX_URL    : unset"
+  fi
+  if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then
+    echo "  PIP_EXTRA_INDEX_URL: set"
+  else
+    echo "  PIP_EXTRA_INDEX_URL: unset"
+  fi
+fi
+
+echo "Reinstalling my_swamp package (primary spec): ${MY_SWAMP_PACKAGE_SPEC}"
 python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
-python -m pip install --no-cache-dir --upgrade --no-deps "${MY_SWAMP_PACKAGE_SPEC}"
-if ! python - <<'PY' >/dev/null 2>&1
-import my_swamp  # noqa: F401
+
+: > "${MY_SWAMP_INSTALL_LOG}"
+INSTALLED_SPEC="${MY_SWAMP_PACKAGE_SPEC}"
+echo "Attempting my_swamp install spec: ${INSTALLED_SPEC}"
+echo "== Attempt: ${INSTALLED_SPEC} ==" >> "${MY_SWAMP_INSTALL_LOG}"
+if ! python -m pip install --no-cache-dir --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${INSTALLED_SPEC}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
+  echo "ERROR: failed to install my_swamp from spec: ${INSTALLED_SPEC}"
+  echo "Hint: set MY_SWAMP_PACKAGE_SPEC to a valid wheel/URL/private-index name."
+  echo "Hint: pass index args via MY_SWAMP_PIP_ARGS, e.g."
+  echo "      MY_SWAMP_PIP_ARGS='--extra-index-url <url> --trusted-host <host>'"
+  echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
+  tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
+  exit 1
+fi
+
+if ! python - <<'PY'
+import my_swamp
+import sys
+print(f"my_swamp import OK from: {getattr(my_swamp, '__file__', '<namespace>')}")
+print(f"python executable: {sys.executable}")
 PY
 then
-  echo "ERROR: my_swamp import failed after package install (${MY_SWAMP_PACKAGE_SPEC})"
+  echo "ERROR: my_swamp import failed after package install (${INSTALLED_SPEC})"
+  echo "Install log tail (${MY_SWAMP_INSTALL_LOG}):"
+  tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
   exit 1
 fi
 

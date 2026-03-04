@@ -258,14 +258,14 @@ Import strategy:
 - Activates conda env (`CONDA_ENV`, default `swamp_compare`).
 - Uses `MAIN_PY` (default `src/main.py`).
 - Optionally runs generation only when raw sims are missing (`RUN_GEN_IF_MISSING=1`).
-- Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my_swamp`).
+- Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
 - Runs training.
 
 ### 11.3 PBS Convenience Script (`run.pbs`)
 - Uses PBS job directives for GH200 targets (`gpu_long`, `model=gh200`, configured walltime/resources).
 - Loads module stack (`miniconda3/gh2`) and activates conda env (`CONDA_ENV`, default `pyt2_8_gh`).
 - Supports optional GH200 package correction path for `h5py` (`FIX_H5PY_ARM`, `H5PY_SPEC`).
-- Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my_swamp`).
+- Always refreshes `my_swamp` from package source each run (`MY_SWAMP_PACKAGE_SPEC`, default `my-swamp` from TestPyPI via `MY_SWAMP_PIP_ARGS`).
 - Uses generation/training flow control `RUN_GEN_IF_MISSING` consistent with `run.sh`.
 
 ### 11.4 SWAMPE Parity Check
