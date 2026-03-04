@@ -68,8 +68,9 @@ Fixed canonical parameter ordering is:
 2. Resolve output dataset directory.
 3. Sample `n_sims` parameter sets from config distributions.
 4. Run MY_SWAMP terminal solves either:
-   - scalar (`GCMULATOR_JAX_SIM_BATCH=1`, default), or
-   - batched via JAX `vmap` (`GCMULATOR_JAX_SIM_BATCH>1`, only when `generation_workers==1`).
+   - scalar (`GCMULATOR_JAX_SIM_BATCH=1`), or
+   - batched via JAX `vmap` (`GCMULATOR_JAX_SIM_BATCH>1`, only when `generation_workers==1`), or
+   - auto mode (`GCMULATOR_JAX_SIM_BATCH=auto`, default), which currently selects batch `4` on single-worker GPU generation and `1` otherwise.
 5. Each solve uses terminal-only MY_SWAMP integration with:
    - `jit_scan=True`
    - `donate_state=True`
@@ -273,7 +274,7 @@ Import strategy:
 - Exposes generation/runtime defaults via environment:
   - `SWAMPE_JAX_ENABLE_X64` (default `0`)
   - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
-  - `GCMULATOR_JAX_SIM_BATCH` (default `1`)
+  - `GCMULATOR_JAX_SIM_BATCH` (default `auto`)
 - Runs training.
 
 ### 11.3 PBS Convenience Script (`run.pbs`)
@@ -285,7 +286,7 @@ Import strategy:
 - Exposes generation/runtime defaults via environment:
   - `SWAMPE_JAX_ENABLE_X64` (default `0`)
   - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
-  - `GCMULATOR_JAX_SIM_BATCH` (default `1`)
+  - `GCMULATOR_JAX_SIM_BATCH` (default `auto`)
 - Uses generation/training flow control `RUN_GEN_IF_MISSING` consistent with `run.sh`.
 
 ### 11.4 SWAMPE Parity Check

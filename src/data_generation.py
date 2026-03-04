@@ -51,15 +51,43 @@ def _resolve_generation_workers(*, requested_workers: int, n_sims: int, jax_back
     return 1
 
 
-def _resolve_sim_batch_size(*, n_sims: int) -> int:
-    """Resolve per-call JAX batch size for independent terminal simulations."""
-    raw = os.environ.get("GCMULATOR_JAX_SIM_BATCH", "1").strip()
-    try:
-        batch = int(raw)
-    except Exception as exc:
-        raise ValueError(f"GCMULATOR_JAX_SIM_BATCH must be an integer >= 1, got {raw!r}") from exc
-    if batch < 1:
-        raise ValueError(f"GCMULATOR_JAX_SIM_BATCH must be >= 1, got {batch}")
+def _resolve_sim_batch_size(
+    *,
+    n_sims: int,
+    jax_backend: str,
+    generation_workers: int,
+) -> int:
+    """Resolve per-call JAX batch size for independent terminal simulations.
+
+    Environment knob:
+    - ``GCMULATOR_JAX_SIM_BATCH=auto`` (default): use a conservative GPU batch.
+    - ``GCMULATOR_JAX_SIM_BATCH=<int>=1``: force explicit batch size.
+    """
+    raw = os.environ.get("GCMULATOR_JAX_SIM_BATCH", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        if jax_backend.lower() in GPU_BACKENDS and int(generation_workers) == 1:
+            batch = 4
+        else:
+            batch = 1
+    else:
+        try:
+            batch = int(raw)
+        except Exception as exc:
+            raise ValueError(
+                "GCMULATOR_JAX_SIM_BATCH must be 'auto' or an integer >= 1, "
+                f"got {raw!r}"
+            ) from exc
+        if batch < 1:
+            raise ValueError(f"GCMULATOR_JAX_SIM_BATCH must be >= 1, got {batch}")
+
+    if int(generation_workers) != 1 and batch > 1:
+        LOGGER.warning(
+            "Requested GCMULATOR_JAX_SIM_BATCH=%d but generation_workers=%d. "
+            "Batched vmap generation is only used with generation_workers=1; falling back to 1.",
+            batch,
+            int(generation_workers),
+        )
+        batch = 1
     return min(batch, int(n_sims))
 
 
@@ -185,7 +213,11 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         n_sims=n_sims,
         jax_backend=jax_backend,
     )
-    sim_batch_size = _resolve_sim_batch_size(n_sims=n_sims)
+    sim_batch_size = _resolve_sim_batch_size(
+        n_sims=n_sims,
+        jax_backend=jax_backend,
+        generation_workers=generation_workers,
+    )
     compress_raw = os.environ.get("GCMULATOR_COMPRESS_RAW", "0") == "1"
     LOGGER.info(
         "Dataset generation backend=%s | generation_workers=%d (requested=%d) | sim_batch_size=%d | raw_compression=%s",
@@ -195,6 +227,11 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         sim_batch_size,
         "on" if compress_raw else "off",
     )
+    if generation_workers == 1 and sim_batch_size > 1:
+        LOGGER.info(
+            "Batched terminal generation is active: vmap batch size=%d.",
+            sim_batch_size,
+        )
     if jax_backend.lower() in GPU_BACKENDS and generation_workers > 1:
         LOGGER.warning(
             "generation_workers=%d on a single GPU may reduce throughput due to contention. "
