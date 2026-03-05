@@ -56,7 +56,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Run GCMulator data generation or training")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--gen", action="store_true", help="Generate MY_SWAMP terminal-state dataset")
+    group.add_argument("--gen", action="store_true", help="Generate MY_SWAMP trajectory-transition dataset")
     group.add_argument("--train", action="store_true", help="Train emulator from generated dataset")
     parser.add_argument("--config", type=str, default=None, help="Path to config JSON/YAML (default: ./config.json)")
     args = parser.parse_args()

@@ -1,4 +1,4 @@
-"""Raw dataset generation pipeline using MY_SWAMP terminal states."""
+"""Raw dataset generation pipeline using MY_SWAMP trajectory transitions."""
 
 from __future__ import annotations
 
@@ -16,15 +16,14 @@ from .config import Extended9Params, GCMulatorConfig, resolve_path
 from .geometry import apply_geometry_state
 from .my_swamp_backend import (
     FIELDS_5,
+    conditioning_param_names,
     detect_jax_backend,
     ensure_my_swamp_importable,
-    param_names_extended9,
-    params_to_json_dict,
-    params_to_ordered_vector,
-    run_terminal_state_batch,
-    run_terminal_state,
+    params_to_conditioning_vector,
+    params_to_public_json_dict,
+    run_trajectory_transitions,
 )
-from .sampling import EXTENDED9_PARAM_NAMES, sample_parameter_dict, to_extended9
+from .sampling import CONDITIONING_PARAM_NAMES, sample_parameter_dict, to_extended9
 
 LOGGER = logging.getLogger("src.generate")
 GPU_BACKENDS = {"gpu", "cuda", "rocm", "metal"}
@@ -60,7 +59,7 @@ def _resolve_sim_batch_size(
     jax_backend: str,
     generation_workers: int,
 ) -> int:
-    """Resolve per-call JAX batch size for independent terminal simulations.
+    """Resolve per-call JAX batch size for independent trajectory simulations.
 
     Environment knob:
     - ``GCMULATOR_JAX_SIM_BATCH=auto`` (default): use a conservative GPU batch.
@@ -97,7 +96,7 @@ def _resolve_sim_batch_size(
     if int(generation_workers) != 1 and batch > 1:
         LOGGER.warning(
             "Requested GCMULATOR_JAX_SIM_BATCH=%d but generation_workers=%d. "
-            "Batched vmap generation is only used with generation_workers=1; falling back to 1.",
+            "Trajectory-transition generation currently uses scalar solves; falling back to 1.",
             batch,
             int(generation_workers),
         )
@@ -109,30 +108,77 @@ def _write_sim_record(
     *,
     sim_idx: int,
     params: Extended9Params,
-    state: Any,
+    state_inputs: np.ndarray,
+    state_targets: np.ndarray,
+    transition_days: np.ndarray,
     cfg: GCMulatorConfig,
     dataset_dir: Path,
     param_names: List[str],
 ) -> Dict[str, Any]:
-    """Write one terminal state into a ``sim_XXXXXX.npy`` file and metadata record."""
-    state_chw = state.as_stacked().astype(np.float32, copy=False)
-    state_chw, geom_info = apply_geometry_state(
-        state_chw,
-        flip_latitude_to_north_south=cfg.geometry.flip_latitude_to_north_south,
-        roll_longitude_to_0_2pi=cfg.geometry.roll_longitude_to_0_2pi,
-    )
+    """Write one transition trajectory into a ``sim_XXXXXX.npy`` file."""
+    if state_inputs.ndim != 4 or state_targets.ndim != 4:
+        raise ValueError(
+            "state_inputs/state_targets must be [T,C,H,W], got "
+            f"{tuple(state_inputs.shape)} and {tuple(state_targets.shape)}"
+        )
+    if state_inputs.shape != state_targets.shape:
+        raise ValueError(f"state_inputs/state_targets shape mismatch: {state_inputs.shape} vs {state_targets.shape}")
+    if transition_days.ndim != 1 or int(transition_days.shape[0]) != int(state_inputs.shape[0]):
+        raise ValueError(
+            "transition_days must be [T] aligned with trajectory transitions, got "
+            f"{tuple(transition_days.shape)} for T={state_inputs.shape[0]}"
+        )
+
+    t_len = int(state_inputs.shape[0])
+    state_inputs_geom = np.empty_like(state_inputs, dtype=np.float32)
+    state_targets_geom = np.empty_like(state_targets, dtype=np.float32)
+    geom_info: Dict[str, Any] | None = None
+    for ti in range(t_len):
+        x_in, g_in = apply_geometry_state(
+            state_inputs[ti].astype(np.float32, copy=False),
+            flip_latitude_to_north_south=cfg.geometry.flip_latitude_to_north_south,
+            roll_longitude_to_0_2pi=cfg.geometry.roll_longitude_to_0_2pi,
+        )
+        x_out, g_out = apply_geometry_state(
+            state_targets[ti].astype(np.float32, copy=False),
+            flip_latitude_to_north_south=cfg.geometry.flip_latitude_to_north_south,
+            roll_longitude_to_0_2pi=cfg.geometry.roll_longitude_to_0_2pi,
+        )
+        if (g_in["lat_order"], g_in["lon_origin"], int(g_in["lon_shift"])) != (
+            g_out["lat_order"],
+            g_out["lon_origin"],
+            int(g_out["lon_shift"]),
+        ):
+            raise RuntimeError("Geometry conversion mismatch between input and target states.")
+        if geom_info is None:
+            geom_info = g_in
+        else:
+            if (geom_info["lat_order"], geom_info["lon_origin"], int(geom_info["lon_shift"])) != (
+                g_in["lat_order"],
+                g_in["lon_origin"],
+                int(g_in["lon_shift"]),
+            ):
+                raise RuntimeError("Inconsistent geometry metadata across trajectory transitions.")
+        state_inputs_geom[ti] = x_in
+        state_targets_geom[ti] = x_out
+    if geom_info is None:
+        raise RuntimeError("Failed to infer geometry metadata for trajectory record.")
 
     sim_file = dataset_dir / f"sim_{sim_idx:06d}.npy"
     payload = {
-        "state_final": state_chw,
+        "state_inputs": state_inputs_geom,
+        "state_targets": state_targets_geom,
+        "transition_days": transition_days.astype(np.float64, copy=False),
         "fields": np.asarray(FIELDS_5, dtype=object),
-        "params": params_to_ordered_vector(params),
+        "params": params_to_conditioning_vector(params),
         "param_names": np.asarray(param_names, dtype=object),
         "time_days": np.asarray(float(cfg.solver.default_time_days), dtype=np.float64),
         "dt_seconds": np.asarray(float(cfg.solver.dt_seconds), dtype=np.float64),
+        "transition_jump_steps": np.asarray(int(cfg.model.transition_jump_steps), dtype=np.int64),
+        "n_transitions": np.asarray(int(t_len), dtype=np.int64),
         "M": np.asarray(int(cfg.solver.M), dtype=np.int64),
-        "nlat": np.asarray(int(state_chw.shape[-2]), dtype=np.int64),
-        "nlon": np.asarray(int(state_chw.shape[-1]), dtype=np.int64),
+        "nlat": np.asarray(int(state_inputs_geom.shape[-2]), dtype=np.int64),
+        "nlon": np.asarray(int(state_inputs_geom.shape[-1]), dtype=np.int64),
         "lat_order": np.asarray(geom_info["lat_order"], dtype=object),
         "lon_origin": np.asarray(geom_info["lon_origin"], dtype=object),
         "lon_shift": np.asarray(int(geom_info["lon_shift"]), dtype=np.int64),
@@ -144,12 +190,16 @@ def _write_sim_record(
         "file": sim_file.name,
         "fields": list(FIELDS_5),
         "param_names": list(param_names),
-        "params": params_to_json_dict(params),
+        "params": params_to_public_json_dict(params),
         "time_days": float(cfg.solver.default_time_days),
+        "transition_jump_steps": int(cfg.model.transition_jump_steps),
+        "n_transitions": int(t_len),
+        "transition_days_min": float(np.min(transition_days)),
+        "transition_days_max": float(np.max(transition_days)),
         "dt_seconds": float(cfg.solver.dt_seconds),
         "M": int(cfg.solver.M),
-        "nlat": int(state_chw.shape[-2]),
-        "nlon": int(state_chw.shape[-1]),
+        "nlat": int(state_inputs_geom.shape[-2]),
+        "nlon": int(state_inputs_geom.shape[-1]),
         "lat_order": str(geom_info["lat_order"]),
         "lon_origin": str(geom_info["lon_origin"]),
         "lon_shift": int(geom_info["lon_shift"]),
@@ -164,18 +214,22 @@ def _write_one_sim(
     dataset_dir: Path,
     param_names: List[str],
 ) -> Dict[str, Any]:
-    """Run one simulation and write one ``sim_XXXXXX.npy`` output file."""
-    state = run_terminal_state(
+    """Run one simulation and write trajectory transitions to one file."""
+    state_inputs, state_targets, transition_days = run_trajectory_transitions(
         params,
         M=cfg.solver.M,
         dt_seconds=cfg.solver.dt_seconds,
         time_days=cfg.solver.default_time_days,
         starttime_index=cfg.solver.starttime_index,
+        n_transitions=cfg.model.rollout_steps_at_default_time,
+        transition_jump_steps=cfg.model.transition_jump_steps,
     )
     return _write_sim_record(
         sim_idx=sim_idx,
         params=params,
-        state=state,
+        state_inputs=state_inputs,
+        state_targets=state_targets,
+        transition_days=transition_days,
         cfg=cfg,
         dataset_dir=dataset_dir,
         param_names=param_names,
@@ -188,7 +242,7 @@ def _log_progress(*, completed: int, total: int, start_t: float) -> None:
     avg = elapsed / float(completed)
     remain = avg * float(total - completed)
     LOGGER.info(
-        "Generated %4d/%4d terminal sims | elapsed=%8.1fs | ETA=%8.1fs",
+        "Generated %4d/%4d trajectory sims | elapsed=%8.1fs | ETA=%8.1fs",
         completed,
         total,
         elapsed,
@@ -197,7 +251,7 @@ def _log_progress(*, completed: int, total: int, start_t: float) -> None:
 
 
 def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
-    """Generate terminal-state dataset using MY_SWAMP truth only."""
+    """Generate trajectory-transition dataset using MY_SWAMP truth."""
     ensure_my_swamp_importable(config_path.parent)
 
     dataset_dir = resolve_path(config_path, cfg.paths.dataset_dir)
@@ -214,7 +268,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
 
     n_sims = int(cfg.sampling.n_sims)
     rng = np.random.default_rng(cfg.sampling.seed)
-    param_names = list(param_names_extended9())
+    param_names = list(conditioning_param_names())
     sampled_params = [to_extended9(sample_parameter_dict(rng, cfg.sampling.parameters)) for _ in range(n_sims)]
 
     jax_backend = detect_jax_backend()
@@ -236,11 +290,12 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         sim_batch_size,
         "npy",
     )
-    if generation_workers == 1 and sim_batch_size > 1:
-        LOGGER.info(
-            "Batched terminal generation is active: vmap batch size=%d.",
+    if sim_batch_size > 1:
+        LOGGER.warning(
+            "Trajectory-transition generation currently runs scalar simulations; ignoring sim_batch=%d.",
             sim_batch_size,
         )
+        sim_batch_size = 1
     if jax_backend.lower() in GPU_BACKENDS and generation_workers > 1:
         LOGGER.warning(
             "generation_workers=%d on a single GPU may reduce throughput due to contention. "
@@ -260,62 +315,17 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
     completed = 0
 
     if generation_workers == 1:
-        if sim_batch_size == 1:
-            for sim_idx, params in enumerate(sampled_params):
-                written_by_idx[sim_idx] = _write_one_sim(
-                    sim_idx=sim_idx,
-                    params=params,
-                    cfg=cfg,
-                    dataset_dir=dataset_dir,
-                    param_names=param_names,
-                )
-                completed += 1
-                if (completed % log_every) == 0 or completed == n_sims:
-                    _log_progress(completed=completed, total=n_sims, start_t=start_t)
-        else:
-            full_batches = n_sims // sim_batch_size
-            for batch_idx in range(full_batches):
-                i0 = batch_idx * sim_batch_size
-                i1 = i0 + sim_batch_size
-                params_batch = sampled_params[i0:i1]
-                states = run_terminal_state_batch(
-                    params_batch,
-                    M=cfg.solver.M,
-                    dt_seconds=cfg.solver.dt_seconds,
-                    time_days=cfg.solver.default_time_days,
-                    starttime_index=cfg.solver.starttime_index,
-                )
-                if len(states) != len(params_batch):
-                    raise RuntimeError(
-                        f"Batched run returned {len(states)} states for {len(params_batch)} params."
-                    )
-                for offset, (params, state) in enumerate(zip(params_batch, states)):
-                    sim_idx = i0 + offset
-                    written_by_idx[sim_idx] = _write_sim_record(
-                        sim_idx=sim_idx,
-                        params=params,
-                        state=state,
-                        cfg=cfg,
-                        dataset_dir=dataset_dir,
-                        param_names=param_names,
-                    )
-                    completed += 1
-                    if (completed % log_every) == 0 or completed == n_sims:
-                        _log_progress(completed=completed, total=n_sims, start_t=start_t)
-
-            remainder_start = full_batches * sim_batch_size
-            for sim_idx in range(remainder_start, n_sims):
-                params = sampled_params[sim_idx]
-                written_by_idx[sim_idx] = _write_one_sim(
-                    sim_idx=sim_idx,
-                    params=params,
-                    cfg=cfg,
-                    dataset_dir=dataset_dir,
-                    param_names=param_names,
-                )
-                completed += 1
-                if (completed % log_every) == 0 or completed == n_sims:
-                    _log_progress(completed=completed, total=n_sims, start_t=start_t)
+        for sim_idx, params in enumerate(sampled_params):
+            written_by_idx[sim_idx] = _write_one_sim(
+                sim_idx=sim_idx,
+                params=params,
+                cfg=cfg,
+                dataset_dir=dataset_dir,
+                param_names=param_names,
+            )
+            completed += 1
+            if (completed % log_every) == 0 or completed == n_sims:
+                _log_progress(completed=completed, total=n_sims, start_t=start_t)
     else:
         # Warm-up one simulation before threading so JAX can compile once first.
         written_by_idx[0] = _write_one_sim(
@@ -364,6 +374,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             "dt_seconds": float(cfg.solver.dt_seconds),
             "default_time_days": float(cfg.solver.default_time_days),
             "starttime_index": int(cfg.solver.starttime_index),
+            "transition_jump_steps": int(cfg.model.transition_jump_steps),
         },
         "sampling": {
             "seed": int(cfg.sampling.seed),
@@ -371,7 +382,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             "generation_workers_used": int(generation_workers),
             "jax_backend": str(jax_backend),
             "parameter_names_config": [x.name for x in cfg.sampling.parameters],
-            "extended9_param_names": list(EXTENDED9_PARAM_NAMES),
+            "conditioning_param_names": list(CONDITIONING_PARAM_NAMES),
             "jax_sim_batch_size": int(sim_batch_size),
         },
         "training_split": {

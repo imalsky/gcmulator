@@ -21,7 +21,7 @@ TransformName = Literal["none", "log10", "signed_log1p"]
 
 @dataclass(frozen=True)
 class Extended9Params:
-    """Extended retrieval parameter set for terminal-state emulation."""
+    """MY_SWAMP run parameters (7 user-facing conditioning + 2 internal fixed controls)."""
 
     a_m: float
     omega_rad_s: float
@@ -34,8 +34,7 @@ class Extended9Params:
     K6Phi: Optional[float]
 
     def to_vector(self) -> np.ndarray:
-        """Return the canonical 9-parameter vector used in saved datasets."""
-        k6phi = 0.0 if self.K6Phi is None else float(self.K6Phi)
+        """Return the canonical user-facing conditioning vector for ML models."""
         return np.array(
             [
                 self.a_m,
@@ -45,8 +44,6 @@ class Extended9Params:
                 self.taurad_s,
                 self.taudrag_s,
                 self.g_m_s2,
-                self.K6,
-                k6phi,
             ],
             dtype=np.float64,
         )
@@ -54,7 +51,7 @@ class Extended9Params:
 
 @dataclass(frozen=True)
 class TerminalState:
-    """Terminal shallow-water state in physical space."""
+    """Shallow-water state snapshot in physical space."""
 
     phi: np.ndarray
     u: np.ndarray
@@ -100,7 +97,7 @@ class SolverConfig:
     """MY_SWAMP integration controls used for data generation."""
 
     M: int = 42
-    dt_seconds: float = 60.0
+    dt_seconds: float = 240.0
     default_time_days: float = 100.0
     starttime_index: int = 2
 
@@ -191,6 +188,8 @@ class ModelConfig:
     bias: bool = False
     include_param_maps: bool = True
     include_coord_channels: bool = True
+    # Direct transition jump in units of solver dt_seconds.
+    transition_jump_steps: int = 1
     rollout_steps_at_default_time: int = 16
     ic: ICConfig = field(default_factory=ICConfig)
 
@@ -240,15 +239,14 @@ class GCMulatorConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
 
-EXTENDED9_CORE_PARAM_NAMES = (
+USER_CORE_PARAM_NAMES = (
     "a_m",
     "omega_rad_s",
     "Phibar",
     "DPhieq",
     "g_m_s2",
-    "K6",
-    "K6Phi",
 )
+INTERNAL_FIXED_PARAM_NAMES = ("K6", "K6Phi")
 TAURAD_ALIASES = ("taurad_s", "taurad_hours")
 TAUDRAG_ALIASES = ("taudrag_s", "taudrag_hours")
 VALID_PARAM_DISTS = {"uniform", "loguniform", "const", "fixed", "mixture_off_loguniform"}
@@ -290,6 +288,7 @@ MODEL_KEYS = {
     "bias",
     "include_param_maps",
     "include_coord_channels",
+    "transition_jump_steps",
     "rollout_steps_at_default_time",
     "ic",
 }
@@ -372,7 +371,7 @@ def _parse_solver(d: Dict[str, Any]) -> SolverConfig:
     """Parse the ``solver`` section."""
     return SolverConfig(
         M=int(d.get("M", 42)),
-        dt_seconds=float(d.get("dt_seconds", 60.0)),
+        dt_seconds=float(d.get("dt_seconds", 240.0)),
         default_time_days=float(d.get("default_time_days", 100.0)),
         starttime_index=int(d.get("starttime_index", 2)),
     )
@@ -427,7 +426,7 @@ def _parse_sampling(d: Dict[str, Any]) -> SamplingConfig:
     if not specs:
         raise ValueError(
             "sampling.parameters is empty or missing in config. "
-            "You must explicitly list all 9 Extended-9 parameters."
+            "You must explicitly list all user-facing conditioning parameters."
         )
     return SamplingConfig(
         seed=int(d.get("seed", 0)),
@@ -509,6 +508,7 @@ def _parse_model(d: Dict[str, Any]) -> ModelConfig:
             d.get("include_coord_channels", True),
             field="model.include_coord_channels",
         ),
+        transition_jump_steps=int(d.get("transition_jump_steps", 1)),
         rollout_steps_at_default_time=int(d.get("rollout_steps_at_default_time", 16)),
         ic=_parse_ic(d.get("ic", {}) if isinstance(d.get("ic", {}), dict) else {}),
     )
@@ -687,6 +687,18 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError(
             f"model.rollout_steps_at_default_time must be >= {MIN_ROLLOUT_STEPS}"
         )
+    if cfg.model.transition_jump_steps < MIN_ROLLOUT_STEPS:
+        raise ValueError(
+            f"model.transition_jump_steps must be >= {MIN_ROLLOUT_STEPS}"
+        )
+    n_steps_default = int(round(float(cfg.solver.default_time_days) * 86400.0 / float(cfg.solver.dt_seconds)))
+    n_steps_default = max(MIN_ROLLOUT_STEPS, n_steps_default)
+    if cfg.model.transition_jump_steps > n_steps_default:
+        raise ValueError(
+            "model.transition_jump_steps exceeds available solver steps at default horizon: "
+            f"jump={cfg.model.transition_jump_steps}, available={n_steps_default} "
+            f"(default_time_days={cfg.solver.default_time_days}, dt_seconds={cfg.solver.dt_seconds})."
+        )
     if cfg.model.ic.hidden_dim < 1:
         raise ValueError("model.ic.hidden_dim must be >= 1")
     if cfg.model.ic.num_layers < 1:
@@ -721,14 +733,18 @@ def _validate_parameter_specs(specs: List[ParameterSpec]) -> None:
     if dupes:
         raise ValueError(f"sampling.parameters contains duplicate names: {dupes}")
 
-    allowed = set(EXTENDED9_CORE_PARAM_NAMES).union(TAURAD_ALIASES).union(TAUDRAG_ALIASES)
+    forbidden = sorted(set(names).intersection(INTERNAL_FIXED_PARAM_NAMES))
+    if forbidden:
+        raise ValueError("sampling.parameters must not include internal fixed diffusion parameters.")
+
+    allowed = set(USER_CORE_PARAM_NAMES).union(TAURAD_ALIASES).union(TAUDRAG_ALIASES)
     unknown = sorted(set(names).difference(allowed))
     if unknown:
         raise ValueError(f"sampling.parameters contains unknown names: {unknown}")
 
-    missing_core = [name for name in EXTENDED9_CORE_PARAM_NAMES if name not in names]
+    missing_core = [name for name in USER_CORE_PARAM_NAMES if name not in names]
     if missing_core:
-        raise ValueError(f"sampling.parameters missing required Extended-9 names: {missing_core}")
+        raise ValueError(f"sampling.parameters missing required core names: {missing_core}")
 
     has_taurad_s = TAURAD_ALIASES[0] in names
     has_taurad_hours = TAURAD_ALIASES[1] in names
@@ -757,8 +773,6 @@ def _validate_parameter_specs(specs: List[ParameterSpec]) -> None:
 
         if spec.dist in {"const", "fixed"}:
             if spec.value is None:
-                if spec.name == "K6Phi":
-                    continue
                 raise ValueError(f"{spec.dist} requires value for '{spec.name}'")
             if not _is_finite(spec.value):
                 raise ValueError(f"{spec.dist} value must be finite for '{spec.name}'")
@@ -767,7 +781,7 @@ def _validate_parameter_specs(specs: List[ParameterSpec]) -> None:
         if spec.dist == "mixture_off_loguniform":
             if spec.p_off is None or spec.on_min is None or spec.on_max is None:
                 raise ValueError(f"mixture_off_loguniform requires p_off/off_value/on_min/on_max for '{spec.name}'")
-            if spec.off_value is None and spec.name != "K6Phi":
+            if spec.off_value is None:
                 raise ValueError(f"mixture_off_loguniform requires off_value for '{spec.name}'")
             if not (_is_finite(spec.p_off) and PROBABILITY_MIN <= float(spec.p_off) <= PROBABILITY_MAX):
                 raise ValueError(f"mixture_off_loguniform p_off must be in [0,1] for '{spec.name}'")
@@ -800,7 +814,10 @@ def time_days_to_rollout_steps(
     default_time_days: float,
     rollout_steps_at_default_time: int,
 ) -> int:
-    """Map physical horizon in days to integer rollout steps."""
+    """Map physical horizon in days to integer rollout steps.
+
+    Kept for compatibility with older terminal-horizon workflows.
+    """
     days = _require_finite("time_days", time_days)
     default_days = _require_finite("default_time_days", default_time_days)
     if days <= 0:

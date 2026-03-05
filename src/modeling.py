@@ -392,7 +392,7 @@ class ParamICBasisMLP(nn.Module):
 
 
 class ParamRolloutModel(nn.Module):
-    """Autoregressive rollout model with optional static conditioning channels."""
+    """Legacy parameter-only autoregressive rollout model."""
 
     def __init__(
         self,
@@ -437,7 +437,7 @@ class ParamRolloutModel(nn.Module):
         return params[:, :, None, None].expand(bsz, p, self.nlat, self.nlon)
 
     def rollout(self, params: torch.Tensor, *, steps: int) -> torch.Tensor:
-        """Roll forward for ``steps`` iterations and return terminal state."""
+        """Roll forward for ``steps`` iterations and return the final state."""
         if steps < 1:
             raise ValueError("rollout steps must be >= 1")
         if params.ndim != 2 or params.shape[-1] != self.param_dim:
@@ -468,6 +468,90 @@ class ParamRolloutModel(nn.Module):
         return self.rollout(params, steps=int(steps))
 
 
+class StateConditionedRolloutModel(nn.Module):
+    """Autoregressive state-transition model with static conditioning channels."""
+
+    def __init__(
+        self,
+        *,
+        stepper: nn.Module,
+        param_dim: int,
+        state_chans: int,
+        nlat: int,
+        nlon: int,
+        include_param_maps: bool,
+        include_coord_channels: bool,
+        lat_order: str = "north_to_south",
+        lon_origin: str = "0_to_2pi",
+    ) -> None:
+        super().__init__()
+        self.stepper = stepper
+        self.param_dim = int(param_dim)
+        self.state_chans = int(state_chans)
+        self.nlat = int(nlat)
+        self.nlon = int(nlon)
+        self.include_param_maps = bool(include_param_maps)
+        self.include_coord_channels = bool(include_coord_channels)
+
+        if self.include_coord_channels:
+            cc = build_coord_channels_legendre_gauss(
+                nlat,
+                nlon,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                lat_order=str(lat_order),
+                lon_origin=str(lon_origin),
+            )
+            self.register_buffer("coord_channels", cc, persistent=False)
+        else:
+            self.register_buffer("coord_channels", torch.zeros((0, nlat, nlon), dtype=torch.float32), persistent=False)
+
+    def _param_maps(self, params: torch.Tensor) -> torch.Tensor:
+        """Broadcast parameter vectors to per-pixel conditioning maps."""
+        bsz, p = params.shape
+        return params[:, :, None, None].expand(bsz, p, self.nlat, self.nlon)
+
+    def rollout(self, state0: torch.Tensor, params: torch.Tensor, *, steps: int) -> torch.Tensor:
+        """Roll forward from ``state0`` for ``steps`` iterations."""
+        if steps < 1:
+            raise ValueError("rollout steps must be >= 1")
+        if state0.ndim != 4:
+            raise ValueError(f"state0 must be [B,C,H,W], got {tuple(state0.shape)}")
+        if state0.shape[1] != self.state_chans:
+            raise ValueError(f"state0 channel count must be {self.state_chans}, got {state0.shape[1]}")
+        if state0.shape[2] != self.nlat or state0.shape[3] != self.nlon:
+            raise ValueError(
+                f"state0 spatial shape must be ({self.nlat},{self.nlon}), got {tuple(state0.shape[-2:])}"
+            )
+        if params.ndim != 2 or params.shape[-1] != self.param_dim:
+            raise ValueError(f"params must be [B,{self.param_dim}], got {tuple(params.shape)}")
+        if int(state0.shape[0]) != int(params.shape[0]):
+            raise ValueError(
+                f"Batch size mismatch between state0 and params: {tuple(state0.shape)} vs {tuple(params.shape)}"
+            )
+
+        state = state0
+        coord = self.coord_channels.to(device=params.device, dtype=params.dtype)
+        if coord.numel():
+            coord = coord.unsqueeze(0).expand(params.shape[0], -1, -1, -1)
+        pmap = self._param_maps(params) if self.include_param_maps else None
+
+        step_scale = 1.0 / float(int(steps))
+        for _ in range(int(steps)):
+            parts = [state]
+            if pmap is not None:
+                parts.append(pmap)
+            if coord.numel():
+                parts.append(coord)
+            x = torch.cat(parts, dim=1)
+            state = self.stepper(x, step_scale=step_scale)
+        return state
+
+    def forward(self, state0: torch.Tensor, params: torch.Tensor, steps: int = 1) -> torch.Tensor:
+        """Alias for ``rollout`` to match standard module call signature."""
+        return self.rollout(state0, params, steps=int(steps))
+
+
 def build_rollout_model(
     *,
     img_size: tuple[int, int],
@@ -477,7 +561,7 @@ def build_rollout_model(
     lat_order: str = "north_to_south",
     lon_origin: str = "0_to_2pi",
 ) -> ParamRolloutModel:
-    """Construct full conditional rollout model from data shape and config."""
+    """Construct legacy parameter-only rollout model from shape and config."""
     h, w = int(img_size[0]), int(img_size[1])
 
     coord_chans = 4 if cfg_model.include_coord_channels else 0
@@ -541,6 +625,72 @@ def build_rollout_model(
     return ParamRolloutModel(
         stepper=stepper,
         ic=ic,
+        param_dim=param_dim,
+        state_chans=state_chans,
+        nlat=h,
+        nlon=w,
+        include_param_maps=bool(cfg_model.include_param_maps),
+        include_coord_channels=bool(cfg_model.include_coord_channels),
+        lat_order=str(lat_order),
+        lon_origin=str(lon_origin),
+    )
+
+
+def build_state_conditioned_rollout_model(
+    *,
+    img_size: tuple[int, int],
+    state_chans: int,
+    param_dim: int,
+    cfg_model,
+    lat_order: str = "north_to_south",
+    lon_origin: str = "0_to_2pi",
+) -> StateConditionedRolloutModel:
+    """Construct state-conditioned rollout model for transition supervision."""
+    h, w = int(img_size[0]), int(img_size[1])
+
+    coord_chans = 4 if cfg_model.include_coord_channels else 0
+    in_chans = state_chans + (param_dim if cfg_model.include_param_maps else 0) + coord_chans
+    out_chans = state_chans
+
+    SphericalFNO = import_sfno()
+    base = SphericalFNO(
+        img_size=(h, w),
+        grid=cfg_model.grid,
+        grid_internal=cfg_model.grid_internal,
+        scale_factor=int(cfg_model.scale_factor),
+        in_chans=int(in_chans),
+        out_chans=int(out_chans),
+        embed_dim=int(cfg_model.embed_dim),
+        num_layers=int(cfg_model.num_layers),
+        activation_function=str(cfg_model.activation_function),
+        encoder_layers=int(cfg_model.encoder_layers),
+        use_mlp=bool(cfg_model.use_mlp),
+        mlp_ratio=float(cfg_model.mlp_ratio),
+        drop_rate=float(cfg_model.drop_rate),
+        drop_path_rate=float(cfg_model.drop_path_rate),
+        normalization_layer=str(cfg_model.normalization_layer),
+        hard_thresholding_fraction=float(cfg_model.hard_thresholding_fraction),
+        residual_prediction=False,
+        pos_embed=str(cfg_model.pos_embed),
+        bias=bool(cfg_model.bias),
+    )
+    _ensure_sfno_encoder_depth(
+        base=base,
+        in_chans=int(in_chans),
+        encoder_layers=int(cfg_model.encoder_layers),
+        mlp_ratio=float(cfg_model.mlp_ratio),
+        bias=bool(cfg_model.bias),
+    )
+
+    stepper = ConditionalResidualWrapper(
+        base,
+        state_chans=state_chans,
+        residual_prediction=bool(cfg_model.residual_prediction),
+        residual_init_scale=float(cfg_model.residual_init_scale),
+    )
+
+    return StateConditionedRolloutModel(
+        stepper=stepper,
         param_dim=param_dim,
         state_chans=state_chans,
         nlat=h,

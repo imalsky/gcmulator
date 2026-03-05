@@ -125,7 +125,7 @@ PY
     SIM_COUNT="$(find "$DATASET_DIR" -maxdepth 1 -type f \( -name 'sim_*.npy' -o -name 'sim_*.npz' \) | wc -l | tr -d ' ')"
   fi
   if [ "$SIM_COUNT" -eq 0 ]; then
-    # Generate only when raw terminal states are not already present.
+    # Generate only when raw trajectory transition files are not already present.
     python "$MAIN_PY" --gen --config "$CONFIG_PATH"
   elif [ "$SIM_COUNT" -ne "$EXPECTED_SIMS" ]; then
     echo "ERROR: dataset file count mismatch: found $SIM_COUNT files in $DATASET_DIR, expected $EXPECTED_SIMS from config.sampling.n_sims."

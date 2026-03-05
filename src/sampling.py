@@ -1,4 +1,4 @@
-"""Sampling utilities for Extended-9 physical parameters."""
+"""Sampling utilities for user-configured physical parameters."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ PROBABILITY_MAX = 1.0
 SECONDS_PER_HOUR = 3600.0
 
 
-EXTENDED9_PARAM_NAMES: List[str] = [
+CONDITIONING_PARAM_NAMES: List[str] = [
     "a_m",
     "omega_rad_s",
     "Phibar",
@@ -23,9 +23,9 @@ EXTENDED9_PARAM_NAMES: List[str] = [
     "taurad_s",
     "taudrag_s",
     "g_m_s2",
-    "K6",
-    "K6Phi",
 ]
+INTERNAL_FIXED_K6 = 1.24e33
+INTERNAL_FIXED_K6PHI = None
 
 
 def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
@@ -44,9 +44,6 @@ def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
 
     if spec.dist in {"const", "fixed"}:
         if spec.value is None:
-            if spec.name == "K6Phi":
-                # K6Phi=null means "inherit K6" at conversion time.
-                return float("nan")
             raise ValueError(f"fixed/const requires value for {spec.name}")
         return float(spec.value)
 
@@ -61,8 +58,6 @@ def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
             raise ValueError(f"p_off must be in [0,1] for {spec.name}")
         if float(rng.uniform(PROBABILITY_MIN, PROBABILITY_MAX)) < float(spec.p_off):
             if spec.off_value is None:
-                if spec.name == "K6Phi":
-                    return float("nan")
                 raise ValueError(f"mixture_off_loguniform requires off_value for {spec.name}")
             return float(spec.off_value)
         lo = math.log10(float(spec.on_min))
@@ -89,12 +84,9 @@ def sample_parameter_dict(rng: np.random.Generator, specs: Sequence[ParameterSpe
 
 def to_extended9(sampled: Dict[str, float]) -> Extended9Params:
     """Convert sampled parameter map into validated ``Extended9Params``."""
-    missing = [name for name in EXTENDED9_PARAM_NAMES if name not in sampled]
+    missing = [name for name in CONDITIONING_PARAM_NAMES if name not in sampled]
     if missing:
-        raise ValueError(f"Missing Extended-9 sampled parameters: {missing}")
-
-    k6phi_raw = float(sampled["K6Phi"])
-    k6phi = None if math.isnan(k6phi_raw) else k6phi_raw
+        raise ValueError(f"Missing sampled conditioning parameters: {missing}")
 
     return Extended9Params(
         a_m=float(sampled["a_m"]),
@@ -104,6 +96,6 @@ def to_extended9(sampled: Dict[str, float]) -> Extended9Params:
         taurad_s=float(sampled["taurad_s"]),
         taudrag_s=float(sampled["taudrag_s"]),
         g_m_s2=float(sampled["g_m_s2"]),
-        K6=float(sampled["K6"]),
-        K6Phi=k6phi,
+        K6=float(INTERNAL_FIXED_K6),
+        K6Phi=INTERNAL_FIXED_K6PHI,
     )

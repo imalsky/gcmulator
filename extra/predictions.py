@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
@@ -27,9 +28,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import time_days_to_rollout_steps
-from src.modeling import build_rollout_model, ensure_torch_harmonics_importable
-from src.normalization import denormalize_states, normalize_params, stats_from_json
+from src.modeling import build_state_conditioned_rollout_model, ensure_torch_harmonics_importable
+from src.normalization import denormalize_states, normalize_params, normalize_states, stats_from_json
 
 # Global configuration.
 MODEL_DIR = Path("models/model")
@@ -37,8 +37,8 @@ CHECKPOINT_NAME = "best.pt"
 
 DEVICE_MODE = "auto"
 SPLIT_NAME = "test"
-PICKED_PROCESSED_NAME: str | None = None  # Example: "test/sim_000042.npy"
-ROLLOUT_STEPS_OVERRIDE: int | None = None  # Example: 1 to bypass time_days mapping.
+PICKED_PROCESSED_NAME: str | None = None  # Example: "test/sim_000042_tr0003.npy"
+ROLLOUT_STEPS_OVERRIDE: int | None = None  # Optional transition rollout override.
 PLOTS_DIR_NAME = "plots"
 FIGURE_NAME = "phi_true_vs_pred_max_days.png"
 FIGURE_DPI = 180
@@ -143,6 +143,9 @@ def _resolve_device(mode: str) -> torch.device:
 def _processed_to_raw_file_name(processed_name: str) -> str:
     """Map processed split filename back to corresponding raw simulation filename."""
     name = Path(str(processed_name)).name
+    m = re.match(r"^(sim_\d+)_tr\d+\.(npy|npz)$", name)
+    if m is not None:
+        return f"{m.group(1)}.{m.group(2)}"
     if name.endswith("_train.npy"):
         return name[: -len("_train.npy")] + ".npy"
     if name.endswith("_val.npy"):
@@ -172,6 +175,51 @@ def _load_sim_payload(path: Path) -> Dict[str, Any]:
         return payload
     with np.load(path, allow_pickle=True) as z:
         return {k: z[k] for k in z.files}
+
+
+def _processed_transition_index(processed_name: str) -> int:
+    """Extract transition index from processed filename."""
+    name = Path(str(processed_name)).name
+    m = re.search(r"_tr(\d+)\.(npy|npz)$", name)
+    if m is None:
+        return 0
+    return int(m.group(1))
+
+
+def _build_conditioning_vector(
+    *,
+    raw_params: np.ndarray,
+    transition_days: float,
+    stats,
+    checkpoint: Dict[str, Any],
+) -> np.ndarray:
+    """Build normalized conditioning vector expected by the trained model."""
+    params_norm = normalize_params(raw_params[None, :], stats=stats).astype(np.float32)[0]
+    conditioning_names = list(checkpoint.get("conditioning_names", checkpoint["param_names"]))
+    if len(conditioning_names) == int(params_norm.shape[0]):
+        return params_norm.astype(np.float32, copy=False)
+
+    if (
+        len(conditioning_names) == int(params_norm.shape[0]) + 1
+        and conditioning_names[-1] == "transition_days"
+    ):
+        transition_norm = dict(checkpoint.get("transition_days_norm", {}))
+        if not transition_norm:
+            raise ValueError("Checkpoint expects transition_days conditioning but lacks transition_days_norm metadata.")
+        td_mean = float(transition_norm["mean"])
+        td_std = float(transition_norm["std"])
+        td_eps = float(transition_norm["zscore_eps"])
+        td_is_constant = bool(transition_norm["is_constant"])
+        td_norm = 0.0 if td_is_constant else (float(transition_days) - td_mean) / (td_std + td_eps)
+        return np.concatenate(
+            [params_norm.astype(np.float32, copy=False), np.asarray([td_norm], dtype=np.float32)],
+            axis=0,
+        )
+
+    raise ValueError(
+        "Unsupported conditioning schema. "
+        f"conditioning_names={conditioning_names}, param_names={list(checkpoint['param_names'])}."
+    )
 
 
 def _apply_plot_style() -> None:
@@ -318,7 +366,7 @@ def _save_phi_figure(
 
     rmse_phi = float(np.sqrt(np.mean((pred_phi - true_phi) ** 2)))
     fig.suptitle(
-        f"{sim_name} | time_days={time_days:.3f} | steps={steps} | device={device} | Phi RMSE={rmse_phi:.3e} | linear scale + wind quiver"
+        f"{sim_name} | time_days={time_days:.3f} | transitions={steps} | device={device} | Phi RMSE={rmse_phi:.3e}"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -350,7 +398,8 @@ def main() -> None:
     state_chans = int(shape["C"])
     h = int(shape["H"])
     w = int(shape["W"])
-    param_dim = int(len(ckpt["param_names"]))
+    conditioning_names = list(ckpt.get("conditioning_names", ckpt["param_names"]))
+    conditioning_dim = int(len(conditioning_names))
     fields = list(ckpt["fields"])
 
     resolved_cfg = dict(ckpt["resolved_config"])
@@ -372,10 +421,7 @@ def main() -> None:
         raise RuntimeError(f"No files in processed split '{SPLIT_NAME}' at {processed_meta_path}")
 
     if PICKED_PROCESSED_NAME is None:
-        picked_processed, raw_file, time_days = _pick_max_days_sample(
-            dataset_dir=dataset_dir,
-            split_files=split_files,
-        )
+        picked_processed = sorted(split_files)[0]
     else:
         if PICKED_PROCESSED_NAME not in split_files:
             raise ValueError(
@@ -383,36 +429,55 @@ def main() -> None:
                 f"Available count={len(split_files)}"
             )
         picked_processed = str(PICKED_PROCESSED_NAME)
-        raw_file = (dataset_dir / _processed_to_raw_file_name(picked_processed)).resolve()
-        z = _load_sim_payload(raw_file)
-        time_days = float(np.asarray(z["time_days"]).item())
+    raw_file = (dataset_dir / _processed_to_raw_file_name(picked_processed)).resolve()
+    z = _load_sim_payload(raw_file)
+    time_days = float(np.asarray(z["time_days"]).item())
+    transition_index = _processed_transition_index(picked_processed)
 
     z = _load_sim_payload(raw_file)
-    true_state = np.asarray(z["state_final"], dtype=np.float32)  # [C,H,W]
+    state_inputs = np.asarray(z["state_inputs"], dtype=np.float32)  # [T,C,H,W]
+    state_targets = np.asarray(z["state_targets"], dtype=np.float32)  # [T,C,H,W]
+    transition_days = np.asarray(z["transition_days"], dtype=np.float64)  # [T]
     raw_params = np.asarray(z["params"], dtype=np.float64)  # [P]
+    if state_inputs.ndim != 4 or state_targets.ndim != 4:
+        raise ValueError(f"Raw trajectory tensors must be [T,C,H,W], got {state_inputs.shape} and {state_targets.shape}")
+    if state_inputs.shape != state_targets.shape:
+        raise ValueError(f"Raw trajectory input/target mismatch: {state_inputs.shape} vs {state_targets.shape}")
+    if transition_days.ndim != 1 or int(transition_days.shape[0]) != int(state_inputs.shape[0]):
+        raise ValueError(f"transition_days shape mismatch: {transition_days.shape} for T={state_inputs.shape[0]}")
+    if transition_index < 0 or transition_index >= int(state_inputs.shape[0]):
+        raise ValueError(
+            f"Transition index {transition_index} is out of bounds for trajectory length {int(state_inputs.shape[0])}"
+        )
 
-    if true_state.shape != (state_chans, h, w):
-        raise ValueError(f"Unexpected state shape in {raw_file}: {true_state.shape} vs expected {(state_chans, h, w)}")
+    if state_inputs.shape[1:] != (state_chans, h, w):
+        raise ValueError(
+            f"Unexpected trajectory state shape in {raw_file}: {state_inputs.shape[1:]} vs expected {(state_chans, h, w)}"
+        )
 
     stats = stats_from_json(ckpt["normalization"])
-    params_norm = normalize_params(raw_params[None, :], stats=stats).astype(np.float32)
-    params_t = torch.from_numpy(params_norm).to(device=device)
+    state0_norm = normalize_states(state_inputs[transition_index : transition_index + 1], stats=stats).astype(np.float32)
+    transition_days_value = float(transition_days[transition_index])
+    conditioning_norm = _build_conditioning_vector(
+        raw_params=raw_params,
+        transition_days=transition_days_value,
+        stats=stats,
+        checkpoint=ckpt,
+    )
+    conditioning_t = torch.from_numpy(conditioning_norm[None, ...]).to(device=device)
+    state_t = torch.from_numpy(state0_norm).to(device=device)
 
-    if ROLLOUT_STEPS_OVERRIDE is None:
-        steps = time_days_to_rollout_steps(
-            time_days=time_days,
-            default_time_days=float(ckpt["solver"]["default_time_days"]),
-            rollout_steps_at_default_time=int(ckpt["model_config"]["rollout_steps_at_default_time"]),
+    steps = 1 if ROLLOUT_STEPS_OVERRIDE is None else int(ROLLOUT_STEPS_OVERRIDE)
+    if steps != 1:
+        raise ValueError(
+            "This utility currently supports one direct transition per call (steps=1). "
+            f"Got ROLLOUT_STEPS_OVERRIDE={ROLLOUT_STEPS_OVERRIDE}."
         )
-    else:
-        steps = int(ROLLOUT_STEPS_OVERRIDE)
-        if steps < 1:
-            raise ValueError(f"ROLLOUT_STEPS_OVERRIDE must be >= 1, got {ROLLOUT_STEPS_OVERRIDE}")
 
-    model = build_rollout_model(
+    model = build_state_conditioned_rollout_model(
         img_size=(h, w),
         state_chans=state_chans,
-        param_dim=param_dim,
+        param_dim=conditioning_dim,
         cfg_model=model_cfg,
         lat_order=lat_order,
         lon_origin=lon_origin,
@@ -422,10 +487,12 @@ def main() -> None:
     model.eval()
 
     with torch.inference_mode():
-        pred_norm_t = model(params_t, steps=steps)
+        pred_norm_t = model(state_t, conditioning_t, steps=1)
         pred_norm = pred_norm_t.detach().cpu().numpy().astype(np.float32)
 
+    true_state = np.asarray(state_targets[transition_index], dtype=np.float32)
     pred_state = denormalize_states(pred_norm, stats=stats)[0]
+    total_days = float(transition_days_value)
 
     if "Phi" not in fields:
         raise ValueError(f"'Phi' not found in checkpoint fields: {fields}")
@@ -452,15 +519,15 @@ def main() -> None:
         pred_u=pred_u,
         pred_v=pred_v,
         sim_name=raw_file.name,
-        time_days=time_days,
+        time_days=total_days,
         steps=int(steps),
         device=device,
         out_path=out_path,
     )
 
     print(f"Saved figure: {out_path}")
-    print(f"Picked split file with max time_days: {picked_processed}")
-    print(f"Raw simulation: {raw_file} | time_days={time_days:.6f}")
+    print(f"Picked split sample: {picked_processed} (transition index={transition_index})")
+    print(f"Raw simulation: {raw_file} | time_days={time_days:.6f} | evaluated_days={total_days:.6f}")
     print(
         f"True Phi range: [{float(np.min(true_phi)):.6e}, {float(np.max(true_phi)):.6e}] | non-positive cells={true_nonpos}"
     )

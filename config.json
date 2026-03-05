@@ -2,12 +2,12 @@
   "paths": {
     "dataset_dir": "data/raw",
     "processed_dir": "data/processed",
-    "model_dir": "models/model",
+    "model_dir": "models/model_v2_fp32",
     "overwrite_dataset": false
   },
   "solver": {
     "M": 42,
-    "dt_seconds": 120.0,
+    "dt_seconds": 240.0,
     "default_time_days": 100.0,
     "starttime_index": 2
   },
@@ -26,9 +26,7 @@
       { "name": "DPhieq", "dist": "fixed", "value": 1000000.0 },
       { "name": "taurad_hours", "dist": "uniform", "min": 5.0, "max": 20.0 },
       { "name": "taudrag_hours", "dist": "uniform", "min": 5.0, "max": 20.0 },
-      { "name": "g_m_s2", "dist": "fixed", "value": 9.8 },
-      { "name": "K6", "dist": "fixed", "value": 1.24e33 },
-      { "name": "K6Phi", "dist": "fixed", "value": null }
+      { "name": "g_m_s2", "dist": "fixed", "value": 9.8 }
     ]
   },
   "normalization": {
@@ -54,9 +52,9 @@
     "grid_internal": "legendre-gauss",
     "scale_factor": 2,
     "embed_dim": 256,
-    "num_layers": 4,
+    "num_layers": 3,
     "encoder_layers": 3,
-    "activation_function": "relu",
+    "activation_function": "gelu",
     "use_mlp": true,
     "mlp_ratio": 2.0,
     "drop_rate": 0.0,
@@ -69,6 +67,7 @@
     "bias": false,
     "include_param_maps": true,
     "include_coord_channels": true,
+    "transition_jump_steps": 1,
     "rollout_steps_at_default_time": 16,
     "ic": {
       "basis": ["const", "sin_lat", "cos_lat", "sin_lon", "cos_lon"],
@@ -84,14 +83,14 @@
   "training": {
     "seed": 42,
     "device": "auto",
-    "amp_mode": "bf16",
+    "amp_mode": "none",
     "epochs": 100,
     "batch_size": 32,
     "num_workers": 0,
     "shuffle": true,
     "pin_memory": false,
     "preload_to_gpu": true,
-    "learning_rate": 1e-4,
+    "learning_rate": 1e-3,
     "weight_decay": 1e-5,
     "val_fraction": 0.1,
     "test_fraction": 0.1,
