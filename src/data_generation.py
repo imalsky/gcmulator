@@ -28,6 +28,7 @@ from .sampling import EXTENDED9_PARAM_NAMES, sample_parameter_dict, to_extended9
 
 LOGGER = logging.getLogger("src.generate")
 GPU_BACKENDS = {"gpu", "cuda", "rocm", "metal"}
+AUTO_GPU_SIM_BATCH_DEFAULT = 8
 
 
 def _clear_dataset_dir(dataset_dir: Path) -> None:
@@ -63,12 +64,23 @@ def _resolve_sim_batch_size(
 
     Environment knob:
     - ``GCMULATOR_JAX_SIM_BATCH=auto`` (default): use a conservative GPU batch.
+    - ``GCMULATOR_JAX_SIM_BATCH_AUTO_GPU=<int>=1``: auto-mode GPU batch size
+      (default: 8).
     - ``GCMULATOR_JAX_SIM_BATCH=<int>=1``: force explicit batch size.
     """
     raw = os.environ.get("GCMULATOR_JAX_SIM_BATCH", "auto").strip().lower()
     if raw in {"", "auto"}:
         if jax_backend.lower() in GPU_BACKENDS and int(generation_workers) == 1:
-            batch = 4
+            auto_gpu_raw = os.environ.get("GCMULATOR_JAX_SIM_BATCH_AUTO_GPU", str(AUTO_GPU_SIM_BATCH_DEFAULT)).strip()
+            try:
+                batch = int(auto_gpu_raw)
+            except Exception as exc:
+                raise ValueError(
+                    "GCMULATOR_JAX_SIM_BATCH_AUTO_GPU must be an integer >= 1, "
+                    f"got {auto_gpu_raw!r}"
+                ) from exc
+            if batch < 1:
+                raise ValueError(f"GCMULATOR_JAX_SIM_BATCH_AUTO_GPU must be >= 1, got {batch}")
         else:
             batch = 1
     else:
@@ -361,6 +373,11 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             "parameter_names_config": [x.name for x in cfg.sampling.parameters],
             "extended9_param_names": list(EXTENDED9_PARAM_NAMES),
             "jax_sim_batch_size": int(sim_batch_size),
+        },
+        "training_split": {
+            "split_seed": int(cfg.training.split_seed),
+            "val_fraction": float(cfg.training.val_fraction),
+            "test_fraction": float(cfg.training.test_fraction),
         },
         "items": written,
     }

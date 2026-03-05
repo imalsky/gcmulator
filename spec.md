@@ -70,7 +70,9 @@ Fixed canonical parameter ordering is:
 4. Run MY_SWAMP terminal solves either:
    - scalar (`GCMULATOR_JAX_SIM_BATCH=1`), or
    - batched via JAX `vmap` (`GCMULATOR_JAX_SIM_BATCH>1`, only when `generation_workers==1`), or
-   - auto mode (`GCMULATOR_JAX_SIM_BATCH=auto`, default), which currently selects batch `4` on single-worker GPU generation and `1` otherwise.
+   - auto mode (`GCMULATOR_JAX_SIM_BATCH=auto`, default), which selects
+     `GCMULATOR_JAX_SIM_BATCH_AUTO_GPU` (default `8`) on single-worker GPU generation
+     and `1` otherwise.
 5. Each solve uses terminal-only MY_SWAMP integration with:
    - `jit_scan=True`
    - `donate_state=True`
@@ -81,9 +83,12 @@ Fixed canonical parameter ordering is:
 ### 4.3 Preprocessing (`src/training.py`, `preprocess_dataset`)
 1. Read raw `sim_*.npy` (legacy `sim_*.npz` is auto-migrated to `.npy` on first preprocess).
 2. Validate raw geometry metadata consistency and ensure it matches `config.geometry`.
-3. Train/val split by `training.split_seed` and `training.val_fraction`.
+3. Train/val/test split by `training.split_seed`, `training.val_fraction`, and `training.test_fraction`.
 4. Fit normalization stats on train split only (streaming moments).
-5. Write normalized per-simulation processed files (`*_train.npy`, `*_val.npy`).
+5. Write normalized per-simulation processed files into split subdirectories:
+   - `processed/train/sim_XXXXXX.npy`
+   - `processed/val/sim_XXXXXX.npy`
+   - `processed/test/sim_XXXXXX.npy`
    - Processed saves are written as uncompressed `.npy` dictionary payloads.
 6. Write `processed_meta.json` with shape, splits, normalization, geometry, and time-mapping metadata.
 7. Reuse cached processed files when raw-file signatures and preprocessing config fingerprint match.
@@ -93,14 +98,15 @@ Fixed canonical parameter ordering is:
 2. Use sphere quadrature-weighted loss (`SphereLoss`).
 3. Train for configured epochs.
 4. Save `last.pt` every epoch and `best.pt` by validation loss.
-5. Evaluate best checkpoint on validation split and save metrics/history JSON.
+5. Evaluate best checkpoint on validation and test splits and save metrics/history JSON.
 
 ### 4.5 Extra Utilities
 - `extra/predictions.py`:
   - selects the split sample with the maximum `time_days`,
   - allows explicit sample override via `PICKED_PROCESSED_NAME`,
   - predicts terminal state and denormalizes,
-  - plots only the signed `Phi` field (`true` vs `predicted`) using a signed symlog color normalization (no positive-only masking),
+  - defaults to the `test` split and supports optional rollout step override,
+  - plots `Phi` (`true` vs `predicted`) using linear centered normalization with `U,V` quiver overlays,
   - uses `extra/science.mplstyle`,
   - saves the figure under `<model_dir>/plots/`.
 - `extra/pytorch_export.py`:
@@ -228,8 +234,9 @@ Sampling metadata includes:
 - `generation_workers_used`
 - `jax_backend`
 - `jax_sim_batch_size`
+- `training_split` (`split_seed`, `val_fraction`, `test_fraction`)
 
-### 9.3 Processed File (`*_train.npy` / `*_val.npy`)
+### 9.3 Processed File (`train/sim_*.npy` / `val/sim_*.npy` / `test/sim_*.npy`)
 Contains:
 - `state_final_norm`
 - `params_norm`
@@ -258,6 +265,7 @@ Contain model weights plus enough metadata to reconstruct inference:
 - `training_history.json`
 - `training_history.csv`
 - `val_metrics.json`
+- `test_metrics.json`
 - `config_used.resolved.json`
 - `config_used.original.<ext>`
 - `model_export.torchscript.pt`
@@ -306,6 +314,7 @@ Local environment requirement:
   - `SWAMPE_JAX_ENABLE_X64` (default `0`)
   - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
   - `GCMULATOR_JAX_SIM_BATCH` (default `auto`)
+  - `GCMULATOR_JAX_SIM_BATCH_AUTO_GPU` (default `8`)
 - When generation already produced `sim_*.npy` (or legacy `sim_*.npz`), reruns skip regeneration and reuse existing raw data.
 - Runs training.
 
@@ -324,6 +333,7 @@ Local environment requirement:
   - `SWAMPE_JAX_ENABLE_X64` (default `0`)
   - `XLA_PYTHON_CLIENT_PREALLOCATE` (default `false`)
   - `GCMULATOR_JAX_SIM_BATCH` (default `auto`)
+  - `GCMULATOR_JAX_SIM_BATCH_AUTO_GPU` (default `8`)
 - Uses generation/training flow control `RUN_GEN_IF_MISSING` consistent with `run.sh`.
 - When generation already produced `sim_*.npy` (or legacy `sim_*.npz`), reruns skip regeneration and reuse existing raw data.
 - Mirrors training stdout/stderr into a dedicated file via `TRAIN_LOG` (default `${PROJECT_ROOT}/training_${PBS_JOBID}.log`) while still streaming to terminal/PBS output.

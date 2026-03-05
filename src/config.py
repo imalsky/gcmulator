@@ -221,7 +221,8 @@ class TrainingConfig:
     preload_to_gpu: bool = True
     learning_rate: float = 3e-4
     weight_decay: float = 0.0
-    val_fraction: float = 0.2
+    val_fraction: float = 0.1
+    test_fraction: float = 0.1
     split_seed: int = 0
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
@@ -315,6 +316,7 @@ TRAINING_KEYS = {
     "learning_rate",
     "weight_decay",
     "val_fraction",
+    "test_fraction",
     "split_seed",
     "scheduler",
 }
@@ -537,7 +539,8 @@ def _parse_training(d: Dict[str, Any]) -> TrainingConfig:
         preload_to_gpu=_parse_bool(d.get("preload_to_gpu", True), field="training.preload_to_gpu"),
         learning_rate=float(d.get("learning_rate", 3e-4)),
         weight_decay=float(d.get("weight_decay", 0.0)),
-        val_fraction=float(d.get("val_fraction", 0.2)),
+        val_fraction=float(d.get("val_fraction", 0.1)),
+        test_fraction=float(d.get("test_fraction", 0.1)),
         split_seed=int(d.get("split_seed", 0)),
         scheduler=_parse_scheduler(d.get("scheduler", {}) if isinstance(d.get("scheduler", {}), dict) else {}),
     )
@@ -622,6 +625,10 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("training.weight_decay must be >= 0")
     if not (0.0 < cfg.training.val_fraction < 1.0):
         raise ValueError("training.val_fraction must be in (0,1)")
+    if not (0.0 < cfg.training.test_fraction < 1.0):
+        raise ValueError("training.test_fraction must be in (0,1)")
+    if (cfg.training.val_fraction + cfg.training.test_fraction) >= 1.0:
+        raise ValueError("training.val_fraction + training.test_fraction must be < 1")
     if cfg.training.scheduler.type not in {"cosine_warmup", "plateau", "none"}:
         raise ValueError("training.scheduler.type must be one of ['cosine_warmup','plateau','none']")
     if cfg.training.scheduler.warmup_epochs < 0:

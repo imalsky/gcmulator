@@ -40,6 +40,7 @@ conda activate "$CONDA_ENV"
 export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT:${PYTHONPATH:-}"
 export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
 export GCMULATOR_JAX_SIM_BATCH="${GCMULATOR_JAX_SIM_BATCH:-auto}"
+export GCMULATOR_JAX_SIM_BATCH_AUTO_GPU="${GCMULATOR_JAX_SIM_BATCH_AUTO_GPU:-8}"
 export SWAMPE_JAX_ENABLE_X64="${SWAMPE_JAX_ENABLE_X64:-0}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -106,7 +107,7 @@ fi
 
 if [ "$RUN_GEN_IF_MISSING" = "1" ]; then
   # Resolve dataset path through config parser so relative path semantics match runtime code.
-  DATASET_DIR="$({ python - "$CONFIG_PATH" <<'PY'
+  mapfile -t DATA_CFG < <(python - "$CONFIG_PATH" <<'PY'
 from pathlib import Path
 import sys
 from src.config import load_config, resolve_path
@@ -114,8 +115,11 @@ from src.config import load_config, resolve_path
 config_path = Path(sys.argv[1]).resolve()
 cfg = load_config(config_path)
 print(resolve_path(config_path, cfg.paths.dataset_dir))
+print(int(cfg.sampling.n_sims))
 PY
-  })"
+  )
+  DATASET_DIR="${DATA_CFG[0]}"
+  EXPECTED_SIMS="${DATA_CFG[1]}"
   SIM_COUNT=0
   if [ -d "$DATASET_DIR" ]; then
     SIM_COUNT="$(find "$DATASET_DIR" -maxdepth 1 -type f \( -name 'sim_*.npy' -o -name 'sim_*.npz' \) | wc -l | tr -d ' ')"
@@ -123,6 +127,10 @@ PY
   if [ "$SIM_COUNT" -eq 0 ]; then
     # Generate only when raw terminal states are not already present.
     python "$MAIN_PY" --gen --config "$CONFIG_PATH"
+  elif [ "$SIM_COUNT" -ne "$EXPECTED_SIMS" ]; then
+    echo "ERROR: dataset file count mismatch: found $SIM_COUNT files in $DATASET_DIR, expected $EXPECTED_SIMS from config.sampling.n_sims."
+    echo "Set paths.overwrite_dataset=true and regenerate, or align config.sampling.n_sims with existing data."
+    exit 1
   fi
 fi
 

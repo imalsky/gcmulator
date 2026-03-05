@@ -8,6 +8,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -37,7 +38,7 @@ LOGGER = logging.getLogger("src.train")
 # Lower bound used when computing z-score denominators from empirical variance.
 STD_FLOOR = 1.0e-12
 FINITE_CHECK_INTERVAL = 25
-PREPROCESS_FINGERPRINT_VERSION = 3
+PREPROCESS_FINGERPRINT_VERSION = 5
 
 
 def _load_npy_payload_dict(file_path: Path) -> Dict[str, Any]:
@@ -76,28 +77,60 @@ def _list_raw_dataset_files(dataset_dir: Path) -> List[Path]:
     raise FileNotFoundError(f"No sim_*.npy or sim_*.npz files found in {dataset_dir}")
 
 
-def _split_files(files: Sequence[Path], *, seed: int, val_fraction: float) -> Tuple[List[Path], List[Path]]:
-    """Create reproducible file-level train/validation split."""
+def _split_files(
+    files: Sequence[Path],
+    *,
+    seed: int,
+    val_fraction: float,
+    test_fraction: float,
+) -> Tuple[List[Path], List[Path], List[Path]]:
+    """Create reproducible file-level train/validation/test split."""
     if not (0.0 < float(val_fraction) < 1.0):
         raise ValueError(f"training.val_fraction must be in (0,1), got {val_fraction}")
+    if not (0.0 < float(test_fraction) < 1.0):
+        raise ValueError(f"training.test_fraction must be in (0,1), got {test_fraction}")
+    if (float(val_fraction) + float(test_fraction)) >= 1.0:
+        raise ValueError(
+            "training.val_fraction + training.test_fraction must be < 1, got "
+            f"{float(val_fraction) + float(test_fraction):.6f}"
+        )
     idx = np.arange(len(files))
     rng = np.random.default_rng(seed)
     rng.shuffle(idx)
-    n_val = max(1, int(round(float(val_fraction) * len(files))))
-    val_ids = set(idx[:n_val].tolist())
-    train = [files[i] for i in range(len(files)) if i not in val_ids]
-    val = [files[i] for i in range(len(files)) if i in val_ids]
+    n_total = len(files)
+    n_val = max(1, int(round(float(val_fraction) * n_total)))
+    n_test = max(1, int(round(float(test_fraction) * n_total)))
+    if (n_val + n_test) >= n_total:
+        raise ValueError(
+            f"Invalid split sizes for n_files={n_total}: "
+            f"n_val={n_val}, n_test={n_test}, n_train={n_total - n_val - n_test}. "
+            "Increase dataset size or reduce val/test fractions."
+        )
+
+    test_ids = set(idx[:n_test].tolist())
+    val_ids = set(idx[n_test : (n_test + n_val)].tolist())
+    train = [files[i] for i in range(n_total) if i not in val_ids and i not in test_ids]
+    val = [files[i] for i in range(n_total) if i in val_ids]
+    test = [files[i] for i in range(n_total) if i in test_ids]
     if not train:
         raise ValueError(
-            f"Train split is empty (n_files={len(files)}, val_fraction={val_fraction}). "
-            "Increase dataset size or reduce val_fraction."
+            "Train split is empty. "
+            f"(n_files={len(files)}, val_fraction={val_fraction}, test_fraction={test_fraction}). "
+            "Increase dataset size or reduce val/test fractions."
         )
     if not val:
         raise ValueError(
-            f"Validation split is empty (n_files={len(files)}, val_fraction={val_fraction}). "
+            "Validation split is empty. "
+            f"(n_files={len(files)}, val_fraction={val_fraction}, test_fraction={test_fraction}). "
             "Increase dataset size or increase val_fraction."
         )
-    return train, val
+    if not test:
+        raise ValueError(
+            "Test split is empty. "
+            f"(n_files={len(files)}, val_fraction={val_fraction}, test_fraction={test_fraction}). "
+            "Increase dataset size or increase test_fraction."
+        )
+    return train, val, test
 
 
 def _load_raw_metadata(file_path: Path) -> Dict[str, Any]:
@@ -216,6 +249,7 @@ def _build_preprocess_fingerprint(*, cfg: GCMulatorConfig, files: Sequence[Path]
         "version": PREPROCESS_FINGERPRINT_VERSION,
         "split_seed": int(cfg.training.split_seed),
         "val_fraction": float(cfg.training.val_fraction),
+        "test_fraction": float(cfg.training.test_fraction),
         "normalization": asdict(cfg.normalization),
         "geometry": asdict(cfg.geometry),
         "solver": {
@@ -238,7 +272,7 @@ def _processed_cache_is_valid(*, meta: Dict[str, Any], fingerprint: Dict[str, An
     splits = meta.get("splits")
     if not isinstance(splits, dict):
         return False
-    for split_name in ("train", "val"):
+    for split_name in ("train", "val", "test"):
         names = splits.get(split_name)
         if not isinstance(names, list) or not names:
             return False
@@ -409,9 +443,16 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
         for p in processed_dir.glob("*"):
             if p.is_file():
                 p.unlink()
+            elif p.is_dir():
+                shutil.rmtree(p)
 
     geometry_meta = _validate_raw_geometry(files, cfg=cfg)
-    train_files, val_files = _split_files(files, seed=cfg.training.split_seed, val_fraction=cfg.training.val_fraction)
+    train_files, val_files, test_files = _split_files(
+        files,
+        seed=cfg.training.split_seed,
+        val_fraction=cfg.training.val_fraction,
+        test_fraction=cfg.training.test_fraction,
+    )
 
     stats = _fit_stats_streaming(
         train_files=train_files,
@@ -439,13 +480,26 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
 
     written_train: List[str] = []
     written_val: List[str] = []
+    written_test: List[str] = []
+    train_dir = processed_dir / "train"
+    val_dir = processed_dir / "val"
+    test_dir = processed_dir / "test"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    val_dir.mkdir(parents=True, exist_ok=True)
+    test_dir.mkdir(parents=True, exist_ok=True)
 
     for fp in train_files:
-        dst = processed_dir / f"{fp.stem}_train.npy"
-        written_train.append(_write_processed_file(src_file=fp, dst_file=dst, stats=stats))
+        dst = train_dir / f"{fp.stem}.npy"
+        name = _write_processed_file(src_file=fp, dst_file=dst, stats=stats)
+        written_train.append(str(Path("train") / name))
     for fp in val_files:
-        dst = processed_dir / f"{fp.stem}_val.npy"
-        written_val.append(_write_processed_file(src_file=fp, dst_file=dst, stats=stats))
+        dst = val_dir / f"{fp.stem}.npy"
+        name = _write_processed_file(src_file=fp, dst_file=dst, stats=stats)
+        written_val.append(str(Path("val") / name))
+    for fp in test_files:
+        dst = test_dir / f"{fp.stem}.npy"
+        name = _write_processed_file(src_file=fp, dst_file=dst, stats=stats)
+        written_test.append(str(Path("test") / name))
 
     z0 = _load_npy_payload_dict(processed_dir / written_train[0])
     st0 = np.asarray(z0["state_final_norm"], dtype=np.float32)
@@ -454,7 +508,7 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
         "fields": fields,
         "param_names": param_names,
         "shape": {"C": int(st0.shape[0]), "H": int(st0.shape[1]), "W": int(st0.shape[2])},
-        "splits": {"train": written_train, "val": written_val},
+        "splits": {"train": written_train, "val": written_val, "test": written_test},
         "normalization": stats_to_json(stats),
         "constant_param_names": const_param_names,
         "geometry": {
@@ -588,7 +642,7 @@ def _collect_validation_predictions(
     rollout_steps_at_default_time: int,
     amp_mode: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Run model on validation loader and collect predictions/targets as NumPy."""
+    """Run model on a split loader and collect predictions/targets as NumPy."""
     preds: List[np.ndarray] = []
     tars: List[np.ndarray] = []
     model.eval()
@@ -774,15 +828,22 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             file_names=processed_meta["splits"]["val"],
             device=device,
         )
+        test_ds = _preload_split_to_device(
+            processed_dir=processed_dir,
+            file_names=processed_meta["splits"]["test"],
+            device=device,
+        )
         LOGGER.info(
-            "Preloaded processed splits to %s | n_train=%d | n_val=%d",
+            "Preloaded processed splits to %s | n_train=%d | n_val=%d | n_test=%d",
             device,
             len(train_ds),
             len(val_ds),
+            len(test_ds),
         )
     else:
         train_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["train"])
         val_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["val"])
+        test_ds = TerminalProcessedDataset(processed_dir=processed_dir, file_names=processed_meta["splits"]["test"])
 
     if len(train_ds) < int(cfg.training.batch_size):
         raise ValueError(
@@ -818,6 +879,13 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     )
     val_loader = DataLoader(
         val_ds,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        **loader_common,
+        drop_last=False,
+    )
+    test_loader = DataLoader(
+        test_ds,
         batch_size=cfg.training.batch_size,
         shuffle=False,
         **loader_common,
@@ -1007,7 +1075,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             best_val = val_loss
             torch.save(ckpt, best_path)
 
-    # Validation metrics on best checkpoint
+    # Validation/test metrics on best checkpoint
     best_ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(best_ckpt["model_state"], strict=True)
     pred_norm, tar_norm = _collect_validation_predictions(
@@ -1020,10 +1088,20 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     )
 
     val_metrics = _compute_gate_metrics(pred_norm=pred_norm, tar_norm=tar_norm, field_names=field_names)
+    test_pred_norm, test_tar_norm = _collect_validation_predictions(
+        model=model,
+        loader=test_loader,
+        device=device,
+        default_time_days=cfg.solver.default_time_days,
+        rollout_steps_at_default_time=cfg.model.rollout_steps_at_default_time,
+        amp_mode=cfg.training.amp_mode,
+    )
+    test_metrics = _compute_gate_metrics(pred_norm=test_pred_norm, tar_norm=test_tar_norm, field_names=field_names)
 
     (model_dir / "training_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     _write_training_history_csv(history=history, csv_path=model_dir / "training_history.csv")
     (model_dir / "val_metrics.json").write_text(json.dumps(val_metrics, indent=2), encoding="utf-8")
+    (model_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2), encoding="utf-8")
 
     summary = {
         "best_checkpoint": str(best_path),
@@ -1031,7 +1109,10 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         "best_val_loss": float(best_val),
         "history_path": str(model_dir / "training_history.json"),
         "history_csv_path": str(model_dir / "training_history.csv"),
+        "val_metrics_path": str(model_dir / "val_metrics.json"),
+        "test_metrics_path": str(model_dir / "test_metrics.json"),
         "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
         "processed_meta": str(processed_dir / "processed_meta.json"),
         "resolved_config_path": str(resolved_cfg_path),
         "original_config_copy_path": str(original_cfg_path),

@@ -36,15 +36,16 @@ MODEL_DIR = Path("models/model")
 CHECKPOINT_NAME = "best.pt"
 
 DEVICE_MODE = "auto"
-SPLIT_NAME = "val"
-PICKED_PROCESSED_NAME: str | None = None  # Example: "sim_000042_val.npy"
+SPLIT_NAME = "test"
+PICKED_PROCESSED_NAME: str | None = None  # Example: "test/sim_000042.npy"
+ROLLOUT_STEPS_OVERRIDE: int | None = None  # Example: 1 to bypass time_days mapping.
 PLOTS_DIR_NAME = "plots"
 FIGURE_NAME = "phi_true_vs_pred_max_days.png"
 FIGURE_DPI = 180
 PHI_COLOR_MAP = "coolwarm"
 PHI_QUANTILE_CLIP = 0.01
-PHI_SYMLOG_LIN_FRAC = 0.02
 COLORBAR_WIDTH_RATIO = 0.07
+WIND_QUIVER_STRIDE = 4
 STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
 
 
@@ -75,6 +76,54 @@ def _resolve_model_dir(path_value: Path) -> Path:
     return project_candidate
 
 
+def _resolve_source_cfg_dir(source_cfg_value: Any) -> Path:
+    """Resolve checkpoint source config directory with local-project fallback."""
+    source_cfg_path = Path(str(source_cfg_value)).expanduser()
+    if source_cfg_path.is_file():
+        return source_cfg_path.resolve().parent
+
+    source_cfg_path_abs = source_cfg_path.resolve()
+    if source_cfg_path_abs.is_file():
+        return source_cfg_path_abs.parent
+
+    return PROJECT_ROOT
+
+
+def _resolve_dataset_and_processed_dirs(
+    *,
+    resolved_cfg: Dict[str, Any],
+    source_cfg_dir: Path,
+    model_dir: Path,
+) -> Tuple[Path, Path]:
+    """Resolve dataset/processed dirs and fall back to local roots if needed."""
+    paths_cfg = dict(resolved_cfg.get("paths", {}))
+    if "dataset_dir" not in paths_cfg or "processed_dir" not in paths_cfg:
+        raise KeyError("resolved_config.paths must include dataset_dir and processed_dir")
+
+    dataset_token = str(paths_cfg["dataset_dir"])
+    processed_token = str(paths_cfg["processed_dir"])
+    base_candidates = [source_cfg_dir, PROJECT_ROOT, model_dir.parent.parent, Path.cwd()]
+
+    checked_meta_paths: List[Path] = []
+    seen_bases: set[str] = set()
+    for base in base_candidates:
+        base_resolved = base.resolve()
+        base_key = str(base_resolved)
+        if base_key in seen_bases:
+            continue
+        seen_bases.add(base_key)
+
+        dataset_dir = (base_resolved / dataset_token).resolve()
+        processed_dir = (base_resolved / processed_token).resolve()
+        processed_meta_path = (processed_dir / "processed_meta.json").resolve()
+        checked_meta_paths.append(processed_meta_path)
+        if processed_meta_path.is_file():
+            return dataset_dir, processed_dir
+
+    checked = ", ".join(str(p) for p in checked_meta_paths)
+    raise FileNotFoundError(f"processed_meta.json not found. Checked: {checked}")
+
+
 def _resolve_device(mode: str) -> torch.device:
     """Resolve plotting/inference device for this utility script."""
     m = str(mode).lower()
@@ -93,15 +142,23 @@ def _resolve_device(mode: str) -> torch.device:
 
 def _processed_to_raw_file_name(processed_name: str) -> str:
     """Map processed split filename back to corresponding raw simulation filename."""
-    p = str(processed_name)
-    if p.endswith("_train.npy"):
-        return p[: -len("_train.npy")] + ".npy"
-    if p.endswith("_val.npy"):
-        return p[: -len("_val.npy")] + ".npy"
-    if p.endswith("_train.npz"):
-        return p[: -len("_train.npz")] + ".npz"
-    if p.endswith("_val.npz"):
-        return p[: -len("_val.npz")] + ".npz"
+    name = Path(str(processed_name)).name
+    if name.endswith("_train.npy"):
+        return name[: -len("_train.npy")] + ".npy"
+    if name.endswith("_val.npy"):
+        return name[: -len("_val.npy")] + ".npy"
+    if name.endswith("_test.npy"):
+        return name[: -len("_test.npy")] + ".npy"
+    if name.endswith("_train.npz"):
+        return name[: -len("_train.npz")] + ".npz"
+    if name.endswith("_val.npz"):
+        return name[: -len("_val.npz")] + ".npz"
+    if name.endswith("_test.npz"):
+        return name[: -len("_test.npz")] + ".npz"
+    if name.startswith("sim_") and name.endswith(".npy"):
+        return name
+    if name.startswith("sim_") and name.endswith(".npz"):
+        return name
     raise ValueError(f"Unexpected processed filename format: {processed_name}")
 
 
@@ -155,7 +212,7 @@ def _pick_max_days_sample(*, dataset_dir: Path, split_files: List[str]) -> Tuple
 
 
 def _robust_phi_signed_limit(true_phi: np.ndarray, pred_phi: np.ndarray) -> float:
-    """Compute robust symmetric color limit for signed Phi plotting."""
+    """Compute robust symmetric color limit for centered Phi plotting."""
     vals = np.concatenate([true_phi.reshape(-1), pred_phi.reshape(-1)]).astype(np.float64)
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
@@ -173,21 +230,22 @@ def _save_phi_figure(
     *,
     true_phi: np.ndarray,
     pred_phi: np.ndarray,
+    true_u: np.ndarray,
+    true_v: np.ndarray,
+    pred_u: np.ndarray,
+    pred_v: np.ndarray,
     sim_name: str,
     time_days: float,
     steps: int,
     device: torch.device,
     out_path: Path,
 ) -> None:
-    """Render side-by-side true/predicted Phi maps with shared signed-symlog colorbar."""
+    """Render side-by-side true/predicted Phi maps with wind quiver overlays."""
     vmax = _robust_phi_signed_limit(true_phi, pred_phi)
-    linthresh = max(float(vmax) * float(PHI_SYMLOG_LIN_FRAC), np.finfo(np.float64).tiny)
-    norm = mcolors.SymLogNorm(
-        linthresh=linthresh,
-        linscale=1.0,
+    norm = mcolors.TwoSlopeNorm(
         vmin=-float(vmax),
+        vcenter=0.0,
         vmax=float(vmax),
-        base=10.0,
     )
     fig = plt.figure(
         figsize=(12.0, 4.8),
@@ -212,6 +270,21 @@ def _save_phi_figure(
         interpolation="bicubic",
         aspect="auto",
     )
+    stride = max(1, int(WIND_QUIVER_STRIDE))
+    h, w = true_phi.shape
+    y_idx = np.arange(0, h, stride, dtype=np.int32)
+    x_idx = np.arange(0, w, stride, dtype=np.int32)
+    xx, yy = np.meshgrid(x_idx, y_idx)
+    ax_true.quiver(
+        xx,
+        yy,
+        true_u[yy, xx],
+        true_v[yy, xx],
+        color="white",
+        pivot="mid",
+        angles="xy",
+        scale_units="xy",
+    )
     ax_true.set_title("True Phi")
     ax_true.set_xlabel("Longitude Index")
     ax_true.set_ylabel("Latitude Index")
@@ -224,18 +297,28 @@ def _save_phi_figure(
         interpolation="bicubic",
         aspect="auto",
     )
+    ax_pred.quiver(
+        xx,
+        yy,
+        pred_u[yy, xx],
+        pred_v[yy, xx],
+        color="white",
+        pivot="mid",
+        angles="xy",
+        scale_units="xy",
+    )
     ax_pred.set_title("Predicted Phi")
     ax_pred.set_xlabel("Longitude Index")
     ax_pred.set_ylabel("Latitude Index")
 
     cbar = fig.colorbar(im_pred, cax=cax)
-    cbar.set_label("Phi (signed symlog)")
-    cbar.locator = mticker.MaxNLocator(nbins=6)
+    cbar.set_label("Phi (linear)")
+    cbar.locator = mticker.MaxNLocator(nbins=7, symmetric=True)
     cbar.update_ticks()
 
     rmse_phi = float(np.sqrt(np.mean((pred_phi - true_phi) ** 2)))
     fig.suptitle(
-        f"{sim_name} | time_days={time_days:.3f} | steps={steps} | device={device} | Phi RMSE={rmse_phi:.3e} | signed symlog"
+        f"{sim_name} | time_days={time_days:.3f} | steps={steps} | device={device} | Phi RMSE={rmse_phi:.3e} | linear scale + wind quiver"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -256,8 +339,8 @@ def main() -> None:
 
     device = _resolve_device(DEVICE_MODE)
     ckpt: Dict[str, Any] = torch.load(ckpt_path, map_location=device)
-    source_cfg_path = Path(str(ckpt["source_config_path"])).resolve()
-    ensure_torch_harmonics_importable(source_cfg_path.parent)
+    source_cfg_dir = _resolve_source_cfg_dir(ckpt["source_config_path"])
+    ensure_torch_harmonics_importable(source_cfg_dir)
 
     model_cfg = _dict_to_namespace(ckpt["model_config"])
     ckpt_geometry = dict(ckpt.get("geometry", {}))
@@ -270,16 +353,21 @@ def main() -> None:
     param_dim = int(len(ckpt["param_names"]))
     fields = list(ckpt["fields"])
 
-    source_cfg_dir = source_cfg_path.parent
     resolved_cfg = dict(ckpt["resolved_config"])
-    dataset_dir = (source_cfg_dir / str(resolved_cfg["paths"]["dataset_dir"])).resolve()
-    processed_dir = (source_cfg_dir / str(resolved_cfg["paths"]["processed_dir"])).resolve()
+    dataset_dir, processed_dir = _resolve_dataset_and_processed_dirs(
+        resolved_cfg=resolved_cfg,
+        source_cfg_dir=source_cfg_dir,
+        model_dir=model_dir,
+    )
     processed_meta_path = (processed_dir / "processed_meta.json").resolve()
     if not processed_meta_path.is_file():
         raise FileNotFoundError(f"processed_meta.json not found: {processed_meta_path}")
 
     processed_meta = json.loads(processed_meta_path.read_text(encoding="utf-8"))
-    split_files = list(processed_meta["splits"][SPLIT_NAME])
+    split_map = dict(processed_meta["splits"])
+    if SPLIT_NAME not in split_map:
+        raise KeyError(f"Split '{SPLIT_NAME}' not found in processed_meta.json. Available: {list(split_map.keys())}")
+    split_files = list(split_map[SPLIT_NAME])
     if not split_files:
         raise RuntimeError(f"No files in processed split '{SPLIT_NAME}' at {processed_meta_path}")
 
@@ -310,11 +398,16 @@ def main() -> None:
     params_norm = normalize_params(raw_params[None, :], stats=stats).astype(np.float32)
     params_t = torch.from_numpy(params_norm).to(device=device)
 
-    steps = time_days_to_rollout_steps(
-        time_days=time_days,
-        default_time_days=float(ckpt["solver"]["default_time_days"]),
-        rollout_steps_at_default_time=int(ckpt["model_config"]["rollout_steps_at_default_time"]),
-    )
+    if ROLLOUT_STEPS_OVERRIDE is None:
+        steps = time_days_to_rollout_steps(
+            time_days=time_days,
+            default_time_days=float(ckpt["solver"]["default_time_days"]),
+            rollout_steps_at_default_time=int(ckpt["model_config"]["rollout_steps_at_default_time"]),
+        )
+    else:
+        steps = int(ROLLOUT_STEPS_OVERRIDE)
+        if steps < 1:
+            raise ValueError(f"ROLLOUT_STEPS_OVERRIDE must be >= 1, got {ROLLOUT_STEPS_OVERRIDE}")
 
     model = build_rollout_model(
         img_size=(h, w),
@@ -336,9 +429,17 @@ def main() -> None:
 
     if "Phi" not in fields:
         raise ValueError(f"'Phi' not found in checkpoint fields: {fields}")
+    if "U" not in fields or "V" not in fields:
+        raise ValueError(f"'U' and 'V' must be present in checkpoint fields: {fields}")
     phi_idx = int(fields.index("Phi"))
+    u_idx = int(fields.index("U"))
+    v_idx = int(fields.index("V"))
     true_phi = np.asarray(true_state[phi_idx], dtype=np.float32)
+    true_u = np.asarray(true_state[u_idx], dtype=np.float32)
+    true_v = np.asarray(true_state[v_idx], dtype=np.float32)
     pred_phi = np.asarray(pred_state[phi_idx], dtype=np.float32)
+    pred_u = np.asarray(pred_state[u_idx], dtype=np.float32)
+    pred_v = np.asarray(pred_state[v_idx], dtype=np.float32)
     true_nonpos = int(np.count_nonzero(true_phi <= 0.0))
     pred_nonpos = int(np.count_nonzero(pred_phi <= 0.0))
 
@@ -346,6 +447,10 @@ def main() -> None:
     _save_phi_figure(
         true_phi=true_phi,
         pred_phi=pred_phi,
+        true_u=true_u,
+        true_v=true_v,
+        pred_u=pred_u,
+        pred_v=pred_v,
         sim_name=raw_file.name,
         time_days=time_days,
         steps=int(steps),
