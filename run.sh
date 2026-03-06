@@ -22,7 +22,7 @@ MAIN_PY="${MAIN_PY:-src/main.py}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
-TORCH_HARMONICS_PACKAGE_SPEC="${TORCH_HARMONICS_PACKAGE_SPEC:-git+https://github.com/NVIDIA/torch-harmonics.git}"
+TORCH_HARMONICS_PACKAGE_SPEC="${TORCH_HARMONICS_PACKAGE_SPEC:-torch-harmonics==0.8.1}"
 TORCH_HARMONICS_PIP_ARGS="${TORCH_HARMONICS_PIP_ARGS:---no-deps --no-build-isolation}"
 TORCH_HARMONICS_FORCE_CPU_BUILD="${TORCH_HARMONICS_FORCE_CPU_BUILD:-1}"
 TORCH_HARMONICS_FORCE_REINSTALL="${TORCH_HARMONICS_FORCE_REINSTALL:-0}"
@@ -110,7 +110,7 @@ if [ "$RUN_GEN_IF_MISSING" = "1" ]; then
   mapfile -t DATA_CFG < <(python - "$CONFIG_PATH" <<'PY'
 from pathlib import Path
 import sys
-from src.config import load_config, resolve_path
+from config import load_config, resolve_path
 
 config_path = Path(sys.argv[1]).resolve()
 cfg = load_config(config_path)

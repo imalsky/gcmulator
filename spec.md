@@ -1,53 +1,36 @@
 # GCMulator Specification
 
 ## 1. Purpose
-GCMulator trains a state-conditioned spherical surrogate for MY_SWAMP dynamics.
+`gcmulator` trains a one-step spherical surrogate for the visible flow produced by `MY_SWAMP`.
 
-Current objective:
-1. Validate and load experiment configuration.
-2. Generate trajectory-transition truth data from MY_SWAMP.
-3. Preprocess and train a transition model on `(state_t, conditioning) -> state_{t+Δt}`.
-4. Run post-training utilities for rollout visualization and TorchScript export.
+The canonical task is:
+1. Sample physical parameters.
+2. Run `MY_SWAMP` on a Legendre-Gauss grid.
+3. Extract many short one-step transitions from each simulation after burn-in.
+4. Train an SFNO-based surrogate on `(state_t, params) -> prognostics_{t+Δ}`.
+5. Reconstruct diagnostic winds outside the network when a full physical state is needed.
 
-Main runtime entrypoint: `src/main.py`.
+This repository does not attempt to emulate the exact internal two-level solver carry. The target is a clean surrogate of the visible flow map.
 
-### 1.1 Change Status (2026-03-05)
-Changed:
-- Training target moved from terminal-state supervision to trajectory-transition supervision.
-- Raw and processed datasets now store transition pairs, not single terminal states.
-- Model interface in training is state-conditioned (`state_t` + conditioning input).
-- Model conditioning now appends normalized transition duration (`transition_days`).
-- User-facing conditioning excludes internal diffusion controls.
-- Runtime AMP safety gate remains active and records `runtime_amp_mode`.
-- Trajectory segmentation now preserves full MY_SWAMP internal state and absolute time index continuity.
-- Transition sampling now supports configurable jump size (`model.transition_jump_steps`).
-
-Unchanged:
-- MY_SWAMP solver physics and integration internals.
-- Geometry conventions and field ordering.
-- Sphere-weighted loss (`SphereLoss`) and core SFNO family.
-
-## 2. Repository Structure
-- `src/`: config, generation, preprocessing, model, training.
-- `extra/`: prediction/export/parity utilities.
-- `config.json`: default experiment configuration.
-- `run.sh`, `run.pbs`: convenience launch scripts.
-
-## 3. Core Domain Objects
-Defined in `src/config.py`.
-
-- `Extended9Params`: internal solver parameter object passed to MY_SWAMP.
-- `TerminalState`: 5-channel physical state container used in backend conversion.
-- `GCMulatorConfig`: top-level config with sections: `paths`, `solver`, `geometry`, `sampling`, `normalization`, `model`, `training`.
-
-Fixed state channel ordering:
+## 2. Scientific Contract
+### 2.1 Input State
+The model input is the full visible physical state in this fixed order:
 1. `Phi`
 2. `U`
 3. `V`
 4. `eta`
 5. `delta`
 
-Fixed user-facing conditioning-vector ordering:
+### 2.2 Learned Target
+The model predicts only the prognostic variables in this fixed order:
+1. `Phi`
+2. `eta`
+3. `delta`
+
+`U` and `V` are not independent network targets. They are reconstructed deterministically from `eta` and `delta` using `MY_SWAMP` spectral inversion utilities when downstream tools need a full five-field state.
+
+## 3. Conditioning
+The conditioning vector is fixed and ordered as:
 1. `a_m`
 2. `omega_rad_s`
 3. `Phibar`
@@ -56,234 +39,188 @@ Fixed user-facing conditioning-vector ordering:
 6. `taudrag_s`
 7. `g_m_s2`
 
-Conditioning vector definition:
-- User-facing parameter vector: the 7 physical parameters listed above.
-- Model conditioning vector: user-facing parameter vector plus trailing normalized `transition_days`.
-- Current model-conditioning order is:
-  1. `a_m`
-  2. `omega_rad_s`
-  3. `Phibar`
-  4. `DPhieq`
-  5. `taurad_s`
-  6. `taudrag_s`
-  7. `g_m_s2`
-  8. `transition_days`
+`transition_days` remains stored as raw metadata, but it is not part of the active model input for the fixed-jump training pipeline.
 
-## 4. End-to-End Flow
-### 4.1 CLI (`src/main.py`)
-- Modes: `--gen`, `--train`.
-- Loads config (`--config` or default `config.json`).
-- Enforces no-TPU JAX policy and generation-safe defaults.
+Conditioning is injected with a small MLP that produces FiLM parameters for the SFNO latent states. The active path does not broadcast parameter maps over every grid cell.
 
-### 4.2 Dataset Generation (`src/data_generation.py`)
-1. Ensure MY_SWAMP importability.
-2. Sample configured parameter sets.
-3. For each simulation, run chunked MY_SWAMP trajectory segments to build transitions:
-   - Use physical horizon from `solver.default_time_days` and `solver.dt_seconds`.
-   - Use `model.rollout_steps_at_default_time` as number of sampled transitions per simulation.
-   - Use `model.transition_jump_steps` as direct transition jump size in solver steps.
-   - Sample anchor times across one continuous integration, then pair `state_t -> state_{t+jump}`.
-   - Integration preserves full solver state and absolute time index continuity.
-4. Save transition tensors and metadata into `sim_XXXXXX.npy`.
-5. Write `manifest.json`.
+## 4. Geometry
+The geometry is locked to Legendre-Gauss.
 
-Notes:
-- Generation currently uses scalar simulation execution for trajectory transitions.
-- Raw saves are uncompressed `.npy` dictionary payloads.
+Stored grid conventions are:
+1. Latitude ordered north-to-south.
+2. Longitude rolled to `[0, 2π)`.
 
-### 4.3 Preprocessing (`src/training.py`)
-1. Read raw `sim_*.npy` (legacy `sim_*.npz` auto-migrates).
-2. Validate geometry consistency and config match.
-3. Split by simulation file into train/val/test.
-4. Fit normalization stats on train split only.
-5. Fit transition-duration normalization stats on train split.
-6. Expand each raw trajectory file into per-transition processed files.
-7. Write `processed_meta.json` and cache fingerprint.
+These conventions are enforced in generation and validated again in preprocessing.
 
-Important:
-- Processed samples are transition-level, but splitting is simulation-level to avoid leakage across splits.
+## 5. Data Generation
+Each simulation produces one contiguous post-burn-in window of short transitions.
 
-### 4.4 Training (`src/training.py`, `train_emulator`)
-1. Build state-conditioned rollout model.
-2. Train one-step transition prediction with sphere quadrature-weighted loss.
-3. Save `last.pt` per epoch and `best.pt` by validation loss.
-4. Evaluate best checkpoint on val/test transition sets.
+Active sampling controls:
+1. `sampling.burn_in_days`
+2. `sampling.transitions_per_simulation`
+3. `sampling.transition_jump_steps`
 
-Model call during training:
-- `y_hat = model(state_t_norm, conditioning_norm, steps=1)`
-- `conditioning_norm` includes normalized parameters and normalized `transition_days`.
-- Supervision is currently single-transition (`steps=1`) by design.
-- The model interface is rollout-capable (`steps>=1`) for future multi-step objectives.
+The window start is sampled uniformly after burn-in. This keeps local dynamics dense enough for one-step learning while preserving coverage across the trajectory ensemble.
 
-### 4.5 Extra Utilities
-- `extra/predictions.py`:
-  - picks one transition sample from a split,
-  - builds transition-aware conditioning (`params + transition_days`),
-  - predicts one direct transition (`state_t -> state_{t+jump}`),
-  - compares predicted vs truth `Phi` map for that sample.
-- `extra/pytorch_export.py`:
-  - exports TorchScript wrapper with baked normalization,
-  - exported module consumes `(state0_physical, params_physical, transition_days_physical)` and returns one direct transition.
-- `extra/swampe_parity_compare.py`:
-  - SWAMPE vs MY_SWAMP terminal parity utility.
+## 6. Learning Objective
+The model learns a one-step spherical flow map in physical state space after normalization:
+- input: full visible state at time `t`
+- conditioning: static physical parameter vector
+- target: prognostic state at time `t + Δ`
 
-## 5. Configuration Design
-Unknown config keys are rejected.
+Loss is sphere-weighted MSE using quadrature weights on the Legendre-Gauss grid.
 
-### 5.1 Sampling Rules
-- Exactly one alias from each pair:
-  - `taurad_s` xor `taurad_hours`
-  - `taudrag_s` xor `taudrag_hours`
-- Allowed dists: `uniform`, `loguniform`, `const`/`fixed`, `mixture_off_loguniform`.
-- Internal diffusion controls are fixed in code and not user-configurable in `sampling.parameters`.
+## 7. Architecture
+The architecture family remains SFNO via `torch_harmonics`.
 
-### 5.2 Time/Transition Mapping
-- Truth integration horizon is `solver.default_time_days`.
-- Number of sampled transitions per simulation is `model.rollout_steps_at_default_time`.
-- Direct transition jump size is `model.transition_jump_steps` (in solver steps).
-- Per-sample physical duration is `transition_days = transition_jump_steps * dt_seconds / 86400`.
-- Current default config uses `dt_seconds=240` and `transition_jump_steps=1`.
+Active stack:
+1. SFNO encoder/backbone/decoder
+2. FiLM-style conditioning MLP over latent states
+3. Residual prognostic head
 
-### 5.3 Model Controls
-- Grid is locked to Legendre-Gauss conventions for torch-harmonics compatibility.
-- Inputs per step: current state + optional parameter maps + optional coordinate channels.
-- Transition duration enters conditioning as a normalized scalar (`transition_days`) appended to normalized physical parameters.
-- `model.transition_jump_steps=1` is the default consecutive-transition training mode.
-- Legacy IC-network controls remain in config but are not used by transition training path.
+Coordinate channels remain optional.
 
-### 5.4 Training Controls
-- Scheduler: `cosine_warmup`, `plateau`, `none`.
-- AMP: `none`, `bf16`, `fp16`.
-- Runtime AMP safety gate disables AMP when transformed grid dimensions are not powers of two.
-- `training.preload_to_gpu=true` requires CUDA and `num_workers=0`.
+## 8. Evaluation
+Acceptance is not based on one-step loss alone.
 
-## 6. Geometry Convention
-`src/geometry.py` applies:
-1. Latitude flip to north-to-south.
-2. Longitude roll to `[0, 2pi)` origin.
+Required evaluation outputs:
+1. One-step normalized and physical RMSE/MAE on prognostic targets.
+2. True spherical harmonic power-spectrum mismatch using `torch_harmonics.RealSHT`, not planar FFTs on the latitude-longitude array.
+3. Free-run rollout metrics over stored contiguous windows.
 
-Training enforces:
-- `geometry.flip_latitude_to_north_south == true`
-- `geometry.roll_longitude_to_0_2pi == true`
+Rollout metrics use recursive model predictions with deterministic `U,V` reconstruction at each step.
 
-## 7. Normalization
-`src/normalization.py` supports per-channel transforms before z-score:
-- `none`
-- `log10`
-- `signed_log1p`
+## 9. Normalization
+State transforms support:
+1. `none`
+2. `log10`
+3. `signed_log1p`
 
-Then z-score normalization is applied channelwise for states and parameters.
+Normalization statistics are stored separately for:
+1. input visible state
+2. target prognostic state
+3. conditioning parameters
 
-Guardrails:
-- Std floors, constant-parameter handling, finite clipping, inverse-transform safety.
+Constant conditioning channels are zeroed after normalization.
 
-## 8. Model Architecture
-Transition model stack:
-1. SFNO stepper (`torch_harmonics.examples`).
-2. `ConditionalResidualWrapper` for residual update.
-3. `StateConditionedRolloutModel` for iterative state-conditioned rollout.
-
-Each step consumes current state and static conditioning channels.
-
-## 9. Data and Artifact Contracts
-### 9.1 Raw Simulation File (`sim_XXXXXX.npy`)
-Contains:
-- `state_inputs` `[T,C,H,W]`
-- `state_targets` `[T,C,H,W]`
-- `transition_days` `[T]`
-- `fields`
+## 10. Raw Data Contract
+Each raw `sim_XXXXXX.npy` file stores:
+- `state_inputs` with shape `[T, 5, H, W]`
+- `state_targets` with shape `[T, 3, H, W]`
+- `transition_days` with shape `[T]`
+- `anchor_steps` with shape `[T]`
+- `input_fields`
+- `target_fields`
 - `params`
 - `param_names`
-- `time_days`
+- `default_time_days`
+- `burn_in_days`
 - `dt_seconds`
+- `starttime_index`
 - `transition_jump_steps`
 - `n_transitions`
-- `M`, `nlat`, `nlon`
-- geometry metadata: `lat_order`, `lon_origin`, `lon_shift`
+- `M`
+- `nlat`
+- `nlon`
+- `lat_order`
+- `lon_origin`
+- `lon_shift`
 
-### 9.2 Raw Manifest (`manifest.json`)
-Includes:
-- solver settings,
-- sampling metadata,
-- `conditioning_param_names`,
-- generated item summaries.
+Raw files must match the active config exactly for solver, sampling, parameter ordering, field ordering, and geometry metadata.
 
-### 9.3 Processed Transition File (`train/*.npy`, `val/*.npy`, `test/*.npy`)
-Contains:
-- `state_input_norm` `[C,H,W]`
-- `state_target_norm` `[C,H,W]`
-- `params_norm` `[P]`
-- `conditioning_norm` `[P+1]` when transition-duration conditioning is present
-- `transition_days` scalar
-- `transition_days_norm` scalar
+## 11. Processed Data Contract
+Processed data is written as split-level shard files, one shard per raw simulation file.
 
-### 9.4 Processed Metadata (`processed_meta.json`)
-Contains:
-- `task="trajectory_transition"`
-- `fields`, `param_names`, `conditioning_names`, `constant_param_names`, `constant_conditioning_names`
-- shape (`C,H,W`)
-- split file lists
-- normalization stats
-- transition-duration normalization stats (`transition_days_norm`)
-- geometry and solver metadata
-- preprocess fingerprint
+Each shard `.npz` stores:
+- `state_inputs_norm`
+- `state_targets_norm`
+- `params_norm`
+- `anchor_steps`
 
-### 9.5 Training Checkpoints (`best.pt`, `last.pt`)
-Contain:
-- `mode="state_conditioned_trajectory_transition"`
+The processed format does not duplicate a full `conditioning_norm` row for every transition. Parameter normalization is stored once per shard and expanded by the loader.
+
+Splitting is done by simulation file, not by transition, to prevent leakage.
+
+## 12. Metadata and Checkpoints
+`processed_meta.json` stores:
+- `input_fields`
+- `target_fields`
+- `param_names`
+- `conditioning_names`
+- `input_shape`
+- `target_shape`
+- split shard entries
+- normalization statistics
+- solver metadata
+- sampling metadata
+- geometry metadata
+- preprocessing fingerprint
+
+`best.pt` and `last.pt` store:
 - model weights
-- field/parameter names, conditioning names, and shape
-- normalization stats
-- transition-duration normalization stats (`transition_days_norm`)
-- config snapshots
-- `runtime_amp_mode`
+- input field ordering
+- target field ordering
+- parameter ordering
+- normalization statistics
+- solver metadata
+- sampling metadata
+- resolved config snapshot
+- runtime AMP mode
 
-### 9.6 Additional Outputs
-- `training_history.json`
-- `training_history.csv`
-- `val_metrics.json`
-- `test_metrics.json`
-- `config_used.resolved.json`
-- `config_used.original.<ext>`
-- `model_export.torchscript.pt`
-- `model_export.meta.json`
-- `plots/phi_true_vs_pred_max_days.png`
-
-## 10. Runtime Dependencies and Import Resolution
-Core:
+## 13. Dependency Contract
+Required core dependencies:
 - `numpy`
 - `torch`
-- `torch_harmonics`
+- `torch-harmonics==0.8.1`
 
-Optional:
-- `my_swamp` (generation)
-- `matplotlib` (prediction utility)
-- `PyYAML` (YAML config)
+Required generation and diagnostic dependency:
+- `my_swamp`
 
-Import strategy:
-- Prefer installed packages, fallback to sibling checkouts.
+Optional plotting dependency:
+- `matplotlib`
 
-## 11. Execution Interfaces
-### 11.1 Direct CLI
-- `python src/main.py --gen --config config.json`
-- `python src/main.py --train --config config.json`
+The active training and generation code assumes these dependencies are importable in the environment. Runtime fallback search paths are not part of the contract.
 
-### 11.2 Convenience Scripts
-- `run.sh` and `run.pbs` provide environment setup, optional generation, and training launch.
+## 14. Repository Layout
+The repository keeps the current flat `src/` layout.
 
-## 12. Verification Status
-Current correctness gates:
-- strict config schema/value validation,
-- preprocessing/data-contract checks,
-- finite checks and training/runtime checks,
-- denormalized-space RMSE metrics,
-- spectral relative-power RMSE metrics,
-- lightweight physical-summary diagnostics.
+Primary files:
+- `src/main.py`
+- `src/config.py`
+- `src/data_generation.py`
+- `src/my_swamp_backend.py`
+- `src/modeling.py`
+- `src/normalization.py`
+- `src/training.py`
+- `src/geometry.py`
+- `src/sampling.py`
+- `extra/predictions.py`
+- `extra/pytorch_export.py`
+- `extra/training_log.py`
+- `extra/batch_size_benchmark.py`
+- `unit_tests/`
 
-## 13. Current Design Notes and Gaps
-1. Current training is intentionally one-step transition supervision (`steps=1`) and no rollout curriculum is planned in current scope (user decision on 2026-03-05).
-2. Prognostic-only target (`eta, delta, Phi` with diagnostic `U,V` reconstruction) is not implemented yet.
-3. Prediction utility expansion beyond the current one-sample `Phi` panel is deferred for now (user decision on 2026-03-05).
-4. IC strategy changes (analytic IC or analytic+residual IC) are deferred for now (user decision on 2026-03-05).
-5. Mixed jump sizes within a single run are deferred for now; jump size remains configured per run (`model.transition_jump_steps`) (user decision on 2026-03-05).
-6. Rebuilding raw+processed data is required after schema changes.
+## 15. Local Integrity Checks
+The minimum local integrity pass for this repository is:
+1. `python -m pytest unit_tests`
+2. `python -m compileall src extra unit_tests`
+
+For code cleanliness, run these developer checks when the tools are available:
+1. `ruff check src extra unit_tests`
+2. `vulture src extra unit_tests --min-confidence 80`
+
+In the standard local `swamp_compare` conda environment, both `ruff` and `vulture`
+are installed. `ruff` must be invoked with a subcommand such as `check`, and
+`vulture` must be invoked with one or more paths.
+
+`ruff` and `vulture` are development-time quality gates, not runtime dependencies.
+
+## 16. Exactness Statement
+This version intentionally models the visible flow, not the exact discrete MY_SWAMP solver carry.
+
+That means:
+- no learned previous-step carry in the network state
+- prognostic-only targets
+- deterministic diagnostic reconstruction outside the network when full-state outputs are required
+
+This is an approximate surrogate of the flow map seen through the visible physical state.

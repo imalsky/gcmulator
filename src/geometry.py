@@ -1,4 +1,10 @@
-"""Grid-orientation helpers for latitude/longitude convention alignment."""
+"""Helpers for aligning latitude/longitude grid conventions.
+
+The emulator stores physical states in a single canonical orientation. These
+utilities keep the conversion logic in one place so data generation,
+preprocessing, and evaluation all agree on what "north-to-south" and
+"0-to-2pi" mean.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,7 @@ import numpy as np
 
 
 def geometry_shift_for_nlon(nlon: int, roll_longitude_to_0_2pi: bool) -> int:
-    """Return longitude roll offset needed to move origin from [-pi,pi) to [0,2pi)."""
+    """Return the longitude roll needed to move ``[-pi, pi)`` to ``[0, 2pi)``."""
     if not roll_longitude_to_0_2pi:
         return 0
     if nlon % 2 != 0:
@@ -22,14 +28,16 @@ def apply_geometry_state(
     flip_latitude_to_north_south: bool,
     roll_longitude_to_0_2pi: bool,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Apply geometry convention conversion on a single [C,H,W] state."""
+    """Apply geometry conversion to one state tensor with shape ``[C, H, W]``."""
     if state_chw.ndim != 3:
-        raise ValueError(f"Expected [C,H,W], got shape {state_chw.shape}")
+        raise ValueError(f"Expected [C, H, W], got shape {state_chw.shape}")
 
     _, nlat, nlon = state_chw.shape
     lon_shift = geometry_shift_for_nlon(nlon, roll_longitude_to_0_2pi)
 
     out = state_chw
+    # Apply latitude and longitude remapping in the same order used by the
+    # dataset pipeline so saved metadata always matches the tensor payload.
     if flip_latitude_to_north_south:
         out = out[:, ::-1, :]
     if lon_shift:

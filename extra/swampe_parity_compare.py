@@ -14,8 +14,9 @@ import numpy as np
 import scipy.special as sp
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 # Keep matplotlib cache in a writable temp path to avoid permission/cache issues.
 MPL_CACHE_DIR = Path(os.environ.get("GCMULATOR_MPLCONFIGDIR", "/tmp/gcmulator_mplcache")).resolve()
@@ -32,10 +33,13 @@ try:
     from matplotlib import colors as mcolors
     from matplotlib import ticker as mticker
 except Exception as exc:  # pragma: no cover
-    raise RuntimeError("swampe_parity_compare.py requires matplotlib. Install it in your environment first.") from exc
+    raise RuntimeError(
+        "swampe_parity_compare.py requires matplotlib. "
+        "Install it in your environment first."
+    ) from exc
 
-from src.config import Extended9Params
-from src.my_swamp_backend import ensure_my_swamp_importable
+from config import Extended9Params
+from my_swamp_backend import ensure_my_swamp_importable
 
 # ---------------------------------------------------------------------------
 # User-editable run settings
@@ -95,7 +99,12 @@ def _ensure_lpmn_compat() -> None:
     if hasattr(sp, "lpmn"):
         return
 
-    def _lpmn_compat(m_max: int, n_max: int, x: float):
+    def _lpmn_compat(
+        m_max: int,
+        n_max: int,
+        x: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute associated Legendre values/derivatives with SciPy-compatible layout."""
         m_max = int(m_max)
         n_max = int(n_max)
         p = np.zeros((m_max + 1, n_max + 1), dtype=np.float64)
@@ -112,9 +121,10 @@ def _ensure_lpmn_compat() -> None:
 
         for m_i in range(0, m_max + 1):
             for n_i in range(m_i + 2, n_max + 1):
-                p[m_i, n_i] = ((2 * n_i - 1) * x * p[m_i, n_i - 1] - (n_i + m_i - 1) * p[m_i, n_i - 2]) / (
-                    n_i - m_i
-                )
+                p[m_i, n_i] = (
+                    (2 * n_i - 1) * x * p[m_i, n_i - 1]
+                    - (n_i + m_i - 1) * p[m_i, n_i - 2]
+                ) / (n_i - m_i)
 
         denom = x * x - 1.0
         if denom == 0.0:
@@ -153,7 +163,10 @@ def _ensure_swampe_importable() -> None:
             except Exception:
                 sys.path.pop(0)
 
-    raise RuntimeError("Could not import SWAMPE. Install it or place SWAMPE/ next to this repository.")
+    raise RuntimeError(
+        "Could not import SWAMPE. Install it or place SWAMPE/ "
+        "next to this repository."
+    )
 
 
 def _apply_plot_style() -> None:
@@ -306,11 +319,41 @@ def _run_swampe(*, tmax: int) -> Dict[str, object]:
         target_step = int(tmax - 1)
         timestamp = str(int(last_ts_s))
         return {
-            "Phi": np.asarray(swampe_cont.read_pickle(f"Phi-{timestamp}", custompath=custompath), dtype=np.float64),
-            "U": np.asarray(swampe_cont.read_pickle(f"U-{timestamp}", custompath=custompath), dtype=np.float64),
-            "V": np.asarray(swampe_cont.read_pickle(f"V-{timestamp}", custompath=custompath), dtype=np.float64),
-            "eta": np.asarray(swampe_cont.read_pickle(f"eta-{timestamp}", custompath=custompath), dtype=np.float64),
-            "delta": np.asarray(swampe_cont.read_pickle(f"delta-{timestamp}", custompath=custompath), dtype=np.float64),
+            "Phi": np.asarray(
+                swampe_cont.read_pickle(
+                    f"Phi-{timestamp}",
+                    custompath=custompath,
+                ),
+                dtype=np.float64,
+            ),
+            "U": np.asarray(
+                swampe_cont.read_pickle(
+                    f"U-{timestamp}",
+                    custompath=custompath,
+                ),
+                dtype=np.float64,
+            ),
+            "V": np.asarray(
+                swampe_cont.read_pickle(
+                    f"V-{timestamp}",
+                    custompath=custompath,
+                ),
+                dtype=np.float64,
+            ),
+            "eta": np.asarray(
+                swampe_cont.read_pickle(
+                    f"eta-{timestamp}",
+                    custompath=custompath,
+                ),
+                dtype=np.float64,
+            ),
+            "delta": np.asarray(
+                swampe_cont.read_pickle(
+                    f"delta-{timestamp}",
+                    custompath=custompath,
+                ),
+                dtype=np.float64,
+            ),
             "terminal_step": int(terminal_step),
             "terminal_timestamp_seconds": int(last_ts_s),
             "target_step": int(target_step),
@@ -356,7 +399,12 @@ def _run_my_swamp(*, tmax: int) -> Dict[str, np.ndarray]:
     }
 
 
-def _metric_dict(*, swampe_field: np.ndarray, my_swamp_field: np.ndarray, atol: float) -> Dict[str, float | bool]:
+def _metric_dict(
+    *,
+    swampe_field: np.ndarray,
+    my_swamp_field: np.ndarray,
+    atol: float,
+) -> Dict[str, float | bool]:
     """Compute per-field parity metrics and tolerance pass/fail flag."""
     diff = my_swamp_field - swampe_field
     max_abs = float(np.max(np.abs(diff)))
@@ -371,7 +419,14 @@ def _metric_dict(*, swampe_field: np.ndarray, my_swamp_field: np.ndarray, atol: 
         "rmse": rmse,
         "mean_abs": mean_abs,
         "rel_l2": float(rel_l2),
-        "allclose_rtol0": bool(np.allclose(my_swamp_field, swampe_field, rtol=0.0, atol=float(atol))),
+        "allclose_rtol0": bool(
+            np.allclose(
+                my_swamp_field,
+                swampe_field,
+                rtol=0.0,
+                atol=float(atol),
+            )
+        ),
     }
 
 
@@ -408,7 +463,9 @@ def main() -> None:
     compared_steps = int(swampe_terminal_step - STARTTIME_INDEX + 1)
     if compared_steps < 1:
         raise RuntimeError(
-            f"Invalid terminal step from SWAMPE ({swampe_terminal_step}); expected at least STARTTIME_INDEX={STARTTIME_INDEX}."
+            "Invalid terminal step from SWAMPE "
+            f"({swampe_terminal_step}); expected at least "
+            f"STARTTIME_INDEX={STARTTIME_INDEX}."
         )
     compared_time_days = float(compared_steps * DT_SECONDS / 86400.0)
     compared_tmax = int(swampe_terminal_step + 1)
@@ -420,7 +477,9 @@ def main() -> None:
     for field in fields:
         if swampe[field].shape != my_swamp[field].shape:
             raise ValueError(
-                f"Shape mismatch for {field}: SWAMPE={swampe[field].shape} vs MY_SWAMP={my_swamp[field].shape}"
+                f"Shape mismatch for {field}: "
+                f"SWAMPE={swampe[field].shape} "
+                f"vs MY_SWAMP={my_swamp[field].shape}"
             )
         m = _metric_dict(
             swampe_field=swampe[field],

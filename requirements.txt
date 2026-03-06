@@ -1,0 +1,6 @@
+# Install `my_swamp` separately from its own repository or wheel.
+numpy>=1.26
+torch>=2.4.0
+torch-harmonics==0.8.1
+matplotlib>=3.8
+PyYAML>=6.0

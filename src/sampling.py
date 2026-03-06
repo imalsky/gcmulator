@@ -1,29 +1,25 @@
-"""Sampling utilities for user-configured physical parameters."""
+"""Sampling utilities for user-configured physical parameters.
+
+This module owns the translation between config-level sampling specifications
+and the canonical conditioning vector used throughout the emulator pipeline.
+"""
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Sequence
+from typing import Dict, Sequence
 
 import numpy as np
 
-from .config import Extended9Params, ParameterSpec
+from config import CONDITIONING_PARAM_NAMES, Extended9Params, ParameterSpec
 
 # Sampling and unit-conversion constants.
 PROBABILITY_MIN = 0.0
 PROBABILITY_MAX = 1.0
 SECONDS_PER_HOUR = 3600.0
 
-
-CONDITIONING_PARAM_NAMES: List[str] = [
-    "a_m",
-    "omega_rad_s",
-    "Phibar",
-    "DPhieq",
-    "taurad_s",
-    "taudrag_s",
-    "g_m_s2",
-]
+# Diffusion controls are fixed internally and intentionally excluded from the
+# user-facing conditioning vector.
 INTERNAL_FIXED_K6 = 1.24e33
 INTERNAL_FIXED_K6PHI = None
 
@@ -49,9 +45,15 @@ def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
 
     if spec.dist == "mixture_off_loguniform":
         if spec.p_off is None or spec.on_min is None or spec.on_max is None:
-            raise ValueError(f"mixture_off_loguniform requires p_off/off_value/on_min/on_max for {spec.name}")
+            raise ValueError(
+                "mixture_off_loguniform requires p_off/off_value/on_min/on_max "
+                f"for {spec.name}"
+            )
         if float(spec.on_min) <= 0 or float(spec.on_max) <= 0:
-            raise ValueError(f"mixture_off_loguniform requires positive on_min/on_max for {spec.name}")
+            raise ValueError(
+                "mixture_off_loguniform requires positive "
+                f"on_min/on_max for {spec.name}"
+            )
         if float(spec.on_min) >= float(spec.on_max):
             raise ValueError(f"mixture_off_loguniform requires on_min < on_max for {spec.name}")
         if not (PROBABILITY_MIN <= float(spec.p_off) <= PROBABILITY_MAX):
@@ -67,7 +69,10 @@ def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
     raise ValueError(f"Unsupported dist '{spec.dist}' for {spec.name}")
 
 
-def sample_parameter_dict(rng: np.random.Generator, specs: Sequence[ParameterSpec]) -> Dict[str, float]:
+def sample_parameter_dict(
+    rng: np.random.Generator,
+    specs: Sequence[ParameterSpec],
+) -> Dict[str, float]:
     """Sample all configured parameters and normalize alias units to seconds."""
     sampled: Dict[str, float] = {}
     for spec in specs:
@@ -83,7 +88,7 @@ def sample_parameter_dict(rng: np.random.Generator, specs: Sequence[ParameterSpe
 
 
 def to_extended9(sampled: Dict[str, float]) -> Extended9Params:
-    """Convert sampled parameter map into validated ``Extended9Params``."""
+    """Convert a sampled parameter map into validated ``Extended9Params``."""
     missing = [name for name in CONDITIONING_PARAM_NAMES if name not in sampled]
     if missing:
         raise ValueError(f"Missing sampled conditioning parameters: {missing}")
@@ -99,3 +104,15 @@ def to_extended9(sampled: Dict[str, float]) -> Extended9Params:
         K6=float(INTERNAL_FIXED_K6),
         K6Phi=INTERNAL_FIXED_K6PHI,
     )
+
+
+def vector_to_extended9(vector: np.ndarray) -> Extended9Params:
+    """Convert a canonical conditioning vector back into ``Extended9Params``."""
+    values = np.asarray(vector, dtype=np.float64)
+    if values.shape != (len(CONDITIONING_PARAM_NAMES),):
+        raise ValueError(
+            "Conditioning vector must have shape "
+            f"({len(CONDITIONING_PARAM_NAMES)},), got {values.shape}"
+        )
+    sampled = {name: float(values[index]) for index, name in enumerate(CONDITIONING_PARAM_NAMES)}
+    return to_extended9(sampled)
