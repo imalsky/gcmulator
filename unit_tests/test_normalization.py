@@ -8,6 +8,7 @@ from normalization import (
     ParamNormalizationStats,
     StateNormalizationStats,
     denormalize_state_tensor,
+    normalize_conditioning,
     normalize_params,
     normalize_state_tensor,
 )
@@ -55,3 +56,35 @@ def test_normalize_params_zeros_constant_channels() -> None:
 
     assert np.allclose(normalized[:, 1], 0.0)
     assert np.allclose(normalized[:, 0], np.array([-1.0, 1.0], dtype=np.float32))
+
+
+def test_normalize_conditioning_appends_transition_time_channel() -> None:
+    """Time-conditioned inputs should append normalized transition duration."""
+    params = np.array([3.0, 9.0], dtype=np.float64)
+    transition_days = np.array([0.25, 0.5], dtype=np.float64)
+    param_stats = ParamNormalizationStats(
+        param_names=("varying", "constant"),
+        mean=np.array([5.0, 9.0], dtype=np.float64),
+        std=np.array([2.0, 1.0], dtype=np.float64),
+        is_constant=np.array([False, True], dtype=bool),
+        zscore_eps=1.0e-8,
+    )
+    transition_time_stats = ParamNormalizationStats(
+        param_names=("transition_days",),
+        mean=np.array([0.375], dtype=np.float64),
+        std=np.array([0.125], dtype=np.float64),
+        is_constant=np.array([False], dtype=bool),
+        zscore_eps=1.0e-8,
+    )
+
+    conditioning = normalize_conditioning(
+        params,
+        transition_days,
+        param_stats=param_stats,
+        transition_time_stats=transition_time_stats,
+    )
+
+    assert conditioning.shape == (2, 3)
+    assert np.allclose(conditioning[:, 0], np.array([-1.0, -1.0], dtype=np.float32))
+    assert np.allclose(conditioning[:, 1], 0.0)
+    assert np.allclose(conditioning[:, 2], np.array([-1.0, 1.0], dtype=np.float32))

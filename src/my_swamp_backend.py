@@ -325,7 +325,10 @@ def _get_batched_trajectory_window_runner(
 
     flags = _build_run_flags(diagnostics=False)
     rel_steps = jnp.arange(1, int(n_steps_total) + 1, dtype=jnp.int32)
-    transition_offsets = jnp.arange(int(n_transitions), dtype=jnp.int32)
+    transition_offsets = (
+        jnp.arange(int(n_transitions), dtype=jnp.int32)
+        * jnp.asarray(int(transition_jump_steps), dtype=jnp.int32)
+    )
     current_field_indices = jnp.asarray(CURRENT_FIELD_INDICES, dtype=jnp.int32)
     prognostic_field_indices = jnp.asarray(PROGNOSTIC_FIELD_INDICES, dtype=jnp.int32)
     transition_days_value = (
@@ -472,8 +475,11 @@ def run_trajectory_windows_batched(
         raise ValueError("transition_jump_steps must be >= 1")
 
     n_steps_total = _total_rollout_steps(time_days=time_days, dt_seconds=dt_seconds)
-    transition_offsets = np.arange(int(n_transitions), dtype=np.int64)
-    anchor_steps = window_start_steps.astype(np.int64, copy=False)[:, None] + transition_offsets[None, :]
+    transition_offsets = np.arange(int(n_transitions), dtype=np.int64) * int(transition_jump_steps)
+    anchor_steps = (
+        window_start_steps.astype(np.int64, copy=False)[:, None]
+        + transition_offsets[None, :]
+    )
     target_steps = anchor_steps + int(transition_jump_steps)
     if np.any(window_start_steps < 0):
         raise ValueError("window_start_steps must be >= 0")
@@ -526,7 +532,7 @@ def run_trajectory_window(
     n_transitions: int,
     transition_jump_steps: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Extract a contiguous visible-state transition window from one MY_SWAMP run."""
+    """Extract a direct-jump transition chain from one MY_SWAMP run."""
     import jax.numpy as jnp
 
     if time_days <= 0:
@@ -541,7 +547,10 @@ def run_trajectory_window(
         raise ValueError("window_start_step must be >= 0")
 
     n_steps_total = _total_rollout_steps(time_days=time_days, dt_seconds=dt_seconds)
-    anchor_steps = window_start_step + np.arange(int(n_transitions), dtype=np.int64)
+    anchor_steps = (
+        window_start_step
+        + np.arange(int(n_transitions), dtype=np.int64) * int(transition_jump_steps)
+    )
     target_steps = anchor_steps + int(transition_jump_steps)
     if int(target_steps[-1]) > int(n_steps_total):
         raise ValueError(

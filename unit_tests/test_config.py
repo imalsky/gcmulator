@@ -36,6 +36,7 @@ def _minimal_config_dict() -> dict[str, object]:
             "burn_in_days": 0.0,
             "transitions_per_simulation": 2,
             "transition_jump_steps": 1,
+            "transition_jump_steps_max": 1,
             "parameters": [
                 {"name": "a_m", "dist": "fixed", "value": 8.2e7},
                 {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
@@ -113,6 +114,35 @@ def test_load_config_allows_zero_burn_in(tmp_path: Path) -> None:
 
     assert cfg.sampling.burn_in_days == pytest.approx(0.0)
     assert cfg.sampling.generation_workers == 2
+
+
+def test_load_config_accepts_variable_transition_jump_range(tmp_path: Path) -> None:
+    """Variable jump training should parse as an explicit solver-step range."""
+    payload = _minimal_config_dict()
+    sampling_section = dict(payload["sampling"])
+    sampling_section["transition_jump_steps"] = 2
+    sampling_section["transition_jump_steps_max"] = 4
+    payload["sampling"] = sampling_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    assert cfg.sampling.min_transition_jump_steps() == 2
+    assert cfg.sampling.max_transition_jump_steps() == 4
+    assert cfg.sampling.uses_variable_transition_jump() is True
+
+
+def test_load_config_rejects_inverted_transition_jump_range(tmp_path: Path) -> None:
+    """The max jump must not be smaller than the min jump."""
+    payload = _minimal_config_dict()
+    sampling_section = dict(payload["sampling"])
+    sampling_section["transition_jump_steps"] = 4
+    sampling_section["transition_jump_steps_max"] = 2
+    payload["sampling"] = sampling_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="transition_jump_steps_max"):
+        load_config(config_path)
 
 
 def test_load_config_rejects_unknown_keys(tmp_path: Path) -> None:

@@ -19,7 +19,13 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 # Keep matplotlib cache in a writable temp path to avoid permission/cache issues.
-MPL_CACHE_DIR = Path(os.environ.get("GCMULATOR_MPLCONFIGDIR", "/tmp/gcmulator_mplcache")).resolve()
+PROJECT_CACHE_DIR = PROJECT_ROOT / ".cache"
+DEFAULT_MPL_CACHE_DIR = PROJECT_CACHE_DIR / "mplconfig"
+PROJECT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("XDG_CACHE_HOME", str(PROJECT_CACHE_DIR.resolve()))
+MPL_CACHE_DIR = Path(
+    os.environ.get("GCMULATOR_MPLCONFIGDIR", str(DEFAULT_MPL_CACHE_DIR))
+).resolve()
 MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 
@@ -286,7 +292,7 @@ def _run_swampe(*, tmax: int) -> Dict[str, object]:
     import SWAMPE.continuation as swampe_cont
     import SWAMPE.model as swampe_model
 
-    with tempfile.TemporaryDirectory(prefix="swampe_parity_", dir="/tmp") as tmp:
+    with tempfile.TemporaryDirectory(prefix="swampe_parity_") as tmp:
         custompath = f"{tmp}/"
         swampe_model.run_model(
             M=int(M),

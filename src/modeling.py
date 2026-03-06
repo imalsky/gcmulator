@@ -142,7 +142,7 @@ def _ensure_sfno_encoder_depth(
 def choose_device(device_cfg: str) -> torch.device:
     """Resolve the runtime torch device from the config string.
 
-    ``auto`` prefers CUDA, then MPS, then CPU.
+    ``auto`` prefers CUDA, then CPU.
     """
     mode = str(device_cfg).lower()
     if mode == "cpu":
@@ -153,8 +153,6 @@ def choose_device(device_cfg: str) -> torch.device:
         return torch.device("cuda")
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -260,16 +258,16 @@ def build_coord_channels_legendre_gauss(
 
     lat2d = lat[:, None]
     lon2d = lon[None, :]
-    sin_lat = np.repeat(np.sin(lat2d), int(nlon), axis=1)
-    cos_lat = np.repeat(np.cos(lat2d), int(nlon), axis=1)
-    sin_lon = np.repeat(np.sin(lon2d), int(nlat), axis=0)
-    cos_lon = np.repeat(np.cos(lon2d), int(nlat), axis=0)
+    sin_lat = np.broadcast_to(np.sin(lat2d), (int(nlat), int(nlon)))
+    cos_lat = np.broadcast_to(np.cos(lat2d), (int(nlat), int(nlon)))
+    sin_lon = np.broadcast_to(np.sin(lon2d), (int(nlat), int(nlon)))
+    cos_lon = np.broadcast_to(np.cos(lon2d), (int(nlat), int(nlon)))
     stacked = np.stack([sin_lat, cos_lat, sin_lon, cos_lon], axis=0).astype(np.float32)
     return torch.from_numpy(stacked).to(device=device, dtype=dtype)
 
 
 class StateConditionedTransitionModel(nn.Module):
-    """One-step transition model with FiLM-conditioned SFNO latent states."""
+    """Direct-jump transition model with FiLM-conditioned SFNO latent states."""
 
     def __init__(
         self,

@@ -11,7 +11,7 @@ from typing import Dict, Sequence, Tuple
 
 import numpy as np
 
-from config import NormalizationConfig
+from config import NormalizationConfig, TRANSITION_TIME_NAME
 
 
 STD_FLOOR = 1.0e-12
@@ -48,6 +48,7 @@ class NormalizationStats:
     input_state: StateNormalizationStats
     target_state: StateNormalizationStats
     params: ParamNormalizationStats
+    transition_time: ParamNormalizationStats
 
 
 def subset_state_stats(
@@ -185,6 +186,45 @@ def normalize_params(params_np: np.ndarray, stats: ParamNormalizationStats) -> n
     return out.astype(np.float32)
 
 
+def normalize_conditioning(
+    params_np: np.ndarray,
+    transition_days_np: np.ndarray,
+    *,
+    param_stats: ParamNormalizationStats,
+    transition_time_stats: ParamNormalizationStats,
+) -> np.ndarray:
+    """Normalize physical parameters and transition duration into one conditioning matrix."""
+    params = np.asarray(params_np, dtype=np.float64)
+    if params.ndim == 1:
+        params = params[None, :]
+    if params.ndim != 2:
+        raise ValueError(f"params_np must be rank-1 or rank-2, got {params.shape}")
+
+    transition_days = np.asarray(transition_days_np, dtype=np.float64)
+    if transition_days.ndim == 0:
+        transition_days = transition_days.reshape(1)
+    elif transition_days.ndim != 1:
+        raise ValueError(
+            "transition_days_np must be rank-0 or rank-1, "
+            f"got {transition_days.shape}"
+        )
+
+    if params.shape[0] == 1 and transition_days.shape[0] > 1:
+        params = np.repeat(params, int(transition_days.shape[0]), axis=0)
+    elif params.shape[0] != int(transition_days.shape[0]):
+        raise ValueError(
+            "params_np and transition_days_np must align by sample count, "
+            f"got {params.shape[0]} and {transition_days.shape[0]}"
+        )
+
+    params_norm = normalize_params(params, param_stats)
+    transition_days_norm = normalize_params(
+        transition_days.reshape(-1, 1),
+        transition_time_stats,
+    )
+    return np.concatenate([params_norm, transition_days_norm], axis=1).astype(np.float32)
+
+
 def stats_to_json(stats: NormalizationStats) -> Dict[str, object]:
     """Serialize normalization stats into JSON-friendly primitives."""
     return {
@@ -213,6 +253,13 @@ def stats_to_json(stats: NormalizationStats) -> Dict[str, object]:
             "is_constant": np.asarray(stats.params.is_constant, dtype=bool).tolist(),
             "zscore_eps": float(stats.params.zscore_eps),
         },
+        "transition_time": {
+            "param_names": list(stats.transition_time.param_names),
+            "mean": stats.transition_time.mean.tolist(),
+            "std": stats.transition_time.std.tolist(),
+            "is_constant": np.asarray(stats.transition_time.is_constant, dtype=bool).tolist(),
+            "zscore_eps": float(stats.transition_time.zscore_eps),
+        },
     }
 
 
@@ -221,6 +268,18 @@ def stats_from_json(data: Dict[str, object]) -> NormalizationStats:
     input_state = dict(data["input_state"])
     target_state = dict(data["target_state"])
     params = dict(data["params"])
+    transition_time = dict(
+        data.get(
+            "transition_time",
+            {
+                "param_names": [TRANSITION_TIME_NAME],
+                "mean": [0.0],
+                "std": [1.0],
+                "is_constant": [True],
+                "zscore_eps": float(params["zscore_eps"]),
+            },
+        )
+    )
 
     param_mean = np.asarray(params["mean"], dtype=np.float64)
     param_is_constant = np.asarray(
@@ -229,6 +288,16 @@ def stats_from_json(data: Dict[str, object]) -> NormalizationStats:
     )
     if param_is_constant.shape != param_mean.shape:
         raise ValueError("Invalid normalization JSON: params.is_constant shape mismatch")
+
+    transition_time_mean = np.asarray(transition_time["mean"], dtype=np.float64)
+    transition_time_is_constant = np.asarray(
+        transition_time.get("is_constant", np.zeros_like(transition_time_mean, dtype=bool)),
+        dtype=bool,
+    )
+    if transition_time_is_constant.shape != transition_time_mean.shape:
+        raise ValueError(
+            "Invalid normalization JSON: transition_time.is_constant shape mismatch"
+        )
 
     return NormalizationStats(
         input_state=StateNormalizationStats(
@@ -261,5 +330,12 @@ def stats_from_json(data: Dict[str, object]) -> NormalizationStats:
             std=np.asarray(params["std"], dtype=np.float64),
             is_constant=param_is_constant,
             zscore_eps=float(params["zscore_eps"]),
+        ),
+        transition_time=ParamNormalizationStats(
+            param_names=tuple(str(value) for value in transition_time["param_names"]),
+            mean=transition_time_mean,
+            std=np.asarray(transition_time["std"], dtype=np.float64),
+            is_constant=transition_time_is_constant,
+            zscore_eps=float(transition_time["zscore_eps"]),
         ),
     )

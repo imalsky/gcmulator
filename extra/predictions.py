@@ -1,8 +1,7 @@
-"""Visualize one predicted one-step prognostic transition from a trained GCMulator checkpoint."""
+"""Visualize one predicted direct-jump prognostic transition from a trained GCMulator checkpoint."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 from pathlib import Path
@@ -10,7 +9,17 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Dict
 
-MPL_CACHE_DIR = Path(os.environ.get("GCMULATOR_MPLCONFIGDIR", "/tmp/gcmulator_mplcache")).resolve()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_CACHE_DIR = PROJECT_ROOT / ".cache"
+DEFAULT_MPL_CACHE_DIR = PROJECT_CACHE_DIR / "mplconfig"
+PROJECT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("XDG_CACHE_HOME", str(PROJECT_CACHE_DIR.resolve()))
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ.setdefault("SWAMPE_JAX_ENABLE_X64", "1")
+MPL_CACHE_DIR = Path(
+    os.environ.get("GCMULATOR_MPLCONFIGDIR", str(DEFAULT_MPL_CACHE_DIR))
+).resolve()
 MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 
@@ -20,28 +29,49 @@ import numpy as np
 import torch
 
 
-SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from config import resolve_path
 from modeling import (
     build_state_conditioned_transition_model,
     ensure_torch_harmonics_importable,
 )
+from my_swamp_backend import (
+    diagnose_winds,
+    ensure_my_swamp_importable,
+    params_to_conditioning_vector,
+    run_trajectory_window,
+)
 from normalization import (
     denormalize_state_tensor,
-    normalize_params,
+    normalize_conditioning,
     normalize_state_tensor,
     stats_from_json,
 )
+from sampling import to_extended9
 
 
 FIGURE_DPI = 180
 DEFAULT_FIGURE_NAME = "prognostic_true_vs_pred.png"
 STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
-CHANNEL_NAMES = ("Phi", "eta", "delta")
-COLOR_MAP = "coolwarm"
+PHI_CHANNEL_INDEX = 0
+FIELD_NAME = "Phi"
+COLOR_MAP = "Blues"
+QUIVER_STRIDE = 8
+QUIVER_COLOR = "#08306b"
+
+# User-editable run settings
+RUN_NAME = "v1"
+RUN_DIR: Path | None = (PROJECT_ROOT / "models" / RUN_NAME).resolve()
+CHECKPOINT_PATH: Path | None = None
+PROCESSED_DIR: Path | None = (PROJECT_ROOT / "data" / "processed").resolve()
+SPLIT = "test"
+SHARD_INDEX = 0
+SAMPLE_INDEX = 0
+COMPARE_DAY: float | None = None
+DEVICE_MODE = "auto"
+FIGURE_PATH: Path | None = None
 
 
 def _dict_to_namespace(obj: Any) -> Any:
@@ -55,44 +85,15 @@ def _dict_to_namespace(obj: Any) -> Any:
     return obj
 
 
-def _parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
-    parser = argparse.ArgumentParser(
-        description=(
-            "Plot one-step prognostic prediction from a trained "
-            "GCMulator checkpoint"
-        )
-    )
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--run-dir", type=Path, help="Run directory containing best.pt")
-    source.add_argument("--checkpoint", type=Path, help="Checkpoint path to evaluate")
-    parser.add_argument(
-        "--split",
-        choices=("train", "val", "test"),
-        default="test",
-        help="Processed split to read",
-    )
-    parser.add_argument("--shard-index", type=int, default=0, help="Split shard index")
-    parser.add_argument("--sample-index", type=int, default=0, help="Sample index within the shard")
-    parser.add_argument(
-        "--device",
-        choices=("auto", "cpu", "gpu"),
-        default="auto",
-        help="Inference device",
-    )
-    parser.add_argument("--figure", type=Path, default=None, help="Explicit output figure path")
-    return parser.parse_args()
-
-
 def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -> Path:
-    """Resolve checkpoint path from CLI inputs."""
+    """Resolve checkpoint path from top-level run settings."""
     if checkpoint is not None:
         resolved = checkpoint.resolve()
         if not resolved.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {resolved}")
         return resolved
     if run_dir is None:
-        raise ValueError("Either --run-dir or --checkpoint must be provided")
+        raise ValueError("Set RUN_DIR or CHECKPOINT_PATH at the top of this file")
     ckpt_path = (run_dir.resolve() / "best.pt").resolve()
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -115,25 +116,22 @@ def _resolve_device(mode: str) -> torch.device:
     raise ValueError(f"Unsupported device mode: {mode}")
 
 
-def _load_npy_payload_dict(file_path: Path) -> Dict[str, Any]:
-    """Load a dict payload stored by ``np.save(..., allow_pickle=True)``."""
-    obj = np.load(file_path, allow_pickle=True)
-    if isinstance(obj, np.ndarray) and obj.shape == () and obj.dtype == object:
-        payload = obj.item()
-    else:
-        payload = obj
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected dict payload in {file_path}, got {type(payload).__name__}")
-    return payload
+def _resolve_processed_dir() -> Path:
+    """Resolve processed directory from top-level settings."""
+    if PROCESSED_DIR is not None:
+        resolved = PROCESSED_DIR.resolve()
+        if not resolved.is_dir():
+            raise FileNotFoundError(f"Processed directory not found: {resolved}")
+        return resolved
+    raise ValueError("Set PROCESSED_DIR at the top of this file")
 
 
-def _load_dataset_paths(ckpt: Dict[str, Any]) -> tuple[Path, Path]:
-    """Resolve raw and processed dataset directories from checkpoint metadata."""
-    resolved_config = dict(ckpt["resolved_config"])
-    source_config_path = Path(str(ckpt["source_config_path"])).resolve()
-    dataset_dir = resolve_path(source_config_path, str(resolved_config["paths"]["dataset_dir"]))
-    processed_dir = resolve_path(source_config_path, str(resolved_config["paths"]["processed_dir"]))
-    return dataset_dir, processed_dir
+def _target_step_from_day(compare_day: float, *, dt_seconds: float) -> int:
+    """Convert an absolute day in the trajectory to an integer target step."""
+    target_step = int(round(float(compare_day) * 86400.0 / float(dt_seconds)))
+    if target_step < 1:
+        raise ValueError("COMPARE_DAY must be at least one model step into the trajectory")
+    return target_step
 
 
 def _apply_plot_style() -> None:
@@ -144,129 +142,267 @@ def _apply_plot_style() -> None:
     plt.rcParams["savefig.dpi"] = int(FIGURE_DPI)
 
 
-def _channel_limit(true_field: np.ndarray, pred_field: np.ndarray) -> float:
-    """Compute a symmetric robust color limit for one field."""
+def _color_limits(true_field: np.ndarray, pred_field: np.ndarray) -> tuple[float, float]:
+    """Compute shared robust color limits for one field."""
     values = np.concatenate([true_field.reshape(-1), pred_field.reshape(-1)]).astype(np.float64)
     values = values[np.isfinite(values)]
     if values.size == 0:
-        return 1.0
-    limit = float(np.quantile(np.abs(values), 0.99))
-    if not np.isfinite(limit) or limit <= 0.0:
-        limit = float(np.max(np.abs(values)))
-    return max(limit, 1.0)
+        return 0.0, 1.0
+    vmin = float(np.quantile(values, 0.01))
+    vmax = float(np.quantile(values, 0.99))
+    if not np.isfinite(vmin):
+        vmin = float(np.min(values))
+    if not np.isfinite(vmax):
+        vmax = float(np.max(values))
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    return vmin, vmax
+
+
+def _denormalize_params(params_norm: np.ndarray, stats: Any) -> Dict[str, float]:
+    """Invert parameter normalization back to physical values."""
+    params_norm = np.asarray(params_norm, dtype=np.float64)
+    params_phys = params_norm * (stats.std + stats.zscore_eps) + stats.mean
+    const_mask = np.asarray(stats.is_constant, dtype=bool)
+    if np.any(const_mask):
+        params_phys[const_mask] = stats.mean[const_mask]
+    return {
+        str(name): float(params_phys[index])
+        for index, name in enumerate(stats.param_names)
+    }
+
+
+def _diagnose_target_winds(
+    target_state: np.ndarray,
+    *,
+    target_field_names: tuple[str, ...],
+    params: Any,
+    solver_cfg: Dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Diagnose physical-space winds from prognostic target channels."""
+    field_index = {str(name): idx for idx, name in enumerate(target_field_names)}
+    return diagnose_winds(
+        np.asarray(target_state[field_index["eta"]], dtype=np.float64),
+        np.asarray(target_state[field_index["delta"]], dtype=np.float64),
+        params=params,
+        M=int(solver_cfg["M"]),
+        dt_seconds=float(solver_cfg["dt_seconds"]),
+    )
+
+
+def _add_quiver(ax: Any, u_field: np.ndarray, v_field: np.ndarray) -> None:
+    """Overlay a sparse wind quiver on one axis."""
+    y_idx = np.arange(0, int(u_field.shape[0]), int(QUIVER_STRIDE))
+    x_idx = np.arange(0, int(u_field.shape[1]), int(QUIVER_STRIDE))
+    x_grid, y_grid = np.meshgrid(x_idx, y_idx)
+    u_sub = np.asarray(u_field[np.ix_(y_idx, x_idx)], dtype=np.float64)
+    v_sub = np.asarray(v_field[np.ix_(y_idx, x_idx)], dtype=np.float64)
+    ax.quiver(
+        x_grid,
+        y_grid,
+        u_sub,
+        v_sub,
+        color=QUIVER_COLOR,
+        pivot="mid",
+        alpha=0.8,
+        width=0.0022,
+    )
 
 
 def _save_figure(
     *,
     true_state: np.ndarray,
     pred_state: np.ndarray,
+    true_winds: tuple[np.ndarray, np.ndarray],
+    pred_winds: tuple[np.ndarray, np.ndarray],
     shard_name: str,
-    sample_index: int,
-    transition_days: float,
+    context_label: str,
+    target_day: float,
     out_path: Path,
 ) -> None:
-    """Save a 2x3 prognostic comparison figure."""
+    """Save a 1x2 Phi comparison figure."""
     fig, axes = plt.subplots(
+        1,
         2,
-        3,
-        figsize=(12.0, 7.0),
+        figsize=(10.0, 4.5),
         dpi=int(FIGURE_DPI),
         constrained_layout=True,
     )
-    for channel_index, field_name in enumerate(CHANNEL_NAMES):
-        true_field = np.asarray(true_state[channel_index], dtype=np.float64)
-        pred_field = np.asarray(pred_state[channel_index], dtype=np.float64)
-        vmax = _channel_limit(true_field, pred_field)
-        norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+    true_field = np.asarray(true_state[PHI_CHANNEL_INDEX], dtype=np.float64)
+    pred_field = np.asarray(pred_state[PHI_CHANNEL_INDEX], dtype=np.float64)
+    vmin, vmax = _color_limits(true_field, pred_field)
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
-        im_true = axes[0, channel_index].imshow(
-            true_field,
-            origin="lower",
-            cmap=COLOR_MAP,
-            norm=norm,
-            interpolation="bicubic",
-            aspect="auto",
-        )
-        axes[1, channel_index].imshow(
-            pred_field,
-            origin="lower",
-            cmap=COLOR_MAP,
-            norm=norm,
-            interpolation="bicubic",
-            aspect="auto",
-        )
-        axes[0, channel_index].set_title(f"True {field_name}")
-        axes[1, channel_index].set_title(f"Predicted {field_name}")
-        axes[0, channel_index].set_xlabel("Longitude Index")
-        axes[1, channel_index].set_xlabel("Longitude Index")
-        axes[0, channel_index].set_ylabel("Latitude Index")
-        axes[1, channel_index].set_ylabel("Latitude Index")
-        fig.colorbar(im_true, ax=axes[:, channel_index], shrink=0.85)
+    im_true = axes[0].imshow(
+        true_field,
+        origin="lower",
+        cmap=COLOR_MAP,
+        norm=norm,
+        interpolation="bicubic",
+        aspect="auto",
+    )
+    axes[1].imshow(
+        pred_field,
+        origin="lower",
+        cmap=COLOR_MAP,
+        norm=norm,
+        interpolation="bicubic",
+        aspect="auto",
+    )
+    axes[0].set_title(f"True {FIELD_NAME}")
+    axes[1].set_title(f"Predicted {FIELD_NAME}")
+    axes[0].set_xlabel("Longitude Index")
+    axes[1].set_xlabel("Longitude Index")
+    axes[0].set_ylabel("Latitude Index")
+    axes[1].set_ylabel("Latitude Index")
+    _add_quiver(axes[0], true_winds[0], true_winds[1])
+    _add_quiver(axes[1], pred_winds[0], pred_winds[1])
+    fig.colorbar(im_true, ax=axes, shrink=0.9)
 
-    rmse = float(np.sqrt(np.mean((pred_state - true_state) ** 2)))
+    rmse = float(np.sqrt(np.mean((pred_field - true_field) ** 2)))
     fig.suptitle(
-        f"{shard_name} | sample={sample_index} | "
-        f"transition_days={transition_days:.6f} | "
-        f"prognostic RMSE={rmse:.3e}"
+        f"{shard_name} | {context_label} | "
+        f"day={target_day:.6f} | "
+        f"{FIELD_NAME} RMSE={rmse:.3e}"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)
 
 
+def _load_comparison_example(
+    *,
+    ckpt: Dict[str, Any],
+    processed_dir: Path,
+    stats: Any,
+    params: Any,
+    shard_name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, float]:
+    """Build one input/target comparison example from either a shard sample or absolute day."""
+    solver_cfg = dict(ckpt["solver"])
+
+    if COMPARE_DAY is not None:
+        target_step = _target_step_from_day(
+            float(COMPARE_DAY),
+            dt_seconds=float(solver_cfg["dt_seconds"]),
+        )
+        anchor_step = 0
+        state_inputs_phys, state_targets_phys, _, _ = run_trajectory_window(
+            params,
+            M=int(solver_cfg["M"]),
+            dt_seconds=float(solver_cfg["dt_seconds"]),
+            time_days=float(COMPARE_DAY),
+            starttime_index=int(solver_cfg["starttime_index"]),
+            window_start_step=anchor_step,
+            n_transitions=1,
+            transition_jump_steps=int(target_step),
+        )
+        state0_norm = normalize_state_tensor(
+            np.asarray(state_inputs_phys, dtype=np.float32),
+            stats.input_state,
+        ).astype(np.float32)
+        conditioning_norm = normalize_conditioning(
+            params_to_conditioning_vector(params),
+            np.asarray(
+                [float(target_step) * float(solver_cfg["dt_seconds"]) / 86400.0],
+                dtype=np.float64,
+            ),
+            param_stats=stats.params,
+            transition_time_stats=stats.transition_time,
+        ).astype(np.float32)
+        true_state = np.asarray(state_targets_phys[0], dtype=np.float32)
+        target_day = float(target_step) * float(solver_cfg["dt_seconds"]) / 86400.0
+        return (
+            conditioning_norm,
+            state0_norm,
+            true_state,
+            f"compare_day={target_day:.6f}",
+            target_day,
+        )
+
+    shard_path = (processed_dir / shard_name).resolve()
+    if not shard_path.is_file():
+        raise FileNotFoundError(f"Processed shard not found: {shard_path}")
+
+    with np.load(shard_path, allow_pickle=False) as npz:
+        conditioning_norm = np.asarray(npz["conditioning_norm"], dtype=np.float32)
+        state_inputs_norm = np.asarray(npz["state_inputs_norm"], dtype=np.float32)
+        state_targets_norm = np.asarray(npz["state_targets_norm"], dtype=np.float32)
+        transition_days = np.asarray(npz["transition_days"], dtype=np.float64)
+        anchor_steps = np.asarray(npz["anchor_steps"], dtype=np.int64)
+    if SAMPLE_INDEX < 0 or SAMPLE_INDEX >= int(state_inputs_norm.shape[0]):
+        raise IndexError(
+            f"sample-index {SAMPLE_INDEX} is out of range "
+            f"for shard '{shard_name}'"
+        )
+
+    state0_norm = state_inputs_norm[SAMPLE_INDEX : SAMPLE_INDEX + 1]
+    true_state = denormalize_state_tensor(
+        state_targets_norm[SAMPLE_INDEX : SAMPLE_INDEX + 1],
+        stats.target_state,
+    )[0]
+    target_day = (
+        float(anchor_steps[SAMPLE_INDEX]) * float(solver_cfg["dt_seconds"]) / 86400.0
+        + float(transition_days[SAMPLE_INDEX])
+    )
+    return (
+        conditioning_norm[SAMPLE_INDEX : SAMPLE_INDEX + 1],
+        state0_norm,
+        true_state,
+        f"sample={int(SAMPLE_INDEX)}",
+        target_day,
+    )
+
+
 def main() -> None:
-    """Load one shard sample, run one-step prediction, and save a prognostic plot."""
+    """Load one shard sample, run one direct-jump prediction, and save a prognostic plot."""
     _apply_plot_style()
-    args = _parse_args()
-    ckpt_path = _resolve_checkpoint_path(run_dir=args.run_dir, checkpoint=args.checkpoint)
+    ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
     figure_path = (
-        args.figure.resolve()
-        if args.figure is not None
+        FIGURE_PATH.resolve()
+        if FIGURE_PATH is not None
         else (run_dir / "plots" / DEFAULT_FIGURE_NAME).resolve()
     )
 
-    device = _resolve_device(args.device)
+    device = _resolve_device(DEVICE_MODE)
     ensure_torch_harmonics_importable()
+    ensure_my_swamp_importable()
     ckpt: Dict[str, Any] = torch.load(ckpt_path, map_location=device)
 
-    dataset_dir, processed_dir = _load_dataset_paths(ckpt)
+    processed_dir = _resolve_processed_dir()
     processed_meta_path = (processed_dir / "processed_meta.json").resolve()
     if not processed_meta_path.is_file():
         raise FileNotFoundError(f"Processed metadata not found: {processed_meta_path}")
     processed_meta = json.loads(processed_meta_path.read_text(encoding="utf-8"))
 
-    split_entries = list(processed_meta["splits"][args.split])
+    split_entries = list(processed_meta["splits"][SPLIT])
     if not split_entries:
-        raise RuntimeError(f"Split '{args.split}' is empty")
-    if args.shard_index < 0 or args.shard_index >= len(split_entries):
+        raise RuntimeError(f"Split '{SPLIT}' is empty")
+    if SHARD_INDEX < 0 or SHARD_INDEX >= len(split_entries):
         raise IndexError(
-            f"shard-index {args.shard_index} is out of range "
-            f"for split '{args.split}'"
-        )
-    shard_entry = dict(split_entries[args.shard_index])
+            f"shard-index {SHARD_INDEX} is out of range "
+            f"for split '{SPLIT}'"
+    )
+    shard_entry = dict(split_entries[SHARD_INDEX])
     shard_name = str(shard_entry["file"])
-    raw_file = (dataset_dir / f"{Path(shard_name).stem}.npy").resolve()
-    if not raw_file.is_file():
-        raise FileNotFoundError(f"Raw file for shard not found: {raw_file}")
+    shard_path = (processed_dir / shard_name).resolve()
+    if not shard_path.is_file():
+        raise FileNotFoundError(f"Processed shard not found: {shard_path}")
 
-    raw_payload = _load_npy_payload_dict(raw_file)
-    state_inputs = np.asarray(raw_payload["state_inputs"], dtype=np.float32)
-    state_targets = np.asarray(raw_payload["state_targets"], dtype=np.float32)
-    transition_days = np.asarray(raw_payload["transition_days"], dtype=np.float64)
-    raw_params = np.asarray(raw_payload["params"], dtype=np.float64)
-    if args.sample_index < 0 or args.sample_index >= int(state_inputs.shape[0]):
-        raise IndexError(
-            f"sample-index {args.sample_index} is out of range "
-            f"for shard '{shard_name}'"
-        )
+    with np.load(shard_path, allow_pickle=False) as npz:
+        params_norm = np.asarray(npz["params_norm"], dtype=np.float32)
 
     stats = stats_from_json(ckpt["normalization"])
-    state0_norm = normalize_state_tensor(
-        state_inputs[args.sample_index : args.sample_index + 1],
-        stats.input_state,
-    ).astype(np.float32)
-    params_norm = normalize_params(raw_params[None, :], stats.params).astype(np.float32)
+    params_norm = params_norm[None, :]
+    params = to_extended9(_denormalize_params(params_norm[0], stats.params))
+    conditioning_norm, state0_norm, true_state, context_label, target_day = _load_comparison_example(
+        ckpt=ckpt,
+        processed_dir=processed_dir,
+        stats=stats,
+        params=params,
+        shard_name=shard_name,
+    )
 
     model_cfg = _dict_to_namespace(ckpt["model_config"])
     shape = dict(ckpt["shape"])
@@ -277,7 +413,7 @@ def main() -> None:
         img_size=(int(shape["H"]), int(shape["W"])),
         input_state_chans=int(shape["input_C"]),
         target_state_chans=int(shape["target_C"]),
-        param_dim=int(len(ckpt["param_names"])),
+        param_dim=int(len(ckpt["conditioning_names"])),
         residual_input_indices=residual_input_indices,
         cfg_model=model_cfg,
         lat_order="north_to_south",
@@ -289,16 +425,30 @@ def main() -> None:
     with torch.inference_mode():
         pred_norm = model(
             torch.from_numpy(state0_norm).to(device=device),
-            torch.from_numpy(params_norm).to(device=device),
+            torch.from_numpy(conditioning_norm).to(device=device),
         )
     pred_phys = denormalize_state_tensor(pred_norm.detach().cpu().numpy(), stats.target_state)[0]
+    true_winds = _diagnose_target_winds(
+        true_state,
+        target_field_names=stats.target_state.field_names,
+        params=params,
+        solver_cfg=dict(ckpt["solver"]),
+    )
+    pred_winds = _diagnose_target_winds(
+        pred_phys,
+        target_field_names=stats.target_state.field_names,
+        params=params,
+        solver_cfg=dict(ckpt["solver"]),
+    )
 
     _save_figure(
-        true_state=state_targets[args.sample_index],
+        true_state=true_state,
         pred_state=pred_phys,
+        true_winds=true_winds,
+        pred_winds=pred_winds,
         shard_name=shard_name,
-        sample_index=int(args.sample_index),
-        transition_days=float(transition_days[args.sample_index]),
+        context_label=context_label,
+        target_day=float(target_day),
         out_path=figure_path,
     )
     print(f"Saved prognostic prediction figure: {figure_path}")

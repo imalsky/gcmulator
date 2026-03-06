@@ -17,7 +17,6 @@ from typing import Any, Dict, List, Literal, Optional
 # Global constants and schema enums
 # -----------------------------------------------------------------------------
 SECONDS_PER_DAY = 86400.0
-SECONDS_PER_HOUR = 3600.0
 MIN_TRANSITIONS = 1
 PROBABILITY_MIN = 0.0
 PROBABILITY_MAX = 1.0
@@ -35,6 +34,7 @@ CONDITIONING_PARAM_NAMES = (
     "taudrag_s",
     "g_m_s2",
 )
+TRANSITION_TIME_NAME = "transition_days"
 USER_CORE_PARAM_NAMES = (
     "a_m",
     "omega_rad_s",
@@ -147,7 +147,22 @@ class SamplingConfig:
     burn_in_days: float = 5.0
     transitions_per_simulation: int = 128
     transition_jump_steps: int = 1
+    transition_jump_steps_max: Optional[int] = None
     parameters: List[ParameterSpec] = field(default_factory=list)
+
+    def min_transition_jump_steps(self) -> int:
+        """Return the minimum sampled transition jump in solver steps."""
+        return int(self.transition_jump_steps)
+
+    def max_transition_jump_steps(self) -> int:
+        """Return the maximum sampled transition jump in solver steps."""
+        if self.transition_jump_steps_max is None:
+            return int(self.transition_jump_steps)
+        return int(self.transition_jump_steps_max)
+
+    def uses_variable_transition_jump(self) -> bool:
+        """Return True when jump duration is sampled from a non-degenerate range."""
+        return self.max_transition_jump_steps() > self.min_transition_jump_steps()
 
 
 @dataclass(frozen=True)
@@ -255,6 +270,7 @@ SAMPLING_KEYS = {
     "burn_in_days",
     "transitions_per_simulation",
     "transition_jump_steps",
+    "transition_jump_steps_max",
     "parameters",
 }
 PARAM_SPEC_KEYS = {"name", "dist", "min", "max", "value", "p_off", "off_value", "on_min", "on_max"}
@@ -401,6 +417,11 @@ def _parse_sampling(d: Dict[str, Any]) -> SamplingConfig:
         burn_in_days=float(d.get("burn_in_days", 5.0)),
         transitions_per_simulation=int(d.get("transitions_per_simulation", 128)),
         transition_jump_steps=int(d.get("transition_jump_steps", 1)),
+        transition_jump_steps_max=(
+            None
+            if d.get("transition_jump_steps_max") is None
+            else int(d.get("transition_jump_steps_max"))
+        ),
         parameters=[_parse_parameter_spec(item) for item in params_raw],
     )
 
@@ -552,6 +573,14 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError(f"sampling.transitions_per_simulation must be >= {MIN_TRANSITIONS}")
     if cfg.sampling.transition_jump_steps < MIN_TRANSITIONS:
         raise ValueError(f"sampling.transition_jump_steps must be >= {MIN_TRANSITIONS}")
+    if (
+        cfg.sampling.transition_jump_steps_max is not None
+        and cfg.sampling.transition_jump_steps_max < cfg.sampling.transition_jump_steps
+    ):
+        raise ValueError(
+            "sampling.transition_jump_steps_max must be >= "
+            "sampling.transition_jump_steps"
+        )
     _validate_parameter_specs(cfg.sampling.parameters)
 
     total_steps = max(
@@ -573,9 +602,8 @@ def validate_config(cfg: GCMulatorConfig) -> None:
     )
     max_window_start = (
         total_steps
-        - int(cfg.sampling.transition_jump_steps)
-        - int(cfg.sampling.transitions_per_simulation)
-        + 1
+        - int(cfg.sampling.max_transition_jump_steps())
+        * int(cfg.sampling.transitions_per_simulation)
     )
     if max_window_start < burn_in_steps:
         raise ValueError(

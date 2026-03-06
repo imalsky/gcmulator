@@ -11,7 +11,7 @@ from typing import Dict, Sequence
 
 import numpy as np
 
-from config import CONDITIONING_PARAM_NAMES, Extended9Params, ParameterSpec
+from config import CONDITIONING_PARAM_NAMES, Extended9Params, ParameterSpec, SamplingConfig
 
 # Sampling and unit-conversion constants.
 PROBABILITY_MIN = 0.0
@@ -116,3 +116,25 @@ def vector_to_extended9(vector: np.ndarray) -> Extended9Params:
         )
     sampled = {name: float(values[index]) for index, name in enumerate(CONDITIONING_PARAM_NAMES)}
     return to_extended9(sampled)
+
+
+def sample_transition_jump_steps(
+    rng: np.random.Generator,
+    cfg_sampling: SamplingConfig,
+    *,
+    n_samples: int,
+) -> np.ndarray:
+    """Draw per-simulation transition jumps according to the sampling config."""
+    if n_samples < 1:
+        raise ValueError("n_samples must be >= 1")
+
+    min_steps = int(cfg_sampling.min_transition_jump_steps())
+    max_steps = int(cfg_sampling.max_transition_jump_steps())
+    if min_steps < 1 or max_steps < min_steps:
+        raise ValueError(
+            "Invalid transition jump bounds: "
+            f"min_steps={min_steps}, max_steps={max_steps}"
+        )
+    if min_steps == max_steps:
+        return np.full((int(n_samples),), fill_value=min_steps, dtype=np.int64)
+    return rng.integers(min_steps, max_steps + 1, size=int(n_samples), dtype=np.int64)

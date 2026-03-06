@@ -58,7 +58,7 @@ def main() -> None:
     stage_group.add_argument(
         "--train",
         action="store_true",
-        help="Train the one-step transition emulator",
+        help="Train the direct-jump transition emulator",
     )
     parser.add_argument("--config", type=str, required=True, help="Path to config JSON/YAML")
     args = parser.parse_args()

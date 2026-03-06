@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
 import os
 from pathlib import Path
 
-MPL_CACHE_DIR = Path(os.environ.get("GCMULATOR_MPLCONFIGDIR", "/tmp/gcmulator_mplcache")).resolve()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_CACHE_DIR = PROJECT_ROOT / ".cache"
+DEFAULT_MPL_CACHE_DIR = PROJECT_CACHE_DIR / "mplconfig"
+PROJECT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("XDG_CACHE_HOME", str(PROJECT_CACHE_DIR.resolve()))
+MPL_CACHE_DIR = Path(
+    os.environ.get("GCMULATOR_MPLCONFIGDIR", str(DEFAULT_MPL_CACHE_DIR))
+).resolve()
 MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 
@@ -20,18 +26,10 @@ FIGURE_NAME = "val_vs_train_loss_by_epoch.png"
 FIGURE_DPI = 180
 STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
 
-
-def _parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
-    parser = argparse.ArgumentParser(description="Plot train-vs-val loss from a GCMulator run")
-    parser.add_argument(
-        "--run-dir",
-        type=Path,
-        required=True,
-        help="Run directory containing training_history.csv",
-    )
-    parser.add_argument("--figure", type=Path, default=None, help="Explicit output figure path")
-    return parser.parse_args()
+# User-editable run settings
+RUN_NAME = "v1"
+RUN_DIR: Path | None = (PROJECT_ROOT / "models" / RUN_NAME).resolve()
+FIGURE_PATH: Path | None = None
 
 
 def _apply_plot_style() -> None:
@@ -113,15 +111,16 @@ def _save_loss_figure(
 def main() -> None:
     """Load a run's history and save the loss plot."""
     _apply_plot_style()
-    args = _parse_args()
-    run_dir = args.run_dir.resolve()
+    if RUN_DIR is None:
+        raise ValueError("Set RUN_DIR at the top of this file")
+    run_dir = RUN_DIR.resolve()
     history_csv_path = (run_dir / HISTORY_CSV_NAME).resolve()
     if not history_csv_path.is_file():
         raise FileNotFoundError(f"Training history CSV not found: {history_csv_path}")
 
     figure_path = (
-        args.figure.resolve()
-        if args.figure is not None
+        FIGURE_PATH.resolve()
+        if FIGURE_PATH is not None
         else (run_dir / PLOTS_DIR_NAME / FIGURE_NAME).resolve()
     )
     epochs, train_losses, val_losses = _read_history_csv(history_csv_path)

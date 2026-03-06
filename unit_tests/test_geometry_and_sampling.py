@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import ParameterSpec
+from config import ParameterSpec, SamplingConfig
 from geometry import apply_geometry_state, geometry_shift_for_nlon
-from sampling import sample_parameter_dict, to_extended9
+from sampling import sample_parameter_dict, sample_transition_jump_steps, to_extended9
 
 
 def test_apply_geometry_state_flips_latitude_and_rolls_longitude() -> None:
@@ -48,3 +48,18 @@ def test_sample_parameter_dict_converts_hour_aliases_to_seconds() -> None:
     assert sampled["taudrag_s"] == 6.0 * 3600.0
     assert params.taurad_s == 10.0 * 3600.0
     assert params.taudrag_s == 6.0 * 3600.0
+
+
+def test_sample_transition_jump_steps_draws_uniform_integer_range() -> None:
+    """Transition jump sampling should cover the configured inclusive range."""
+    rng = np.random.default_rng(0)
+    draws = sample_transition_jump_steps(
+        rng,
+        SamplingConfig(transition_jump_steps=2, transition_jump_steps_max=4),
+        n_samples=32,
+    )
+
+    assert draws.dtype == np.int64
+    assert np.all(draws >= 2)
+    assert np.all(draws <= 4)
+    assert set(draws.tolist()) == {2, 3, 4}

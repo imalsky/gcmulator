@@ -1,10 +1,10 @@
-"""Preprocessing and training pipeline for one-step visible-state transition learning.
+"""Preprocessing and training pipeline for direct-jump visible-state transition learning.
 
 This module covers three stages:
 
 1. validate raw trajectory-window files
 2. preprocess them into split-level normalized shards
-3. train and evaluate the one-step transition emulator
+3. train and evaluate the direct-jump transition emulator
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from config import (
     GCMulatorConfig,
     PHYSICAL_STATE_FIELDS,
     PROGNOSTIC_TARGET_FIELDS,
+    TRANSITION_TIME_NAME,
     resolve_path,
 )
 from geometry import geometry_shift_for_nlon
@@ -49,6 +50,7 @@ from normalization import (
     StateNormalizationStats,
     apply_state_transforms,
     denormalize_state_tensor,
+    normalize_conditioning,
     normalize_params,
     normalize_state_tensor,
     stats_from_json,
@@ -60,7 +62,7 @@ from sampling import vector_to_extended9
 
 LOGGER = logging.getLogger("train")
 
-PREPROCESS_FINGERPRINT_VERSION = 11
+PREPROCESS_FINGERPRINT_VERSION = 12
 RAW_REQUIRED_KEYS = (
     "state_inputs",
     "state_targets",
@@ -75,6 +77,7 @@ RAW_REQUIRED_KEYS = (
     "dt_seconds",
     "starttime_index",
     "transition_jump_steps",
+    "anchor_stride_steps",
     "n_transitions",
     "M",
     "nlat",
@@ -172,6 +175,7 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
     dt_seconds = float(np.asarray(payload["dt_seconds"], dtype=np.float64).item())
     starttime_index = int(np.asarray(payload["starttime_index"], dtype=np.int64).item())
     transition_jump_steps = int(np.asarray(payload["transition_jump_steps"], dtype=np.int64).item())
+    anchor_stride_steps = int(np.asarray(payload["anchor_stride_steps"], dtype=np.int64).item())
     n_transitions = int(np.asarray(payload["n_transitions"], dtype=np.int64).item())
     M = int(np.asarray(payload["M"], dtype=np.int64).item())
     nlat = int(np.asarray(payload["nlat"], dtype=np.int64).item())
@@ -232,15 +236,51 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
             f"Raw file {file_path} has starttime_index={starttime_index}, "
             f"expected {cfg.solver.starttime_index}"
         )
-    if transition_jump_steps != int(cfg.sampling.transition_jump_steps):
+    if not (
+        int(cfg.sampling.min_transition_jump_steps())
+        <= transition_jump_steps
+        <= int(cfg.sampling.max_transition_jump_steps())
+    ):
         raise ValueError(
             f"Raw file {file_path} has transition_jump_steps={transition_jump_steps}, "
-            f"expected {cfg.sampling.transition_jump_steps}"
+            "outside the configured range "
+            f"[{cfg.sampling.min_transition_jump_steps()}, "
+            f"{cfg.sampling.max_transition_jump_steps()}]"
+        )
+    if anchor_stride_steps != transition_jump_steps:
+        raise ValueError(
+            f"Raw file {file_path} has anchor_stride_steps={anchor_stride_steps}, "
+            f"expected {transition_jump_steps}"
         )
     if n_transitions != int(cfg.sampling.transitions_per_simulation):
         raise ValueError(
             f"Raw file {file_path} has n_transitions={n_transitions}, "
             f"expected {cfg.sampling.transitions_per_simulation}"
+        )
+    expected_transition_days = (
+        float(transition_jump_steps) * float(dt_seconds) / 86400.0
+    )
+    if not np.allclose(
+        transition_days,
+        np.full_like(transition_days, fill_value=expected_transition_days),
+        rtol=0.0,
+        atol=0.0,
+    ):
+        raise ValueError(
+            f"Raw file {file_path} has transition_days inconsistent with "
+            f"transition_jump_steps={transition_jump_steps}"
+        )
+    if anchor_steps.size > 1 and not np.array_equal(
+        np.diff(anchor_steps),
+        np.full(
+            (anchor_steps.size - 1,),
+            fill_value=anchor_stride_steps,
+            dtype=np.int64,
+        ),
+    ):
+        raise ValueError(
+            f"Raw file {file_path} does not use the expected anchor stride "
+            f"{anchor_stride_steps}"
         )
 
     expected_geometry = _expected_geometry(cfg, nlon=nlon)
@@ -269,6 +309,7 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
         "dt_seconds": dt_seconds,
         "starttime_index": starttime_index,
         "transition_jump_steps": transition_jump_steps,
+        "anchor_stride_steps": anchor_stride_steps,
         "n_transitions": n_transitions,
         "M": M,
         "nlat": nlat,
@@ -295,6 +336,7 @@ def _raw_file_signature(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str, A
         "dt_seconds": float(metadata["dt_seconds"]),
         "starttime_index": int(metadata["starttime_index"]),
         "transition_jump_steps": int(metadata["transition_jump_steps"]),
+        "anchor_stride_steps": int(metadata["anchor_stride_steps"]),
         "n_transitions": int(metadata["n_transitions"]),
         "nlat": int(metadata["nlat"]),
         "nlon": int(metadata["nlon"]),
@@ -404,6 +446,10 @@ def _fit_stats_streaming(
     param_m2: np.ndarray | None = None
     param_count = 0
 
+    transition_time_sum: np.ndarray | None = None
+    transition_time_sum2: np.ndarray | None = None
+    transition_time_count = 0
+
     for file_path in train_files:
         payload = _validated_raw_payload(file_path, cfg=cfg)
         transformed = apply_state_transforms(
@@ -436,7 +482,25 @@ def _fit_stats_streaming(
             delta2 = params - param_mean
             param_m2 += delta * delta2
 
-    if state_sum is None or state_sum2 is None or param_mean is None or param_m2 is None:
+        transition_days = payload["transition_days"].astype(np.float64, copy=False).reshape(-1, 1)
+        transition_chunk_sum = transition_days.sum(axis=0)
+        transition_chunk_sum2 = (transition_days * transition_days).sum(axis=0)
+        if transition_time_sum is None:
+            transition_time_sum = transition_chunk_sum
+            transition_time_sum2 = transition_chunk_sum2
+        else:
+            transition_time_sum += transition_chunk_sum
+            transition_time_sum2 += transition_chunk_sum2
+        transition_time_count += int(transition_days.shape[0])
+
+    if (
+        state_sum is None
+        or state_sum2 is None
+        or param_mean is None
+        or param_m2 is None
+        or transition_time_sum is None
+        or transition_time_sum2 is None
+    ):
         raise RuntimeError("Could not infer normalization statistics from the training split")
 
     state_mean = state_sum / float(state_count)
@@ -456,8 +520,27 @@ def _fit_stats_streaming(
         param_is_constant = np.zeros_like(param_mean, dtype=bool)
         param_std = np.ones_like(param_mean, dtype=np.float64)
         param_mean_out = np.zeros_like(param_mean, dtype=np.float64)
+        transition_time_is_constant = np.zeros((1,), dtype=bool)
+        transition_time_std = np.ones((1,), dtype=np.float64)
+        transition_time_mean_out = np.zeros((1,), dtype=np.float64)
     else:
         raise ValueError(f"Unsupported param normalization mode: {cfg.normalization.params.mode}")
+
+    if cfg.normalization.params.mode == "zscore":
+        transition_time_mean = transition_time_sum / float(transition_time_count)
+        transition_time_var = np.maximum(
+            transition_time_sum2 / float(transition_time_count)
+            - transition_time_mean * transition_time_mean,
+            0.0,
+        )
+        transition_time_std_raw = np.sqrt(transition_time_var)
+        transition_time_is_constant = transition_time_std_raw <= STD_FLOOR
+        transition_time_std = np.where(
+            transition_time_is_constant,
+            1.0,
+            np.maximum(transition_time_std_raw, STD_FLOOR),
+        )
+        transition_time_mean_out = transition_time_mean
 
     input_state_stats = StateNormalizationStats(
         field_names=tuple(PHYSICAL_STATE_FIELDS),
@@ -480,6 +563,13 @@ def _fit_stats_streaming(
         input_state=input_state_stats,
         target_state=target_state_stats,
         params=param_stats,
+        transition_time=ParamNormalizationStats(
+            param_names=(TRANSITION_TIME_NAME,),
+            mean=transition_time_mean_out.astype(np.float64),
+            std=transition_time_std.astype(np.float64),
+            is_constant=np.asarray(transition_time_is_constant, dtype=bool),
+            zscore_eps=float(cfg.normalization.params.eps),
+        ),
     )
 
 
@@ -501,6 +591,12 @@ def _write_processed_shard(
         stats.target_state,
     ).astype(np.float32)
     params_norm = normalize_params(payload["params"][None, ...], stats.params)[0].astype(np.float32)
+    conditioning_norm = normalize_conditioning(
+        payload["params"],
+        payload["transition_days"],
+        param_stats=stats.params,
+        transition_time_stats=stats.transition_time,
+    ).astype(np.float32)
 
     shard_name = f"{src_file.stem}.npz"
     np.savez(
@@ -508,6 +604,8 @@ def _write_processed_shard(
         state_inputs_norm=state_inputs_norm,
         state_targets_norm=state_targets_norm,
         params_norm=params_norm,
+        conditioning_norm=conditioning_norm,
+        transition_days=payload["transition_days"].astype(np.float64),
         anchor_steps=payload["anchor_steps"].astype(np.int64),
     )
     return {
@@ -587,7 +685,9 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
         "input_fields": list(stats.input_state.field_names),
         "target_fields": list(stats.target_state.field_names),
         "param_names": list(stats.params.param_names),
-        "conditioning_names": list(stats.params.param_names),
+        "conditioning_names": list(stats.params.param_names) + list(
+            stats.transition_time.param_names
+        ),
         "input_shape": {
             "C": int(sample_input.shape[0]),
             "H": int(sample_input.shape[1]),
@@ -652,7 +752,7 @@ class TransitionShardDataset(Dataset):
         # tend to walk consecutive indices within the same simulation window.
         with np.load(shard_path, allow_pickle=False) as npz:
             arrays = {
-                "params_norm": np.asarray(npz["params_norm"], dtype=np.float32),
+                "conditioning_norm": np.asarray(npz["conditioning_norm"], dtype=np.float32),
                 "state_inputs_norm": np.asarray(npz["state_inputs_norm"], dtype=np.float32),
                 "state_targets_norm": np.asarray(npz["state_targets_norm"], dtype=np.float32),
             }
@@ -673,7 +773,7 @@ class TransitionShardDataset(Dataset):
         shard_path = self.processed_dir / str(self.shard_entries[shard_index]["file"])
         arrays = self._load_shard(shard_path)
         return (
-            torch.from_numpy(arrays["params_norm"]),
+            torch.from_numpy(arrays["conditioning_norm"][local_index]),
             torch.from_numpy(arrays["state_inputs_norm"][local_index]),
             torch.from_numpy(arrays["state_targets_norm"][local_index]),
         )
@@ -730,12 +830,10 @@ def _preload_split_to_device(
 
     for entry in shard_entries:
         with np.load(processed_dir / str(entry["file"]), allow_pickle=False) as npz:
-            params_norm = np.asarray(npz["params_norm"], dtype=np.float32)
+            conditioning = np.asarray(npz["conditioning_norm"], dtype=np.float32)
             state_inputs = np.asarray(npz["state_inputs_norm"], dtype=np.float32)
             state_targets = np.asarray(npz["state_targets_norm"], dtype=np.float32)
-            conditioning_rows.append(
-                np.repeat(params_norm[None, :], int(state_inputs.shape[0]), axis=0)
-            )
+            conditioning_rows.append(conditioning)
             state_input_rows.append(state_inputs)
             state_target_rows.append(state_targets)
 
@@ -820,7 +918,7 @@ def _compute_one_step_metrics(
     state_stats: StateNormalizationStats,
     grid: str,
 ) -> Dict[str, Any]:
-    """Compute normalized, physical, and spherical-spectrum one-step metrics."""
+    """Compute normalized, physical, and spherical-spectrum single-call metrics."""
     diff_norm = pred_norm - target_norm
     per_channel_rmse_norm = np.sqrt(np.mean(diff_norm**2, axis=(0, 2, 3)))
 
@@ -890,7 +988,12 @@ def _compute_rollout_metrics(
                 shard_entry=shard_entry,
             )
             payload = _validated_raw_payload(raw_file, cfg=cfg)
-            params_norm = normalize_params(payload["params"][None, ...], stats.params)
+            conditioning_norm = normalize_conditioning(
+                payload["params"],
+                payload["transition_days"],
+                param_stats=stats.params,
+                transition_time_stats=stats.transition_time,
+            )
             params_ext = vector_to_extended9(payload["params"])
             current_state_phys = np.asarray(payload["state_inputs"][0], dtype=np.float64)
 
@@ -901,7 +1004,7 @@ def _compute_rollout_metrics(
                 ).astype(np.float32)
                 state_input_tensor = torch.from_numpy(state_input_norm).to(device=device)
                 conditioning_tensor = torch.from_numpy(
-                    params_norm.astype(np.float32)
+                    conditioning_norm[step_index : step_index + 1].astype(np.float32)
                 ).to(device=device)
                 with autocast_context(device, amp_mode):
                     pred_target_norm = model(state_input_tensor, conditioning_tensor)

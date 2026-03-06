@@ -50,6 +50,7 @@ def test_batched_trajectory_windows_match_serial() -> None:
     """The batched trajectory extractor must preserve serial results."""
     params_list = _sample_params()
     window_starts = np.array([0, 2], dtype=np.int64)
+    transition_jump_steps = 2
     serial = [
         run_trajectory_window(
             params,
@@ -59,7 +60,7 @@ def test_batched_trajectory_windows_match_serial() -> None:
             starttime_index=2,
             window_start_step=int(window_starts[index]),
             n_transitions=3,
-            transition_jump_steps=1,
+            transition_jump_steps=transition_jump_steps,
         )
         for index, params in enumerate(params_list)
     ]
@@ -72,7 +73,7 @@ def test_batched_trajectory_windows_match_serial() -> None:
         starttime_index=2,
         window_start_steps=window_starts,
         n_transitions=3,
-        transition_jump_steps=1,
+        transition_jump_steps=transition_jump_steps,
         k6=params_list[0].K6,
         k6phi=params_list[0].K6Phi,
     )
@@ -83,6 +84,7 @@ def test_batched_trajectory_windows_match_serial() -> None:
         assert np.allclose(state_targets, batched[1][index])
         assert np.allclose(transition_days, batched[2][index])
         assert np.array_equal(anchor_steps, batched[3][index])
+        assert np.array_equal(np.diff(anchor_steps), np.full((2,), transition_jump_steps))
 
 
 def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None:
@@ -111,6 +113,7 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "burn_in_days": 0.0,
             "transitions_per_simulation": 2,
             "transition_jump_steps": 1,
+            "transition_jump_steps_max": 2,
             "parameters": [
                 {"name": "a_m", "dist": "fixed", "value": 8.2e7},
                 {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
@@ -172,6 +175,22 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
         cfg = load_config(config_path)
         manifest = generate_dataset(cfg, config_path=config_path)
         raw_files = sorted((root / "raw").glob("sim_*.npy"))
+        raw_payloads = [
+            np.load(path, allow_pickle=True).item()
+            for path in raw_files
+        ]
 
     assert manifest["n_sims_written"] == 2
     assert len(raw_files) == 2
+    assert manifest["sampling"]["uses_variable_transition_jump"] is True
+    for payload in raw_payloads:
+        jump_steps = int(np.asarray(payload["transition_jump_steps"], dtype=np.int64).item())
+        anchor_stride_steps = int(np.asarray(payload["anchor_stride_steps"], dtype=np.int64).item())
+        anchor_steps = np.asarray(payload["anchor_steps"], dtype=np.int64)
+        assert jump_steps in {1, 2}
+        assert anchor_stride_steps == jump_steps
+        if anchor_steps.size > 1:
+            assert np.array_equal(
+                np.diff(anchor_steps),
+                np.full((anchor_steps.size - 1,), jump_steps, dtype=np.int64),
+            )

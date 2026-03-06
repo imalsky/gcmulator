@@ -1,8 +1,7 @@
-"""Export a trained one-step GCMulator checkpoint as a physical-space TorchScript module."""
+"""Export a trained direct-jump GCMulator checkpoint as a physical-space TorchScript module."""
 
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 import sys
@@ -14,7 +13,8 @@ import torch
 import torch.nn as nn
 
 
-SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
@@ -26,6 +26,12 @@ EXPORT_META_NAME = "model_export.meta.json"
 EXAMPLE_BATCH_SIZE = 1
 STRICT_TRACE = True
 SUPPRESS_KNOWN_EXPORT_WARNINGS = True
+RUN_NAME = "v1"
+RUN_DIR: Path | None = (PROJECT_ROOT / "models" / RUN_NAME).resolve()
+CHECKPOINT_PATH: Path | None = None
+DEVICE_MODE = "auto"
+OUTPUT_PATH: Path | None = None
+META_OUTPUT_PATH: Path | None = None
 
 FIELD_MODE_NONE = 0
 FIELD_MODE_LOG10 = 1
@@ -43,44 +49,15 @@ def _dict_to_namespace(obj: Any) -> Any:
     return obj
 
 
-def _parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
-    parser = argparse.ArgumentParser(
-        description="Export a trained GCMulator checkpoint to TorchScript"
-    )
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--run-dir", type=Path, help="Run directory containing best.pt")
-    source.add_argument("--checkpoint", type=Path, help="Checkpoint path to export")
-    parser.add_argument(
-        "--device",
-        choices=("auto", "cpu", "gpu"),
-        default="auto",
-        help="Export device",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Explicit TorchScript output path",
-    )
-    parser.add_argument(
-        "--meta-output",
-        type=Path,
-        default=None,
-        help="Explicit metadata JSON output path",
-    )
-    return parser.parse_args()
-
-
 def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -> Path:
-    """Resolve checkpoint path from CLI inputs."""
+    """Resolve checkpoint path from top-level run settings."""
     if checkpoint is not None:
         resolved = checkpoint.resolve()
         if not resolved.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {resolved}")
         return resolved
     if run_dir is None:
-        raise ValueError("Either --run-dir or --checkpoint must be provided")
+        raise ValueError("Set RUN_DIR or CHECKPOINT_PATH at the top of this file")
     resolved_run_dir = run_dir.resolve()
     ckpt_path = (resolved_run_dir / "best.pt").resolve()
     if not ckpt_path.is_file():
@@ -127,6 +104,11 @@ def _setup_warning_filters() -> None:
             r".*Converting a tensor to a Python integer might cause "
             r"the trace to be incorrect.*"
         ),
+        category=torch.jit.TracerWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*torch.tensor results are registered as constants in the trace.*",
         category=torch.jit.TracerWarning,
     )
     warnings.filterwarnings(
@@ -241,6 +223,50 @@ def _denormalize_state_with_stats(
     )
 
 
+def _normalize_params_with_stats(
+    params: torch.Tensor,
+    *,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    is_constant: torch.Tensor,
+    zscore_eps: float,
+) -> torch.Tensor:
+    """Normalize physical conditioning parameters."""
+    torch._assert(params.dim() == 2, "params must be rank-2")
+    torch._assert(
+        params.size(-1) == int(mean.numel()),
+        "params width does not match checkpoint metadata",
+    )
+    mean = mean.to(device=params.device, dtype=params.dtype)
+    std = std.to(device=params.device, dtype=params.dtype)
+    out = (params - mean) / (std + float(zscore_eps))
+    const_mask = is_constant.to(device=params.device)
+    if torch.any(const_mask):
+        out = out.masked_fill(const_mask.unsqueeze(0), 0.0)
+    return out
+
+
+def _normalize_transition_days_with_stats(
+    transition_days: torch.Tensor,
+    *,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    is_constant: torch.Tensor,
+    zscore_eps: float,
+) -> torch.Tensor:
+    """Normalize scalar transition durations to the model conditioning space."""
+    torch._assert(transition_days.dim() == 1, "transition_days must be rank-1")
+    mean = mean.to(device=transition_days.device, dtype=transition_days.dtype)
+    std = std.to(device=transition_days.device, dtype=transition_days.dtype)
+    out = (
+        transition_days.unsqueeze(-1) - mean.unsqueeze(0)
+    ) / (std.unsqueeze(0) + float(zscore_eps))
+    const_mask = is_constant.to(device=transition_days.device)
+    if torch.any(const_mask):
+        out = out.masked_fill(const_mask.unsqueeze(0), 0.0)
+    return out
+
+
 class PhysicalStateExportModule(nn.Module):
     """TorchScript-exportable physical-I/O wrapper around the normalized core model."""
 
@@ -271,6 +297,30 @@ class PhysicalStateExportModule(nn.Module):
         self.register_buffer(
             "param_is_constant",
             torch.tensor(params["is_constant"], dtype=torch.bool),
+        )
+        transition_time = dict(
+            normalization.get(
+                "transition_time",
+                {
+                    "param_names": ["transition_days"],
+                    "mean": [0.0],
+                    "std": [1.0],
+                    "is_constant": [True],
+                    "zscore_eps": float(params["zscore_eps"]),
+                },
+            )
+        )
+        self.register_buffer(
+            "transition_time_mean",
+            torch.tensor(transition_time["mean"], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "transition_time_std",
+            torch.tensor(transition_time["std"], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "transition_time_is_constant",
+            torch.tensor(transition_time["is_constant"], dtype=torch.bool),
         )
 
         self.register_buffer(
@@ -317,22 +367,27 @@ class PhysicalStateExportModule(nn.Module):
         self.target_state_zscore_eps = float(target_state["zscore_eps"])
         self.target_signed_log1p_scale = float(target_state["signed_log1p_scale"])
         self.param_zscore_eps = float(params["zscore_eps"])
-        self.base_param_dim = int(self.param_mean.numel())
+        self.transition_time_zscore_eps = float(transition_time["zscore_eps"])
 
     def _normalize_params(self, params: torch.Tensor) -> torch.Tensor:
         """Normalize physical conditioning parameters."""
-        torch._assert(params.dim() == 2, "params must be rank-2")
-        torch._assert(
-            params.size(-1) == self.base_param_dim,
-            "params width does not match checkpoint metadata",
+        return _normalize_params_with_stats(
+            params,
+            mean=self.param_mean,
+            std=self.param_std,
+            is_constant=self.param_is_constant,
+            zscore_eps=self.param_zscore_eps,
         )
-        mean = self.param_mean.to(device=params.device, dtype=params.dtype)
-        std = self.param_std.to(device=params.device, dtype=params.dtype)
-        out = (params - mean) / (std + self.param_zscore_eps)
-        const_mask = self.param_is_constant.to(device=params.device)
-        if torch.any(const_mask):
-            out = out.masked_fill(const_mask.unsqueeze(0), 0.0)
-        return out
+
+    def _normalize_transition_days(self, transition_days: torch.Tensor) -> torch.Tensor:
+        """Normalize physical transition duration."""
+        return _normalize_transition_days_with_stats(
+            transition_days,
+            mean=self.transition_time_mean,
+            std=self.transition_time_std,
+            is_constant=self.transition_time_is_constant,
+            zscore_eps=self.transition_time_zscore_eps,
+        )
 
     def _normalize_input_state(self, state: torch.Tensor) -> torch.Tensor:
         """Normalize the full visible state to model space."""
@@ -380,32 +435,38 @@ class PhysicalStateExportModule(nn.Module):
             signed_log1p_scale=self.input_signed_log1p_scale,
         )
 
-    def forward(self, state0: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        """Run one physical-space transition step."""
+    def forward(
+        self,
+        state0: torch.Tensor,
+        params: torch.Tensor,
+        transition_days: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one physical-space direct-jump transition."""
         state0_norm = self._normalize_input_state(state0)
         params_norm = self._normalize_params(params)
-        state1_norm = self.model(state0_norm, params_norm)
+        transition_days_norm = self._normalize_transition_days(transition_days)
+        conditioning_norm = torch.cat((params_norm, transition_days_norm), dim=1)
+        state1_norm = self.model(state0_norm, conditioning_norm)
         return self._denormalize_target_state(state1_norm)
 
 
 def main() -> None:
     """Export the selected checkpoint."""
     _setup_warning_filters()
-    args = _parse_args()
-    ckpt_path = _resolve_checkpoint_path(run_dir=args.run_dir, checkpoint=args.checkpoint)
+    ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
     export_path = (
-        args.output.resolve()
-        if args.output is not None
+        OUTPUT_PATH.resolve()
+        if OUTPUT_PATH is not None
         else (run_dir / EXPORT_NAME).resolve()
     )
     meta_path = (
-        args.meta_output.resolve()
-        if args.meta_output is not None
+        META_OUTPUT_PATH.resolve()
+        if META_OUTPUT_PATH is not None
         else (run_dir / EXPORT_META_NAME).resolve()
     )
 
-    device = _resolve_device(args.device)
+    device = _resolve_device(DEVICE_MODE)
     ensure_torch_harmonics_importable()
     ckpt: Dict[str, Any] = torch.load(ckpt_path, map_location=device)
 
@@ -419,7 +480,7 @@ def main() -> None:
         img_size=(int(shape["H"]), int(shape["W"])),
         input_state_chans=int(shape["input_C"]),
         target_state_chans=int(shape["target_C"]),
-        param_dim=int(len(ckpt["param_names"])),
+        param_dim=int(len(ckpt["conditioning_names"])),
         residual_input_indices=residual_input_indices,
         cfg_model=model_cfg,
         lat_order="north_to_south",
@@ -428,45 +489,88 @@ def main() -> None:
     core_model.load_state_dict(ckpt["model_state"], strict=True)
     core_model.to(device=device).eval()
 
+    normalization = dict(ckpt["normalization"])
+    input_state_stats = dict(normalization["input_state"])
+    params_stats = dict(normalization["params"])
+
     with torch.inference_mode():
-        bootstrap_model = PhysicalStateExportModule(
-            model=core_model,
-            normalization=dict(ckpt["normalization"]),
-            input_fields=input_fields,
-            target_fields=target_fields,
-        ).to(device=device).eval()
-        params_stats = dict(ckpt["normalization"]["params"])
         example_params = torch.tensor(
             params_stats["mean"],
             dtype=torch.float32,
             device=device,
         )[None, :]
         example_params = example_params.repeat(int(EXAMPLE_BATCH_SIZE), 1)
-        example_state = bootstrap_model.example_state(
-            batch_size=int(EXAMPLE_BATCH_SIZE),
-            height=int(shape["H"]),
-            width=int(shape["W"]),
+        transition_time_stats = dict(
+            normalization.get(
+                "transition_time",
+                {
+                    "mean": [0.0],
+                    "std": [1.0],
+                    "is_constant": [True],
+                    "zscore_eps": float(params_stats["zscore_eps"]),
+                },
+            )
+        )
+        example_transition_days = torch.tensor(
+            transition_time_stats["mean"],
+            dtype=torch.float32,
+            device=device,
+        ).reshape(1).repeat(int(EXAMPLE_BATCH_SIZE))
+        input_state_mean = torch.tensor(
+            input_state_stats["mean"],
+            dtype=torch.float32,
             device=device,
         )
-        traced_core = torch.jit.trace(
-            core_model,
-            (
-                bootstrap_model._normalize_input_state(example_state),
-                bootstrap_model._normalize_params(example_params),
-            ),
-            strict=bool(STRICT_TRACE),
-            check_trace=False,
+        input_state_std = torch.tensor(
+            input_state_stats["std"],
+            dtype=torch.float32,
+            device=device,
         )
-        traced_core = torch.jit.freeze(traced_core.eval())
+        input_state_mode_codes = torch.tensor(
+            _build_state_mode_codes(
+                fields=input_fields,
+                field_transforms=dict(input_state_stats.get("field_transforms", {})),
+            ),
+            dtype=torch.int64,
+            device=device,
+        )
+        zero_norm = torch.zeros(
+            (
+                int(EXAMPLE_BATCH_SIZE),
+                int(input_state_mean.numel()),
+                int(shape["H"]),
+                int(shape["W"]),
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        example_state = _denormalize_state_with_stats(
+            zero_norm,
+            mean=input_state_mean,
+            std=input_state_std,
+            mode_codes=input_state_mode_codes,
+            zscore_eps=float(input_state_stats["zscore_eps"]),
+            signed_log1p_scale=float(input_state_stats["signed_log1p_scale"]),
+        )
+
         export_model = PhysicalStateExportModule(
-            model=traced_core,
-            normalization=dict(ckpt["normalization"]),
+            model=core_model,
+            normalization=normalization,
             input_fields=input_fields,
             target_fields=target_fields,
         ).to(device=device).eval()
-        exported = torch.jit.script(export_model)
+        reference_output = export_model(
+            example_state,
+            example_params,
+            example_transition_days,
+        ).detach().cpu()
+        exported = torch.jit.trace(
+            export_model,
+            (example_state, example_params, example_transition_days),
+            strict=bool(STRICT_TRACE),
+            check_trace=False,
+        )
         exported = torch.jit.freeze(exported.eval())
-        reference_output = export_model(example_state, example_params).detach().cpu()
 
     export_path.parent.mkdir(parents=True, exist_ok=True)
     exported.save(str(export_path))
@@ -476,6 +580,7 @@ def main() -> None:
         loaded_output = loaded(
             example_state.detach().cpu(),
             example_params.detach().cpu(),
+            example_transition_days.detach().cpu(),
         ).detach().cpu()
     max_abs_diff = float((loaded_output - reference_output).abs().max().item())
     if max_abs_diff > 1.0e-4:
@@ -489,6 +594,7 @@ def main() -> None:
         "input": {
             "state0": ["batch", int(shape["input_C"]), int(shape["H"]), int(shape["W"])],
             "params": ["batch", int(len(ckpt["param_names"]))],
+            "transition_days": ["batch"],
             "fields": input_fields,
         },
         "output": {
@@ -496,6 +602,7 @@ def main() -> None:
             "fields": target_fields,
         },
         "param_names": list(ckpt["param_names"]),
+        "conditioning_names": list(ckpt["conditioning_names"]),
         "normalization": dict(ckpt["normalization"]),
         "verification": {
             "max_abs_diff_vs_reference": max_abs_diff,
