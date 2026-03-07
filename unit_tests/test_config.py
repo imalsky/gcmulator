@@ -167,6 +167,7 @@ def test_load_config_defaults_to_plateau_with_relative_min_lr(tmp_path: Path) ->
     training_section = dict(payload["training"])
     training_section.pop("scheduler")
     training_section.pop("deterministic")
+    training_section.pop("preload_to_gpu")
     training_section["learning_rate"] = 1.0e-3
     payload["training"] = training_section
 
@@ -174,6 +175,7 @@ def test_load_config_defaults_to_plateau_with_relative_min_lr(tmp_path: Path) ->
     cfg = load_config(config_path)
 
     assert cfg.training.deterministic is False
+    assert cfg.training.preload_to_gpu is True
     assert cfg.training.scheduler.type == "plateau"
     assert cfg.training.scheduler.warmup_epochs == 10
     assert cfg.training.scheduler.factor == pytest.approx(0.5)

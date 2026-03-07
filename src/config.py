@@ -248,7 +248,7 @@ class TrainingConfig:
     prefetch_factor: int = 4
     shuffle: bool = True
     pin_memory: bool = False
-    preload_to_gpu: bool = False
+    preload_to_gpu: bool = True
     learning_rate: float = 3e-4
     weight_decay: float = 0.0
     val_fraction: float = 0.1
@@ -561,7 +561,7 @@ def _parse_training(
         shuffle=_parse_bool(d.get("shuffle", True), field_name="training.shuffle"),
         pin_memory=_parse_bool(d.get("pin_memory", False), field_name="training.pin_memory"),
         preload_to_gpu=_parse_bool(
-            d.get("preload_to_gpu", False),
+            d.get("preload_to_gpu", True),
             field_name="training.preload_to_gpu",
         ),
         learning_rate=learning_rate,
