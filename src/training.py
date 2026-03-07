@@ -52,13 +52,12 @@ from normalization import (
     normalize_state_tensor,
     stats_from_json,
     stats_to_json,
-    subset_state_stats,
 )
 
 
 LOGGER = logging.getLogger("train")
 
-PREPROCESS_FINGERPRINT_VERSION = 13
+PREPROCESS_FINGERPRINT_VERSION = 14
 RAW_REQUIRED_KEYS = (
     "state_inputs",
     "state_targets",
@@ -422,9 +421,13 @@ def _fit_stats_streaming(
     cfg: GCMulatorConfig,
 ) -> NormalizationStats:
     """Compute normalization statistics from the train split using streaming moments."""
-    state_sum: np.ndarray | None = None
-    state_sum2: np.ndarray | None = None
-    state_count = 0
+    input_state_sum: np.ndarray | None = None
+    input_state_sum2: np.ndarray | None = None
+    input_state_count = 0
+
+    target_state_sum: np.ndarray | None = None
+    target_state_sum2: np.ndarray | None = None
+    target_state_count = 0
 
     param_mean: np.ndarray | None = None
     param_m2: np.ndarray | None = None
@@ -436,23 +439,45 @@ def _fit_stats_streaming(
 
     for file_path in train_files:
         payload = _validated_raw_payload(file_path, cfg=cfg)
-        transformed = apply_state_transforms(
+        input_transformed = apply_state_transforms(
             payload["state_inputs"],
             payload["input_fields"],
             cfg.normalization.state,
         ).astype(np.float64, copy=False)
+        target_transformed = apply_state_transforms(
+            payload["state_targets"],
+            payload["target_fields"],
+            cfg.normalization.state,
+        ).astype(np.float64, copy=False)
+
         # Count every grid point in every transition frame because state
         # normalization is applied channel-wise over the full training corpus.
-        state_chunk_sum = transformed.sum(axis=(0, 2, 3))
-        state_chunk_sum2 = (transformed * transformed).sum(axis=(0, 2, 3))
-        n_samples = int(transformed.shape[0] * transformed.shape[2] * transformed.shape[3])
-        if state_sum is None:
-            state_sum = state_chunk_sum
-            state_sum2 = state_chunk_sum2
+        input_chunk_sum = input_transformed.sum(axis=(0, 2, 3))
+        input_chunk_sum2 = (input_transformed * input_transformed).sum(axis=(0, 2, 3))
+        input_n_samples = int(
+            input_transformed.shape[0] * input_transformed.shape[2] * input_transformed.shape[3]
+        )
+        if input_state_sum is None:
+            input_state_sum = input_chunk_sum
+            input_state_sum2 = input_chunk_sum2
         else:
-            state_sum += state_chunk_sum
-            state_sum2 += state_chunk_sum2
-        state_count += n_samples
+            input_state_sum += input_chunk_sum
+            input_state_sum2 += input_chunk_sum2
+        input_state_count += input_n_samples
+
+        # Fit target-channel statistics on the training targets themselves.
+        target_chunk_sum = target_transformed.sum(axis=(0, 2, 3))
+        target_chunk_sum2 = (target_transformed * target_transformed).sum(axis=(0, 2, 3))
+        target_n_samples = int(
+            target_transformed.shape[0] * target_transformed.shape[2] * target_transformed.shape[3]
+        )
+        if target_state_sum is None:
+            target_state_sum = target_chunk_sum
+            target_state_sum2 = target_chunk_sum2
+        else:
+            target_state_sum += target_chunk_sum
+            target_state_sum2 += target_chunk_sum2
+        target_state_count += target_n_samples
 
         params = payload["params"].astype(np.float64, copy=False)
         if param_mean is None:
@@ -480,8 +505,10 @@ def _fit_stats_streaming(
         transition_time_count += int(log10_transition_days.shape[0])
 
     if (
-        state_sum is None
-        or state_sum2 is None
+        input_state_sum is None
+        or input_state_sum2 is None
+        or target_state_sum is None
+        or target_state_sum2 is None
         or param_mean is None
         or param_m2 is None
         or transition_time_sum is None
@@ -489,9 +516,19 @@ def _fit_stats_streaming(
     ):
         raise RuntimeError("Could not infer normalization statistics from the training split")
 
-    state_mean = state_sum / float(state_count)
-    state_var = np.maximum(state_sum2 / float(state_count) - state_mean * state_mean, 0.0)
-    state_std = np.maximum(np.sqrt(state_var), STD_FLOOR)
+    input_state_mean = input_state_sum / float(input_state_count)
+    input_state_var = np.maximum(
+        input_state_sum2 / float(input_state_count) - input_state_mean * input_state_mean,
+        0.0,
+    )
+    input_state_std = np.maximum(np.sqrt(input_state_var), STD_FLOOR)
+
+    target_state_mean = target_state_sum / float(target_state_count)
+    target_state_var = np.maximum(
+        target_state_sum2 / float(target_state_count) - target_state_mean * target_state_mean,
+        0.0,
+    )
+    target_state_std = np.maximum(np.sqrt(target_state_var), STD_FLOOR)
 
     if cfg.normalization.params.mode == "zscore":
         if param_count > 1:
@@ -531,13 +568,24 @@ def _fit_stats_streaming(
     input_state_stats = StateNormalizationStats(
         field_names=tuple(PHYSICAL_STATE_FIELDS),
         field_transforms=dict(cfg.normalization.state.field_transforms),
-        mean=state_mean.astype(np.float64),
-        std=state_std.astype(np.float64),
+        mean=input_state_mean.astype(np.float64),
+        std=input_state_std.astype(np.float64),
         zscore_eps=float(cfg.normalization.state.zscore_eps),
         log10_eps=float(cfg.normalization.state.log10_eps),
         signed_log1p_scale=float(cfg.normalization.state.signed_log1p_scale),
     )
-    target_state_stats = subset_state_stats(input_state_stats, PROGNOSTIC_TARGET_FIELDS)
+    target_state_stats = StateNormalizationStats(
+        field_names=tuple(PROGNOSTIC_TARGET_FIELDS),
+        field_transforms={
+            str(name): str(cfg.normalization.state.field_transforms.get(str(name), "none"))
+            for name in PROGNOSTIC_TARGET_FIELDS
+        },
+        mean=target_state_mean.astype(np.float64),
+        std=target_state_std.astype(np.float64),
+        zscore_eps=float(cfg.normalization.state.zscore_eps),
+        log10_eps=float(cfg.normalization.state.log10_eps),
+        signed_log1p_scale=float(cfg.normalization.state.signed_log1p_scale),
+    )
     param_stats = ParamNormalizationStats(
         param_names=tuple(CONDITIONING_PARAM_NAMES),
         mean=param_mean_out.astype(np.float64),
@@ -1075,6 +1123,47 @@ def _loss_improved(*, current: float, best: float, min_delta: float) -> bool:
     return float(current) < float(best) - float(min_delta)
 
 
+def _update_loss_tracking(
+    *,
+    current: float,
+    best: float,
+    bad_epochs: int,
+    min_delta: float,
+) -> Tuple[float, int, bool]:
+    """Update the best loss and consecutive bad-epoch count for one metric."""
+    if bad_epochs < 0:
+        raise ValueError("bad_epochs must be >= 0")
+    improved = _loss_improved(current=current, best=best, min_delta=min_delta)
+    if improved:
+        return float(current), 0, True
+    return float(best), int(bad_epochs) + 1, False
+
+
+def _reduce_plateau_learning_rate(
+    optimizer: torch.optim.Optimizer,
+    *,
+    factor: float,
+    min_lr: float,
+    eps: float,
+) -> bool:
+    """Apply one plateau LR reduction step across all optimizer parameter groups."""
+    if factor <= 0.0 or factor >= 1.0:
+        raise ValueError("factor must be in (0,1)")
+    if min_lr < 0.0:
+        raise ValueError("min_lr must be >= 0")
+    if eps <= 0.0:
+        raise ValueError("eps must be > 0")
+
+    reduced = False
+    for group in optimizer.param_groups:
+        current_lr = float(group["lr"])
+        new_lr = max(float(min_lr), current_lr * float(factor))
+        if (current_lr - new_lr) > float(eps):
+            group["lr"] = float(new_lr)
+            reduced = True
+    return reduced
+
+
 def _early_stopping_patience(*, scheduler_patience: int, warmup_epochs: int) -> int:
     """Choose a conservative patience that still leaves room for LR reductions."""
     if scheduler_patience < 0:
@@ -1272,19 +1361,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     scheduler_patience = int(cfg.training.scheduler.patience)
     scheduler_min_lr = float(cfg.training.scheduler.min_lr)
     scheduler_eps = float(cfg.training.scheduler.eps)
+    scheduler_factor = float(cfg.training.scheduler.factor)
     warmup_epochs = int(cfg.training.scheduler.warmup_epochs)
-    scheduler = None
-    if scheduler_type == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=float(cfg.training.scheduler.factor),
-            patience=scheduler_patience,
-            threshold=scheduler_eps,
-            threshold_mode="abs",
-            min_lr=scheduler_min_lr,
-            eps=scheduler_eps,
-        )
 
     scaler = None
     if runtime_amp_mode == "fp16" and device.type == "cuda":
@@ -1297,6 +1375,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     history: List[Dict[str, float]] = []
     base_learning_rate = float(cfg.training.learning_rate)
     epochs_without_improvement = 0
+    plateau_bad_epochs = 0
     early_stop_patience = _early_stopping_patience(
         scheduler_patience=scheduler_patience,
         warmup_epochs=warmup_epochs,
@@ -1403,8 +1482,25 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             raise RuntimeError("No training or validation batches were produced")
         train_loss = train_loss_sum / float(train_count)
         val_loss = val_loss_sum / float(val_count)
-        if scheduler is not None and epoch > warmup_epochs:
-            scheduler.step(val_loss)
+        best_val, epochs_without_improvement, val_improved = _update_loss_tracking(
+            current=val_loss,
+            best=best_val,
+            bad_epochs=epochs_without_improvement,
+            min_delta=scheduler_eps,
+        )
+        if scheduler_type == "plateau":
+            if val_improved:
+                plateau_bad_epochs = 0
+            else:
+                plateau_bad_epochs += 1
+            if epoch >= warmup_epochs and plateau_bad_epochs >= scheduler_patience:
+                if _reduce_plateau_learning_rate(
+                    optimizer,
+                    factor=scheduler_factor,
+                    min_lr=scheduler_min_lr,
+                    eps=scheduler_eps,
+                ):
+                    plateau_bad_epochs = 0
 
         current_lr = float(optimizer.param_groups[0]["lr"])
         epoch_seconds = time.perf_counter() - epoch_start
@@ -1472,12 +1568,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             "epoch_seconds": float(epoch_seconds),
         }
         torch.save(checkpoint, last_path)
-        if _loss_improved(current=val_loss, best=best_val, min_delta=scheduler_eps):
-            best_val = val_loss
-            epochs_without_improvement = 0
+        if val_improved:
             torch.save(checkpoint, best_path)
-        else:
-            epochs_without_improvement += 1
 
         if epoch < epochs and epochs_without_improvement >= early_stop_patience:
             LOGGER.info(

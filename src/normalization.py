@@ -51,26 +51,6 @@ class NormalizationStats:
     transition_time: ParamNormalizationStats
 
 
-def subset_state_stats(
-    stats: StateNormalizationStats,
-    field_names: Sequence[str],
-) -> StateNormalizationStats:
-    """Return state normalization statistics restricted to selected fields."""
-    indices = [stats.field_names.index(str(field_name)) for field_name in field_names]
-    return StateNormalizationStats(
-        field_names=tuple(str(field_name) for field_name in field_names),
-        field_transforms={
-            str(name): str(stats.field_transforms.get(str(name), "none"))
-            for name in field_names
-        },
-        mean=np.asarray(stats.mean, dtype=np.float64)[indices],
-        std=np.asarray(stats.std, dtype=np.float64)[indices],
-        zscore_eps=float(stats.zscore_eps),
-        log10_eps=float(stats.log10_eps),
-        signed_log1p_scale=float(stats.signed_log1p_scale),
-    )
-
-
 def _transform_channel(
     x: np.ndarray,
     mode: str,

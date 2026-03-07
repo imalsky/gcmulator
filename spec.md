@@ -292,7 +292,8 @@ Training performs preprocessing internally before optimization.
 `src/training.py::preprocess_dataset`:
 1. loads and validates every raw file against the active config
 2. splits at the simulation-file level, never at the transition level
-3. fits normalization on train files only
+3. fits normalization on train files only, with `input_state` stats from
+   training inputs and `target_state` stats from training targets
 4. writes one processed shard per raw simulation file
 5. writes `processed_meta.json`
 6. reuses cached processed data only when the preprocessing fingerprint matches
@@ -308,10 +309,10 @@ Training performs preprocessing internally before optimization.
 
 ### 4.5 Export And Utilities
 The `extra/` scripts provide:
-1. direct-jump qualitative prediction plots
+1. held-out test-split multi-jump qualitative prediction plots
 2. TorchScript export with baked normalization
 3. training-curve plots
-4. batch-size timing benchmarks for direct-jump inference
+4. batch-size timing benchmarks for held-out multi-jump rollout inference
 5. SWAMPE vs MY_SWAMP parity diagnostics
 
 ### 4.6 How To Run
@@ -335,15 +336,17 @@ python src/main.py --train --config config.json
 
 **Utility scripts** (run from the repository root after training):
 ```bash
-python extra/predictions.py        # qualitative prediction plots
+python extra/predictions.py        # held-out test multi-jump prediction plot
 python extra/pytorch_export.py     # TorchScript export
 python extra/training_log.py       # training loss curves
-python extra/batch_size_benchmark.py  # inference latency benchmark
+python extra/batch_size_benchmark.py  # held-out test rollout latency benchmark
 ```
 
 Each utility script has user-editable constants at the top (e.g. `RUN_NAME`,
 `CHECKPOINT_PATH`) that control which trained run is inspected. Edit those
-before running.
+before running. If `PROCESSED_DIR` is left unset in `extra/predictions.py` or
+`extra/batch_size_benchmark.py`, the scripts resolve the processed dataset path
+from the checkpoint's stored `source_config_path` and `resolved_config`.
 
 ## 5. Torch-Harmonics Interface
 ### 5.1 Required APIs
@@ -428,14 +431,15 @@ No planar FFT surrogate is part of the contract for spherical spectral metrics.
 
 ### 6.3 Extra Utilities
 1. `extra/predictions.py`
-   Plot one direct-jump prognostic prediction against truth from a checkpoint.
+   Plot one held-out test-split multi-jump prognostic prediction against truth
+   from a checkpoint.
 2. `extra/pytorch_export.py`
    Export a trained checkpoint as a physical-space TorchScript module and write
    export metadata.
 3. `extra/training_log.py`
    Plot train-vs-val loss curves from `training_history.csv`.
 4. `extra/batch_size_benchmark.py`
-   Benchmark direct-jump inference latency across batch sizes.
+   Benchmark held-out test-split multi-jump rollout latency across batch sizes.
 5. `extra/swampe_parity_compare.py`
    Compare SWAMPE and MY_SWAMP outputs for parity/debugging.
 6. `extra/science.mplstyle`
@@ -639,7 +643,8 @@ Parameter normalization keys:
 11. `pin_memory`
    Dataloader pinned-memory toggle.
 12. `preload_to_gpu`
-   Whether the processed splits are fully moved to GPU before training.
+   Whether the processed splits are fully moved to GPU before training. The
+   active default is `true`.
 13. `learning_rate`
    Base optimizer learning rate.
 14. `weight_decay`
@@ -664,12 +669,16 @@ Scheduler keys:
 Active default scheduler behavior:
 1. default `type` is `plateau`
 2. warmup is linear for `warmup_epochs`
-3. after warmup, validation loss is monitored with `ReduceLROnPlateau`
-4. learning rate is multiplied by `factor` after `patience` epochs without an
-   improvement larger than `eps`
-5. if `min_lr` is omitted, it resolves to `learning_rate / 50` for active
+3. plateau bad-epoch counting starts from the first validation epoch,
+   including warmup epochs
+4. plateau LR reductions are only applied once warmup has finished
+5. learning rate is multiplied by `factor` after `patience` consecutive epochs
+   without an improvement larger than `eps`
+6. early stopping patience is
+   `max(warmup_epochs + patience, 3 * patience)`
+7. if `min_lr` is omitted, it resolves to `learning_rate / 50` for active
    schedulers and to `0.0` for `type='none'`
-6. cosine scheduling remains supported via `type='cosine_warmup'`
+8. cosine scheduling remains supported via `type='cosine_warmup'`
 
 Active runtime behavior:
 1. `preload_to_gpu=true` requires CUDA and forces `num_workers=0`

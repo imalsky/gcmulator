@@ -180,3 +180,26 @@ def test_preprocess_dataset_writes_time_conditioned_shards(tmp_path: Path) -> No
     assert params_norm.shape == (len(CONDITIONING_PARAM_NAMES),)
     assert np.allclose(transition_days, np.full((2,), 2 * 240.0 / 86400.0))
     assert np.array_equal(anchor_steps, np.array([0, 2], dtype=np.int64))
+
+
+def test_preprocess_dataset_fits_target_stats_from_train_targets(tmp_path: Path) -> None:
+    """Training-target normalization should be centered on the training targets themselves."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_config_dict()), encoding="utf-8")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for sim_idx in range(3):
+        _write_raw_payload(raw_dir, sim_idx=sim_idx)
+
+    cfg = load_config(config_path)
+    meta = preprocess_dataset(cfg, config_path=config_path)
+
+    train_target_rows: list[np.ndarray] = []
+    for entry in meta["splits"]["train"]:
+        with np.load(tmp_path / "processed" / str(entry["file"]), allow_pickle=False) as npz:
+            train_target_rows.append(np.asarray(npz["state_targets_norm"], dtype=np.float32))
+
+    train_targets_norm = np.concatenate(train_target_rows, axis=0)
+    train_channel_means = train_targets_norm.mean(axis=(0, 2, 3))
+
+    assert np.allclose(train_channel_means, 0.0, atol=1.0e-6)
