@@ -17,6 +17,34 @@ The canonical task is:
 This repository does not emulate the exact internal two-level solver carry. It
 learns a surrogate of the visible flow map seen through the physical state.
 
+### 1.1 Working Environment And First Checks
+Use the local `swamp_compare` conda environment for generation, training,
+export, and repository checks.
+
+Default operator routine:
+1. Activate the environment:
+   `conda activate swamp_compare`
+2. Work from the repository root:
+   `cd /Users/imalsky/Desktop/SWAMPE_Project/gcmulator`
+3. Confirm the required imports before debugging repository code:
+   `python -c "import torch, torch_harmonics, my_swamp; print(torch.__version__, getattr(torch_harmonics, '__version__', 'unknown'))"`
+4. Run the minimum integrity checks:
+   `python -m pytest unit_tests`
+   `python -m compileall src extra unit_tests`
+5. Run developer cleanliness checks when available:
+   `ruff check src extra unit_tests`
+   `vulture src extra unit_tests --min-confidence 80`
+6. Use the main entrypoints from the same environment:
+   `python src/main.py --gen --config config.json`
+   `python src/main.py --train --config config.json`
+
+Important dependency naming:
+1. the install package is `torch-harmonics==0.8.1`
+2. the Python import name is `torch_harmonics`
+
+If `python -c "import torch_harmonics"` fails inside `swamp_compare`, fix the
+environment before changing repository code.
+
 ## 2. Engineering Principles
 ### 2.1 Fail Fast
 The repository should prefer a small number of high-value contract checks over a
@@ -326,7 +354,8 @@ The active code depends on these `torch_harmonics` APIs:
 3. `torch_harmonics.RealSHT`
 
 Preferred baseline version:
-`torch-harmonics==0.8.1`
+`torch-harmonics==0.8.1` installed into `swamp_compare`, imported in Python as
+`torch_harmonics`
 
 ### 5.2 How GCMulator Wraps SFNO
 `src/modeling.py` does not use bare SFNO directly. It wraps it as:
@@ -611,6 +640,17 @@ Scheduler keys:
 3. `factor`
 4. `patience`
 5. `min_lr`
+6. `eps`
+
+Active default scheduler behavior:
+1. default `type` is `plateau`
+2. warmup is linear for `warmup_epochs`
+3. after warmup, validation loss is monitored with `ReduceLROnPlateau`
+4. learning rate is multiplied by `factor` after `patience` epochs without an
+   improvement larger than `eps`
+5. if `min_lr` is omitted, it resolves to `learning_rate / 50` for active
+   schedulers and to `0.0` for `type='none'`
+6. cosine scheduling remains supported via `type='cosine_warmup'`
 
 ### 7.8 Common Artifact Variable Names
 These names recur across raw files, processed metadata, checkpoints, and code:
@@ -937,6 +977,9 @@ Required hygiene:
 4. prefer explicit exact contracts over "best effort" convenience behavior
 
 ## 11. Local Integrity Checks
+Run all commands in this section from the repository root inside
+`swamp_compare`.
+
 The minimum local integrity pass for this repository is:
 1. `python -m pytest unit_tests`
 2. `python -m compileall src extra unit_tests`
@@ -956,7 +999,8 @@ dependencies.
 Required core dependencies:
 1. `numpy`
 2. `torch`
-3. `torch-harmonics==0.8.1` as the preferred baseline
+3. `torch-harmonics==0.8.1` as the preferred baseline, imported as
+   `torch_harmonics`
 
 Required generation/physics dependency:
 1. `my_swamp`
@@ -964,7 +1008,8 @@ Required generation/physics dependency:
 Optional plotting dependency:
 1. `matplotlib`
 
-The contract assumes these packages are importable in the active environment.
+The contract assumes these packages are importable in the active
+`swamp_compare` environment.
 
 ## 13. Exactness Statement
 This repository intentionally models the visible MY_SWAMP flow map, not the

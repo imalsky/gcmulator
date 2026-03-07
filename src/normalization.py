@@ -193,7 +193,13 @@ def normalize_conditioning(
     param_stats: ParamNormalizationStats,
     transition_time_stats: ParamNormalizationStats,
 ) -> np.ndarray:
-    """Normalize physical parameters and transition duration into one conditioning matrix."""
+    """Normalize physical parameters and transition duration into one conditioning matrix.
+
+    Transition durations are log10-encoded before z-scoring to compress the
+    wide dynamic range (e.g. 0.1–100 days) into a well-conditioned input space.
+    The ``transition_time_stats`` must have been fitted on log10-transformed
+    values for consistency.
+    """
     params = np.asarray(params_np, dtype=np.float64)
     if params.ndim == 1:
         params = params[None, :]
@@ -218,8 +224,9 @@ def normalize_conditioning(
         )
 
     params_norm = normalize_params(params, param_stats)
+    log10_transition_days = np.log10(np.maximum(transition_days, 1.0e-30))
     transition_days_norm = normalize_params(
-        transition_days.reshape(-1, 1),
+        log10_transition_days.reshape(-1, 1),
         transition_time_stats,
     )
     return np.concatenate([params_norm, transition_days_norm], axis=1).astype(np.float32)

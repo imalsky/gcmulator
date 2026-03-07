@@ -1,0 +1,61 @@
+{
+  "export_path": "/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/models/v1/model_export.torchscript.pt",
+  "checkpoint_path": "/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/models/v1/best.pt",
+  "export_format": "torchscript",
+  "forward_schema": "forward(__torch__.___torch_mangle_42.PhysicalStateExportModule self, Tensor state0, Tensor params) -> Tensor",
+  "export_arg_count": 2,
+  "param_names": [
+    "a_m",
+    "omega_rad_s",
+    "Phibar",
+    "DPhieq",
+    "taurad_s",
+    "taudrag_s",
+    "g_m_s2"
+  ],
+  "conditioning_names": [
+    "a_m",
+    "omega_rad_s",
+    "Phibar",
+    "DPhieq",
+    "taurad_s",
+    "taudrag_s",
+    "g_m_s2"
+  ],
+  "input_fields": [
+    "Phi",
+    "U",
+    "V",
+    "eta",
+    "delta"
+  ],
+  "output_fields": [
+    "Phi",
+    "eta",
+    "delta"
+  ],
+  "transition_days_conditioned": false,
+  "has_transition_time_stats": false,
+  "transition_time_name": null,
+  "sampling_transition_days_min": null,
+  "sampling_transition_days_max": null,
+  "fixed_step_days": 0.001388888888888889,
+  "rollout_steps_for_100_days": 72000,
+  "gpu_native_jax_retrieval_ready": false,
+  "blockers": [
+    "The checked-in export is TorchScript/PyTorch, so a JAX+jaxoplanet retrieval would need a framework bridge instead of staying inside one GPU-native graph.",
+    "The checkpoint normalization does not include `transition_time`, so the export is missing the current variable-jump training contract.",
+    "The checkpoint conditioning vector is ['a_m', 'omega_rad_s', 'Phibar', 'DPhieq', 'taurad_s', 'taudrag_s', 'g_m_s2'], which does not include `log10_transition_days`.",
+    "The export forward signature is fixed-step: it does not accept `transition_days`, so long horizons require recurrent rollout.",
+    "A 100.0-day prediction would require about 72,000 recurrent surrogate steps with the current fixed-step artifact.",
+    "The checkpoint sampling metadata does not record a variable `transition_days` range, so there is no evidence this artifact was trained for flexible jumps from initial state toward equilibrium."
+  ],
+  "recommendations": [
+    "Export a JAX-native surrogate, or retrain/export the surrogate in a JAX stack so the forward model and jaxoplanet share the same runtime.",
+    "Regenerate checkpoints after variable-jump training so `normalization.transition_time` is stored in the artifact.",
+    "Export a checkpoint whose conditioning vector includes the explicit time feature.",
+    "Train/export a direct-jump model with explicit `transition_days` conditioning.",
+    "Use log-spaced variable-jump training and export a long-horizon direct-jump artifact before attempting full nested-sampling retrieval.",
+    "Train with explicit random forward-only jump sampling over a broad day range and store that range in checkpoint metadata."
+  ]
+}

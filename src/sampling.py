@@ -7,15 +7,20 @@ and the canonical conditioning vector used throughout the emulator pipeline.
 from __future__ import annotations
 
 import math
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Tuple
 
 import numpy as np
 
-from config import CONDITIONING_PARAM_NAMES, Extended9Params, ParameterSpec, SamplingConfig
+from config import (
+    CONDITIONING_PARAM_NAMES,
+    Extended9Params,
+    ParameterSpec,
+    PROBABILITY_MAX,
+    PROBABILITY_MIN,
+    SECONDS_PER_DAY,
+)
 
 # Sampling and unit-conversion constants.
-PROBABILITY_MIN = 0.0
-PROBABILITY_MAX = 1.0
 SECONDS_PER_HOUR = 3600.0
 
 # Diffusion controls are fixed internally and intentionally excluded from the
@@ -118,23 +123,83 @@ def vector_to_extended9(vector: np.ndarray) -> Extended9Params:
     return to_extended9(sampled)
 
 
-def sample_transition_jump_steps(
+def sample_transition_pairs(
     rng: np.random.Generator,
-    cfg_sampling: SamplingConfig,
     *,
-    n_samples: int,
-) -> np.ndarray:
-    """Draw per-simulation transition jumps according to the sampling config."""
-    if n_samples < 1:
-        raise ValueError("n_samples must be >= 1")
+    n_transitions: int,
+    burn_in_steps: int,
+    n_steps_total: int,
+    dt_seconds: float,
+    transition_jump_days_min: float,
+    transition_jump_days_max: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample random (anchor, target) pairs with log-uniform time jumps.
 
-    min_steps = int(cfg_sampling.min_transition_jump_steps())
-    max_steps = int(cfg_sampling.max_transition_jump_steps())
-    if min_steps < 1 or max_steps < min_steps:
+    Each transition independently draws a random anchor time from the
+    post-burn-in portion of the trajectory and a random time jump from a
+    log-uniform distribution.  The jump is clamped to fit within the
+    available simulation horizon.  This means early anchor times can reach
+    large dt (including near-equilibrium states), while late anchor times
+    are naturally limited to shorter jumps.
+
+    Returns:
+        anchor_steps: (n_transitions,) int64 — solver step indices of inputs
+        target_steps: (n_transitions,) int64 — solver step indices of targets
+        transition_days: (n_transitions,) float64 — actual jump durations
+    """
+    if n_transitions < 1:
+        raise ValueError("n_transitions must be >= 1")
+    if n_steps_total < 1:
+        raise ValueError("n_steps_total must be >= 1")
+    if dt_seconds <= 0:
+        raise ValueError("dt_seconds must be > 0")
+    if transition_jump_days_min <= 0:
+        raise ValueError("transition_jump_days_min must be > 0")
+    if transition_jump_days_min >= transition_jump_days_max:
+        raise ValueError("transition_jump_days_min must be < transition_jump_days_max")
+
+    min_jump_steps = max(1, int(math.ceil(
+        transition_jump_days_min * SECONDS_PER_DAY / dt_seconds
+    )))
+
+    # Anchors can start anywhere from burn-in up to the point where at
+    # least the minimum jump still fits within the trajectory.
+    max_anchor = n_steps_total - min_jump_steps
+    if max_anchor < burn_in_steps:
         raise ValueError(
-            "Invalid transition jump bounds: "
-            f"min_steps={min_steps}, max_steps={max_steps}"
+            "No valid anchor positions exist: "
+            f"burn_in_steps={burn_in_steps}, "
+            f"n_steps_total={n_steps_total}, "
+            f"min_jump_steps={min_jump_steps}"
         )
-    if min_steps == max_steps:
-        return np.full((int(n_samples),), fill_value=min_steps, dtype=np.int64)
-    return rng.integers(min_steps, max_steps + 1, size=int(n_samples), dtype=np.int64)
+
+    log_min = math.log10(transition_jump_days_min)
+    log_max = math.log10(transition_jump_days_max)
+
+    anchor_steps = np.empty(n_transitions, dtype=np.int64)
+    target_steps = np.empty(n_transitions, dtype=np.int64)
+    transition_days = np.empty(n_transitions, dtype=np.float64)
+
+    for i in range(n_transitions):
+        anchor = int(rng.integers(burn_in_steps, max_anchor + 1))
+
+        # Clamp the upper bound so the target stays within the trajectory.
+        remaining_steps = n_steps_total - anchor
+        remaining_days = float(remaining_steps) * dt_seconds / SECONDS_PER_DAY
+        effective_log_max = min(log_max, math.log10(max(remaining_days, transition_jump_days_min)))
+
+        # Sample log-uniform jump, clamp to at least one solver step.
+        dt_days = float(10.0 ** rng.uniform(log_min, max(log_min, effective_log_max)))
+        dt_steps = max(1, int(round(dt_days * SECONDS_PER_DAY / dt_seconds)))
+        dt_steps = min(dt_steps, remaining_steps)
+
+        target = anchor + dt_steps
+        actual_days = float(dt_steps) * dt_seconds / SECONDS_PER_DAY
+
+        anchor_steps[i] = anchor
+        target_steps[i] = target
+        transition_days[i] = actual_days
+
+    # Sort by anchor time for deterministic ordering.
+    order = np.argsort(anchor_steps)
+    return anchor_steps[order], target_steps[order], transition_days[order]

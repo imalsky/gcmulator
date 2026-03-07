@@ -155,3 +155,22 @@ def test_load_config_rejects_unknown_keys(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, payload)
     with pytest.raises(ValueError, match="unknown keys"):
         load_config(config_path)
+
+
+def test_load_config_defaults_to_plateau_with_relative_min_lr(tmp_path: Path) -> None:
+    """Default scheduler settings should resolve from the configured start LR."""
+    payload = _minimal_config_dict()
+    training_section = dict(payload["training"])
+    training_section.pop("scheduler")
+    training_section["learning_rate"] = 1.0e-3
+    payload["training"] = training_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    assert cfg.training.scheduler.type == "plateau"
+    assert cfg.training.scheduler.warmup_epochs == 10
+    assert cfg.training.scheduler.factor == pytest.approx(0.5)
+    assert cfg.training.scheduler.patience == 10
+    assert cfg.training.scheduler.min_lr == pytest.approx(2.0e-5)
+    assert cfg.training.scheduler.eps == pytest.approx(1.0e-10)

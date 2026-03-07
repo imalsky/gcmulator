@@ -1,8 +1,14 @@
-"""Raw dataset generation for trajectory-transition emulator training.
+"""Raw dataset generation for variable-dt trajectory-transition emulator training.
 
 The generator samples physical parameters, runs MY_SWAMP to obtain one
-contiguous transition window per simulation, and writes those windows in the
-raw format consumed by preprocessing.
+trajectory per simulation, then samples random (anchor, target) pairs with
+log-uniform time jumps.  Each transition within a simulation may use a
+different time gap, enabling the model to learn dynamics across all
+timescales — from fast transients to slow relaxation toward equilibrium.
+
+Setting ``burn_in_days`` to 0 allows anchor times at the very start of the
+simulation so the model can learn to evolve an arbitrary initial state
+(e.g. a rest state) toward the forced equilibrium.
 """
 
 from __future__ import annotations
@@ -30,9 +36,8 @@ from my_swamp_backend import (
     params_to_conditioning_vector,
     params_to_public_json_dict,
     run_trajectory_window,
-    run_trajectory_windows_batched,
 )
-from sampling import sample_parameter_dict, sample_transition_jump_steps, to_extended9
+from sampling import sample_parameter_dict, sample_transition_pairs, to_extended9
 
 
 LOGGER = logging.getLogger("generate")
@@ -40,7 +45,9 @@ LOGGER = logging.getLogger("generate")
 
 def _list_existing_raw_files(dataset_dir: Path) -> List[Path]:
     """Return all raw simulation files, including unsupported legacy leftovers."""
-    return sorted(list(dataset_dir.glob("sim_*.npy")) + list(dataset_dir.glob("sim_*.npz")))
+    return sorted(
+        list(dataset_dir.glob("sim_*.npy")) + list(dataset_dir.glob("sim_*.npz"))
+    )
 
 
 def _clear_dataset_dir(dataset_dir: Path) -> None:
@@ -52,35 +59,6 @@ def _clear_dataset_dir(dataset_dir: Path) -> None:
         manifest.unlink()
 
 
-def _sample_window_start_step(
-    *,
-    cfg: GCMulatorConfig,
-    transition_jump_steps: int,
-    rng: np.random.Generator,
-) -> int:
-    """Sample one contiguous post-burn-in transition window start index."""
-    total_steps = int(
-        round(float(cfg.solver.default_time_days) * SECONDS_PER_DAY / float(cfg.solver.dt_seconds))
-    )
-    total_steps = max(1, total_steps)
-    burn_in_steps = int(
-        round(float(cfg.sampling.burn_in_days) * SECONDS_PER_DAY / float(cfg.solver.dt_seconds))
-    )
-    max_window_start = (
-        total_steps
-        - int(transition_jump_steps) * int(cfg.sampling.transitions_per_simulation)
-    )
-    if max_window_start < burn_in_steps:
-        raise ValueError(
-            "No valid post-burn-in transition window exists for the configured horizon: "
-            f"transition_jump_steps={transition_jump_steps}, "
-            f"burn_in_steps={burn_in_steps}, max_window_start={max_window_start}"
-        )
-    if max_window_start == burn_in_steps:
-        return int(burn_in_steps)
-    return int(rng.integers(burn_in_steps, max_window_start + 1))
-
-
 def _write_sim_record(
     *,
     sim_idx: int,
@@ -88,7 +66,6 @@ def _write_sim_record(
     state_targets: np.ndarray,
     transition_days: np.ndarray,
     anchor_steps: np.ndarray,
-    transition_jump_steps: int,
     params_vector: np.ndarray,
     params_json: Dict[str, float],
     cfg: GCMulatorConfig,
@@ -103,12 +80,10 @@ def _write_sim_record(
         raise ValueError("transition_days must align with transition count")
     if anchor_steps.shape != transition_days.shape:
         raise ValueError("anchor_steps must align with transition count")
-
     if int(state_inputs.shape[0]) == 0:
         raise RuntimeError("Failed to infer geometry metadata for trajectory record")
 
-    # Vectorized geometry canonicalization: apply the same flip/roll to the
-    # entire [T, C, H, W] batch instead of looping over individual timesteps.
+    # Vectorized geometry canonicalization.
     nlon = int(state_inputs.shape[3])
     lon_shift = geometry_shift_for_nlon(nlon, cfg.geometry.roll_longitude_to_0_2pi)
 
@@ -125,7 +100,11 @@ def _write_sim_record(
 
     nlat = int(state_inputs.shape[2])
     geometry_info = {
-        "lat_order": "north_to_south" if cfg.geometry.flip_latitude_to_north_south else "south_to_north",
+        "lat_order": (
+            "north_to_south"
+            if cfg.geometry.flip_latitude_to_north_south
+            else "south_to_north"
+        ),
         "lon_origin": "0_to_2pi" if cfg.geometry.roll_longitude_to_0_2pi else "minus_pi_to_pi",
         "lon_shift": int(lon_shift),
         "nlat": int(nlat),
@@ -149,8 +128,12 @@ def _write_sim_record(
         "burn_in_days": np.asarray(float(cfg.sampling.burn_in_days), dtype=np.float64),
         "dt_seconds": np.asarray(float(cfg.solver.dt_seconds), dtype=np.float64),
         "starttime_index": np.asarray(int(cfg.solver.starttime_index), dtype=np.int64),
-        "transition_jump_steps": np.asarray(int(transition_jump_steps), dtype=np.int64),
-        "anchor_stride_steps": np.asarray(int(transition_jump_steps), dtype=np.int64),
+        "transition_jump_days_min": np.asarray(
+            float(cfg.sampling.transition_jump_days_min), dtype=np.float64
+        ),
+        "transition_jump_days_max": np.asarray(
+            float(cfg.sampling.transition_jump_days_max), dtype=np.float64
+        ),
         "n_transitions": np.asarray(int(state_inputs.shape[0]), dtype=np.int64),
         "M": np.asarray(int(cfg.solver.M), dtype=np.int64),
         "nlat": np.asarray(int(inputs_geom.shape[-2]), dtype=np.int64),
@@ -172,8 +155,8 @@ def _write_sim_record(
         "burn_in_days": float(cfg.sampling.burn_in_days),
         "dt_seconds": float(cfg.solver.dt_seconds),
         "starttime_index": int(cfg.solver.starttime_index),
-        "transition_jump_steps": int(transition_jump_steps),
-        "anchor_stride_steps": int(transition_jump_steps),
+        "transition_jump_days_min": float(cfg.sampling.transition_jump_days_min),
+        "transition_jump_days_max": float(cfg.sampling.transition_jump_days_max),
         "n_transitions": int(state_inputs.shape[0]),
         "anchor_step_start": int(anchor_steps[0]),
         "anchor_step_end": int(anchor_steps[-1]),
@@ -203,7 +186,19 @@ def _log_progress(*, completed: int, total: int, start_time: float) -> None:
 
 
 def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
-    """Generate the raw transition dataset using MY_SWAMP as the source of truth."""
+    """Generate the raw transition dataset using MY_SWAMP as the source of truth.
+
+    For each simulation, physical parameters are sampled from the configured
+    distributions and MY_SWAMP is run for ``default_time_days``.  Random
+    (anchor, target) pairs are then drawn with log-uniform time jumps so that
+    the model sees a wide range of timescales — from sub-day transients to
+    near-equilibrium relaxation over tens of days.
+
+    When ``burn_in_days`` is 0, anchor times can start at the very beginning
+    of the trajectory (right after the ``starttime_index`` numerical warm-up).
+    This is critical for training the model to evolve an initial state toward
+    the forced equilibrium.
+    """
     ensure_my_swamp_importable(config_path.parent)
 
     dataset_dir = resolve_path(config_path, cfg.paths.dataset_dir)
@@ -215,41 +210,33 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         if existing:
             raise FileExistsError(
                 "Dataset directory already contains raw simulation files "
-                f"({len(existing)} .npy/.npz files) and overwrite_dataset=false: {dataset_dir}"
+                f"({len(existing)} .npy/.npz files) and overwrite_dataset=false: "
+                f"{dataset_dir}"
             )
 
     n_sims = int(cfg.sampling.n_sims)
     rng = np.random.default_rng(int(cfg.sampling.seed))
-    sampled_params = [
-        to_extended9(sample_parameter_dict(rng, cfg.sampling.parameters))
-        for _ in range(n_sims)
-    ]
-    transition_jump_steps_per_sim = sample_transition_jump_steps(
-        rng,
-        cfg.sampling,
-        n_samples=n_sims,
+
+    n_steps_total = max(
+        1,
+        int(round(
+            float(cfg.solver.default_time_days) * SECONDS_PER_DAY
+            / float(cfg.solver.dt_seconds)
+        )),
     )
-    window_start_steps = np.asarray(
-        [
-            _sample_window_start_step(
-                cfg=cfg,
-                transition_jump_steps=int(transition_jump_steps_per_sim[index]),
-                rng=rng,
-            )
-            for index in range(n_sims)
-        ],
-        dtype=np.int64,
-    )
-    generation_batch_size = max(1, int(cfg.sampling.generation_workers))
+    burn_in_steps = int(round(
+        float(cfg.sampling.burn_in_days) * SECONDS_PER_DAY
+        / float(cfg.solver.dt_seconds)
+    ))
 
     jax_backend = detect_jax_backend()
     LOGGER.info(
-        "Dataset generation | backend=%-6s | batch_size=%d | jump_steps=[%d,%d] | "
+        "Dataset generation | backend=%-6s | n_sims=%d | jump_days=[%.3f,%.3f] | "
         "input_fields=%s | target_fields=%s",
         jax_backend,
-        generation_batch_size,
-        int(np.min(transition_jump_steps_per_sim)),
-        int(np.max(transition_jump_steps_per_sim)),
+        n_sims,
+        float(cfg.sampling.transition_jump_days_min),
+        float(cfg.sampling.transition_jump_days_max),
         list(PHYSICAL_STATE_FIELDS),
         list(PROGNOSTIC_TARGET_FIELDS),
     )
@@ -258,87 +245,46 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
     start_time = time.time()
     log_every = max(1, n_sims // 20)
 
-    if generation_batch_size == 1:
-        for sim_idx, params in enumerate(sampled_params):
-            state_inputs, state_targets, transition_days, anchor_steps = run_trajectory_window(
-                params,
-                M=int(cfg.solver.M),
-                dt_seconds=float(cfg.solver.dt_seconds),
-                time_days=float(cfg.solver.default_time_days),
-                starttime_index=int(cfg.solver.starttime_index),
-                window_start_step=int(window_start_steps[sim_idx]),
-                n_transitions=int(cfg.sampling.transitions_per_simulation),
-                transition_jump_steps=int(transition_jump_steps_per_sim[sim_idx]),
-            )
-            item = _write_sim_record(
-                sim_idx=sim_idx,
-                state_inputs=state_inputs,
-                state_targets=state_targets,
-                transition_days=transition_days,
-                anchor_steps=anchor_steps,
-                transition_jump_steps=int(transition_jump_steps_per_sim[sim_idx]),
-                params_vector=params_to_conditioning_vector(params),
-                params_json=params_to_public_json_dict(params),
-                cfg=cfg,
-                dataset_dir=dataset_dir,
-            )
-            items.append(item)
-            completed = sim_idx + 1
-            if (completed % log_every) == 0 or completed == n_sims:
-                _log_progress(completed=completed, total=n_sims, start_time=start_time)
-    else:
-        completed = 0
-        for transition_jump_steps in sorted(
-            {int(value) for value in transition_jump_steps_per_sim.tolist()}
-        ):
-            group_indices = np.flatnonzero(
-                transition_jump_steps_per_sim == int(transition_jump_steps)
-            ).astype(np.int64)
-            for batch_start in range(0, int(group_indices.shape[0]), generation_batch_size):
-                batch_indices = group_indices[
-                    batch_start : batch_start + generation_batch_size
-                ]
-                params_batch = [sampled_params[int(index)] for index in batch_indices.tolist()]
-                params_matrix = np.asarray(
-                    [params_to_conditioning_vector(params) for params in params_batch],
-                    dtype=np.float64,
-                )
-                batch_window_starts = window_start_steps[batch_indices]
-                state_inputs_batch, state_targets_batch, transition_days_batch, anchor_steps_batch = (
-                    run_trajectory_windows_batched(
-                        params_matrix,
-                        M=int(cfg.solver.M),
-                        dt_seconds=float(cfg.solver.dt_seconds),
-                        time_days=float(cfg.solver.default_time_days),
-                        starttime_index=int(cfg.solver.starttime_index),
-                        window_start_steps=batch_window_starts,
-                        n_transitions=int(cfg.sampling.transitions_per_simulation),
-                        transition_jump_steps=int(transition_jump_steps),
-                        k6=float(params_batch[0].K6),
-                        k6phi=params_batch[0].K6Phi,
-                    )
-                )
-                for local_index, params in enumerate(params_batch):
-                    sim_idx = int(batch_indices[local_index])
-                    item = _write_sim_record(
-                        sim_idx=sim_idx,
-                        state_inputs=state_inputs_batch[local_index],
-                        state_targets=state_targets_batch[local_index],
-                        transition_days=transition_days_batch[local_index],
-                        anchor_steps=anchor_steps_batch[local_index],
-                        transition_jump_steps=int(transition_jump_steps),
-                        params_vector=params_to_conditioning_vector(params),
-                        params_json=params_to_public_json_dict(params),
-                        cfg=cfg,
-                        dataset_dir=dataset_dir,
-                    )
-                    items.append(item)
+    for sim_idx in range(n_sims):
+        params = to_extended9(sample_parameter_dict(rng, cfg.sampling.parameters))
 
-                completed += int(batch_indices.shape[0])
-                if (completed % log_every) == 0 or completed == n_sims:
-                    _log_progress(completed=completed, total=n_sims, start_time=start_time)
+        anchor_steps, target_steps, transition_days = sample_transition_pairs(
+            rng,
+            n_transitions=int(cfg.sampling.transitions_per_simulation),
+            burn_in_steps=burn_in_steps,
+            n_steps_total=n_steps_total,
+            dt_seconds=float(cfg.solver.dt_seconds),
+            transition_jump_days_min=float(cfg.sampling.transition_jump_days_min),
+            transition_jump_days_max=float(cfg.sampling.transition_jump_days_max),
+        )
 
-    # The manifest is purely descriptive; training reads the raw files directly.
+        state_inputs, state_targets = run_trajectory_window(
+            params,
+            M=int(cfg.solver.M),
+            dt_seconds=float(cfg.solver.dt_seconds),
+            time_days=float(cfg.solver.default_time_days),
+            starttime_index=int(cfg.solver.starttime_index),
+            anchor_steps=anchor_steps,
+            target_steps=target_steps,
+        )
+
+        item = _write_sim_record(
+            sim_idx=sim_idx,
+            state_inputs=state_inputs,
+            state_targets=state_targets,
+            transition_days=transition_days,
+            anchor_steps=anchor_steps,
+            params_vector=params_to_conditioning_vector(params),
+            params_json=params_to_public_json_dict(params),
+            cfg=cfg,
+            dataset_dir=dataset_dir,
+        )
+        items.append(item)
+
+        completed = sim_idx + 1
+        if (completed % log_every) == 0 or completed == n_sims:
+            _log_progress(completed=completed, total=n_sims, start_time=start_time)
+
     items.sort(key=lambda item: int(item["sim_idx"]))
     manifest = {
         "created_unix": time.time(),
@@ -359,9 +305,8 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             "n_sims": int(cfg.sampling.n_sims),
             "burn_in_days": float(cfg.sampling.burn_in_days),
             "transitions_per_simulation": int(cfg.sampling.transitions_per_simulation),
-            "transition_jump_steps": int(cfg.sampling.min_transition_jump_steps()),
-            "transition_jump_steps_max": int(cfg.sampling.max_transition_jump_steps()),
-            "uses_variable_transition_jump": bool(cfg.sampling.uses_variable_transition_jump()),
+            "transition_jump_days_min": float(cfg.sampling.transition_jump_days_min),
+            "transition_jump_days_max": float(cfg.sampling.transition_jump_days_max),
         },
         "geometry": {
             "flip_latitude_to_north_south": bool(cfg.geometry.flip_latitude_to_north_south),
@@ -369,5 +314,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         },
         "items": items,
     }
-    (dataset_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (dataset_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
     return manifest

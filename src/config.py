@@ -20,6 +20,8 @@ SECONDS_PER_DAY = 86400.0
 MIN_TRANSITIONS = 1
 PROBABILITY_MIN = 0.0
 PROBABILITY_MAX = 1.0
+DEFAULT_SCHEDULER_MIN_LR_RATIO = 50.0
+DEFAULT_SCHEDULER_EPS = 1.0e-10
 
 TransformName = Literal["none", "log10", "signed_log1p"]
 
@@ -34,7 +36,7 @@ CONDITIONING_PARAM_NAMES = (
     "taudrag_s",
     "g_m_s2",
 )
-TRANSITION_TIME_NAME = "transition_days"
+TRANSITION_TIME_NAME = "log10_transition_days"
 USER_CORE_PARAM_NAMES = (
     "a_m",
     "omega_rad_s",
@@ -139,30 +141,27 @@ class ParameterSpec:
 
 @dataclass(frozen=True)
 class SamplingConfig:
-    """Sampling strategy for raw simulation generation."""
+    """Sampling strategy for raw simulation generation.
+
+    Transition pairs are sampled with log-uniform time jumps between
+    ``transition_jump_days_min`` and ``transition_jump_days_max``.  Each
+    transition within a single simulation may use a different jump duration,
+    enabling the model to learn dynamics at all timescales — from fast
+    transients to slow relaxation toward equilibrium.
+
+    Setting ``burn_in_days`` to 0 allows anchor times at the very start of
+    the simulation (right after the numerical warm-up controlled by
+    ``solver.starttime_index``).  This is essential for training the model
+    to evolve an arbitrary initial state toward equilibrium.
+    """
 
     seed: int = 0
     n_sims: int = 500
-    generation_workers: int = 0
-    burn_in_days: float = 5.0
+    burn_in_days: float = 0.0
     transitions_per_simulation: int = 128
-    transition_jump_steps: int = 1
-    transition_jump_steps_max: Optional[int] = None
+    transition_jump_days_min: float = 0.1
+    transition_jump_days_max: float = 100.0
     parameters: List[ParameterSpec] = field(default_factory=list)
-
-    def min_transition_jump_steps(self) -> int:
-        """Return the minimum sampled transition jump in solver steps."""
-        return int(self.transition_jump_steps)
-
-    def max_transition_jump_steps(self) -> int:
-        """Return the maximum sampled transition jump in solver steps."""
-        if self.transition_jump_steps_max is None:
-            return int(self.transition_jump_steps)
-        return int(self.transition_jump_steps_max)
-
-    def uses_variable_transition_jump(self) -> bool:
-        """Return True when jump duration is sampled from a non-degenerate range."""
-        return self.max_transition_jump_steps() > self.min_transition_jump_steps()
 
 
 @dataclass(frozen=True)
@@ -209,11 +208,12 @@ class ModelConfig:
 class SchedulerConfig:
     """Learning-rate scheduler hyperparameters."""
 
-    type: str = "cosine_warmup"
-    warmup_epochs: int = 5
+    type: str = "plateau"
+    warmup_epochs: int = 10
     factor: float = 0.5
     patience: int = 10
-    min_lr: float = 1e-6
+    min_lr: float = 0.0
+    eps: float = DEFAULT_SCHEDULER_EPS
 
 
 @dataclass(frozen=True)
@@ -266,11 +266,10 @@ GEOMETRY_KEYS = {"flip_latitude_to_north_south", "roll_longitude_to_0_2pi"}
 SAMPLING_KEYS = {
     "seed",
     "n_sims",
-    "generation_workers",
     "burn_in_days",
     "transitions_per_simulation",
-    "transition_jump_steps",
-    "transition_jump_steps_max",
+    "transition_jump_days_min",
+    "transition_jump_days_max",
     "parameters",
 }
 PARAM_SPEC_KEYS = {"name", "dist", "min", "max", "value", "p_off", "off_value", "on_min", "on_max"}
@@ -315,7 +314,7 @@ TRAINING_KEYS = {
     "split_seed",
     "scheduler",
 }
-SCHEDULER_KEYS = {"type", "warmup_epochs", "factor", "patience", "min_lr"}
+SCHEDULER_KEYS = {"type", "warmup_epochs", "factor", "patience", "min_lr", "eps"}
 
 
 def _load_raw_config(config_path: Path) -> Dict[str, Any]:
@@ -413,15 +412,10 @@ def _parse_sampling(d: Dict[str, Any]) -> SamplingConfig:
     return SamplingConfig(
         seed=int(d.get("seed", 0)),
         n_sims=int(d.get("n_sims", 500)),
-        generation_workers=int(d.get("generation_workers", 0)),
-        burn_in_days=float(d.get("burn_in_days", 5.0)),
+        burn_in_days=float(d.get("burn_in_days", 0.0)),
         transitions_per_simulation=int(d.get("transitions_per_simulation", 128)),
-        transition_jump_steps=int(d.get("transition_jump_steps", 1)),
-        transition_jump_steps_max=(
-            None
-            if d.get("transition_jump_steps_max") is None
-            else int(d.get("transition_jump_steps_max"))
-        ),
+        transition_jump_days_min=float(d.get("transition_jump_days_min", 0.1)),
+        transition_jump_days_max=float(d.get("transition_jump_days_max", 100.0)),
         parameters=[_parse_parameter_spec(item) for item in params_raw],
     )
 
@@ -487,22 +481,47 @@ def _parse_model(d: Dict[str, Any]) -> ModelConfig:
     )
 
 
-def _parse_scheduler(d: Dict[str, Any]) -> SchedulerConfig:
+def _parse_scheduler(
+    d: Dict[str, Any],
+    *,
+    learning_rate: float,
+    raw_scheduler: Optional[Dict[str, Any]] = None,
+) -> SchedulerConfig:
     """Parse the optional scheduler subsection."""
+    scheduler_type = str(d.get("type", "plateau"))
+    raw_scheduler = raw_scheduler or {}
+    if "min_lr" in raw_scheduler:
+        min_lr = float(raw_scheduler["min_lr"])
+    elif scheduler_type == "none":
+        min_lr = 0.0
+    else:
+        min_lr = float(learning_rate) / float(DEFAULT_SCHEDULER_MIN_LR_RATIO)
     return SchedulerConfig(
-        type=str(d.get("type", "cosine_warmup")),
-        warmup_epochs=int(d.get("warmup_epochs", 5)),
+        type=scheduler_type,
+        warmup_epochs=int(d.get("warmup_epochs", 10)),
         factor=float(d.get("factor", 0.5)),
         patience=int(d.get("patience", 10)),
-        min_lr=float(d.get("min_lr", 1e-6)),
+        min_lr=min_lr,
+        eps=float(d.get("eps", DEFAULT_SCHEDULER_EPS)),
     )
 
 
-def _parse_training(d: Dict[str, Any]) -> TrainingConfig:
+def _parse_training(
+    d: Dict[str, Any],
+    *,
+    raw_training: Optional[Dict[str, Any]] = None,
+) -> TrainingConfig:
     """Parse the ``training`` section."""
     scheduler_raw = d.get("scheduler", {})
     if not isinstance(scheduler_raw, dict):
         raise ValueError("training.scheduler must be an object")
+    raw_training = raw_training or {}
+    raw_scheduler = raw_training.get("scheduler", {})
+    if raw_scheduler is None:
+        raw_scheduler = {}
+    if not isinstance(raw_scheduler, dict):
+        raise ValueError("training.scheduler must be an object")
+    learning_rate = float(d.get("learning_rate", 3e-4))
     return TrainingConfig(
         seed=int(d.get("seed", 0)),
         device=str(d.get("device", "auto")),
@@ -517,12 +536,16 @@ def _parse_training(d: Dict[str, Any]) -> TrainingConfig:
             d.get("preload_to_gpu", False),
             field_name="training.preload_to_gpu",
         ),
-        learning_rate=float(d.get("learning_rate", 3e-4)),
+        learning_rate=learning_rate,
         weight_decay=float(d.get("weight_decay", 0.0)),
         val_fraction=float(d.get("val_fraction", 0.1)),
         test_fraction=float(d.get("test_fraction", 0.1)),
         split_seed=int(d.get("split_seed", 0)),
-        scheduler=_parse_scheduler(scheduler_raw),
+        scheduler=_parse_scheduler(
+            scheduler_raw,
+            learning_rate=learning_rate,
+            raw_scheduler=raw_scheduler,
+        ),
     )
 
 
@@ -541,7 +564,10 @@ def load_config(config_path: Path) -> GCMulatorConfig:
         sampling=_parse_sampling(merged.get("sampling", {})),
         normalization=_parse_norm(merged.get("normalization", {})),
         model=_parse_model(merged.get("model", {})),
-        training=_parse_training(merged.get("training", {})),
+        training=_parse_training(
+            merged.get("training", {}),
+            raw_training=raw.get("training", {}),
+        ),
     )
     validate_config(cfg)
     return cfg
@@ -565,50 +591,29 @@ def validate_config(cfg: GCMulatorConfig) -> None:
 
     if cfg.sampling.n_sims < 1:
         raise ValueError("sampling.n_sims must be >= 1")
-    if cfg.sampling.generation_workers < 0:
-        raise ValueError("sampling.generation_workers must be >= 0")
     if cfg.sampling.burn_in_days < 0:
         raise ValueError("sampling.burn_in_days must be >= 0")
     if cfg.sampling.transitions_per_simulation < MIN_TRANSITIONS:
         raise ValueError(f"sampling.transitions_per_simulation must be >= {MIN_TRANSITIONS}")
-    if cfg.sampling.transition_jump_steps < MIN_TRANSITIONS:
-        raise ValueError(f"sampling.transition_jump_steps must be >= {MIN_TRANSITIONS}")
-    if (
-        cfg.sampling.transition_jump_steps_max is not None
-        and cfg.sampling.transition_jump_steps_max < cfg.sampling.transition_jump_steps
-    ):
+    if cfg.sampling.transition_jump_days_min <= 0:
+        raise ValueError("sampling.transition_jump_days_min must be > 0")
+    if cfg.sampling.transition_jump_days_max <= 0:
+        raise ValueError("sampling.transition_jump_days_max must be > 0")
+    if cfg.sampling.transition_jump_days_min >= cfg.sampling.transition_jump_days_max:
         raise ValueError(
-            "sampling.transition_jump_steps_max must be >= "
-            "sampling.transition_jump_steps"
+            "sampling.transition_jump_days_min must be < "
+            "sampling.transition_jump_days_max"
         )
     _validate_parameter_specs(cfg.sampling.parameters)
 
-    total_steps = max(
-        MIN_TRANSITIONS,
-        int(
-            round(
-                float(cfg.solver.default_time_days)
-                * SECONDS_PER_DAY
-                / float(cfg.solver.dt_seconds)
-            )
-        ),
-    )
-    burn_in_steps = int(
-        round(
-            float(cfg.sampling.burn_in_days)
-            * SECONDS_PER_DAY
-            / float(cfg.solver.dt_seconds)
-        )
-    )
-    max_window_start = (
-        total_steps
-        - int(cfg.sampling.max_transition_jump_steps())
-        * int(cfg.sampling.transitions_per_simulation)
-    )
-    if max_window_start < burn_in_steps:
+    burn_in_days = float(cfg.sampling.burn_in_days)
+    min_jump_days = float(cfg.sampling.transition_jump_days_min)
+    available_days = float(cfg.solver.default_time_days) - burn_in_days
+    if available_days < min_jump_days:
         raise ValueError(
-            "sampling window does not fit within the configured horizon after burn-in: "
-            f"burn_in_steps={burn_in_steps}, max_window_start={max_window_start}"
+            "No valid post-burn-in transition window exists: "
+            f"available_days={available_days:.2f}, "
+            f"min_jump_days={min_jump_days:.2f}"
         )
 
     if cfg.normalization.state.zscore_eps <= 0:
@@ -675,6 +680,8 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("training.scheduler.min_lr must be >= 0")
     if cfg.training.scheduler.min_lr > cfg.training.learning_rate:
         raise ValueError("training.scheduler.min_lr must be <= training.learning_rate")
+    if cfg.training.scheduler.eps <= 0:
+        raise ValueError("training.scheduler.eps must be > 0")
 
     if cfg.model.grid != "legendre-gauss":
         raise ValueError("model.grid must be 'legendre-gauss'")

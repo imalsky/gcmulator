@@ -39,10 +39,6 @@ from modeling import (
     choose_device,
     ensure_torch_harmonics_importable,
 )
-from my_swamp_backend import (
-    ensure_my_swamp_importable,
-    reconstruct_full_state_from_prognostics,
-)
 from normalization import (
     NormalizationStats,
     ParamNormalizationStats,
@@ -57,12 +53,11 @@ from normalization import (
     stats_to_json,
     subset_state_stats,
 )
-from sampling import vector_to_extended9
 
 
 LOGGER = logging.getLogger("train")
 
-PREPROCESS_FINGERPRINT_VERSION = 12
+PREPROCESS_FINGERPRINT_VERSION = 13
 RAW_REQUIRED_KEYS = (
     "state_inputs",
     "state_targets",
@@ -76,8 +71,8 @@ RAW_REQUIRED_KEYS = (
     "burn_in_days",
     "dt_seconds",
     "starttime_index",
-    "transition_jump_steps",
-    "anchor_stride_steps",
+    "transition_jump_days_min",
+    "transition_jump_days_max",
     "n_transitions",
     "M",
     "nlat",
@@ -86,6 +81,7 @@ RAW_REQUIRED_KEYS = (
     "lon_origin",
     "lon_shift",
 )
+EARLY_STOPPING_PATIENCE_MULTIPLIER = 3
 
 
 def _load_npy_payload_dict(file_path: Path) -> Dict[str, Any]:
@@ -174,8 +170,12 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
     burn_in_days = float(np.asarray(payload["burn_in_days"], dtype=np.float64).item())
     dt_seconds = float(np.asarray(payload["dt_seconds"], dtype=np.float64).item())
     starttime_index = int(np.asarray(payload["starttime_index"], dtype=np.int64).item())
-    transition_jump_steps = int(np.asarray(payload["transition_jump_steps"], dtype=np.int64).item())
-    anchor_stride_steps = int(np.asarray(payload["anchor_stride_steps"], dtype=np.int64).item())
+    transition_jump_days_min = float(
+        np.asarray(payload["transition_jump_days_min"], dtype=np.float64).item()
+    )
+    transition_jump_days_max = float(
+        np.asarray(payload["transition_jump_days_max"], dtype=np.float64).item()
+    )
     n_transitions = int(np.asarray(payload["n_transitions"], dtype=np.int64).item())
     M = int(np.asarray(payload["M"], dtype=np.int64).item())
     nlat = int(np.asarray(payload["nlat"], dtype=np.int64).item())
@@ -236,52 +236,33 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
             f"Raw file {file_path} has starttime_index={starttime_index}, "
             f"expected {cfg.solver.starttime_index}"
         )
-    if not (
-        int(cfg.sampling.min_transition_jump_steps())
-        <= transition_jump_steps
-        <= int(cfg.sampling.max_transition_jump_steps())
+    if not math.isclose(
+        transition_jump_days_min,
+        float(cfg.sampling.transition_jump_days_min),
+        rel_tol=0.0,
+        abs_tol=0.0,
     ):
         raise ValueError(
-            f"Raw file {file_path} has transition_jump_steps={transition_jump_steps}, "
-            "outside the configured range "
-            f"[{cfg.sampling.min_transition_jump_steps()}, "
-            f"{cfg.sampling.max_transition_jump_steps()}]"
+            f"Raw file {file_path} has transition_jump_days_min={transition_jump_days_min}, "
+            f"expected {cfg.sampling.transition_jump_days_min}"
         )
-    if anchor_stride_steps != transition_jump_steps:
+    if not math.isclose(
+        transition_jump_days_max,
+        float(cfg.sampling.transition_jump_days_max),
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
         raise ValueError(
-            f"Raw file {file_path} has anchor_stride_steps={anchor_stride_steps}, "
-            f"expected {transition_jump_steps}"
+            f"Raw file {file_path} has transition_jump_days_max={transition_jump_days_max}, "
+            f"expected {cfg.sampling.transition_jump_days_max}"
         )
     if n_transitions != int(cfg.sampling.transitions_per_simulation):
         raise ValueError(
             f"Raw file {file_path} has n_transitions={n_transitions}, "
             f"expected {cfg.sampling.transitions_per_simulation}"
         )
-    expected_transition_days = (
-        float(transition_jump_steps) * float(dt_seconds) / 86400.0
-    )
-    if not np.allclose(
-        transition_days,
-        np.full_like(transition_days, fill_value=expected_transition_days),
-        rtol=0.0,
-        atol=0.0,
-    ):
-        raise ValueError(
-            f"Raw file {file_path} has transition_days inconsistent with "
-            f"transition_jump_steps={transition_jump_steps}"
-        )
-    if anchor_steps.size > 1 and not np.array_equal(
-        np.diff(anchor_steps),
-        np.full(
-            (anchor_steps.size - 1,),
-            fill_value=anchor_stride_steps,
-            dtype=np.int64,
-        ),
-    ):
-        raise ValueError(
-            f"Raw file {file_path} does not use the expected anchor stride "
-            f"{anchor_stride_steps}"
-        )
+    if np.any(transition_days <= 0.0):
+        raise ValueError(f"Raw file {file_path} contains non-positive transition_days")
 
     expected_geometry = _expected_geometry(cfg, nlon=nlon)
     if lat_order != expected_geometry["lat_order"] or lon_origin != expected_geometry["lon_origin"]:
@@ -308,8 +289,8 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
         "burn_in_days": burn_in_days,
         "dt_seconds": dt_seconds,
         "starttime_index": starttime_index,
-        "transition_jump_steps": transition_jump_steps,
-        "anchor_stride_steps": anchor_stride_steps,
+        "transition_jump_days_min": transition_jump_days_min,
+        "transition_jump_days_max": transition_jump_days_max,
         "n_transitions": n_transitions,
         "M": M,
         "nlat": nlat,
@@ -335,8 +316,8 @@ def _raw_file_signature(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str, A
         "burn_in_days": float(metadata["burn_in_days"]),
         "dt_seconds": float(metadata["dt_seconds"]),
         "starttime_index": int(metadata["starttime_index"]),
-        "transition_jump_steps": int(metadata["transition_jump_steps"]),
-        "anchor_stride_steps": int(metadata["anchor_stride_steps"]),
+        "transition_jump_days_min": float(metadata["transition_jump_days_min"]),
+        "transition_jump_days_max": float(metadata["transition_jump_days_max"]),
         "n_transitions": int(metadata["n_transitions"]),
         "nlat": int(metadata["nlat"]),
         "nlon": int(metadata["nlon"]),
@@ -482,16 +463,18 @@ def _fit_stats_streaming(
             delta2 = params - param_mean
             param_m2 += delta * delta2
 
-        transition_days = payload["transition_days"].astype(np.float64, copy=False).reshape(-1, 1)
-        transition_chunk_sum = transition_days.sum(axis=0)
-        transition_chunk_sum2 = (transition_days * transition_days).sum(axis=0)
+        log10_transition_days = np.log10(
+            np.maximum(payload["transition_days"].astype(np.float64, copy=False), 1.0e-30)
+        ).reshape(-1, 1)
+        transition_chunk_sum = log10_transition_days.sum(axis=0)
+        transition_chunk_sum2 = (log10_transition_days * log10_transition_days).sum(axis=0)
         if transition_time_sum is None:
             transition_time_sum = transition_chunk_sum
             transition_time_sum2 = transition_chunk_sum2
         else:
             transition_time_sum += transition_chunk_sum
             transition_time_sum2 += transition_chunk_sum2
-        transition_time_count += int(transition_days.shape[0])
+        transition_time_count += int(log10_transition_days.shape[0])
 
     if (
         state_sum is None
@@ -953,144 +936,6 @@ def _compute_one_step_metrics(
     }
 
 
-def _resolve_raw_file_from_shard(*, dataset_dir: Path, shard_entry: Dict[str, Any]) -> Path:
-    """Map a processed shard entry back to its raw simulation file."""
-    return (dataset_dir / f"{Path(str(shard_entry['file'])).stem}.npy").resolve()
-
-
-def _compute_rollout_metrics(
-    *,
-    model: torch.nn.Module,
-    shard_entries: Sequence[Dict[str, Any]],
-    dataset_dir: Path,
-    stats: NormalizationStats,
-    cfg: GCMulatorConfig,
-    device: torch.device,
-    amp_mode: str,
-) -> Dict[str, Any]:
-    """Compute free-run rollout metrics over contiguous raw transition windows."""
-    ensure_my_swamp_importable(None)
-
-    prog_sq_sum = np.zeros(len(PROGNOSTIC_TARGET_FIELDS), dtype=np.float64)
-    prog_abs_sum = np.zeros(len(PROGNOSTIC_TARGET_FIELDS), dtype=np.float64)
-    full_sq_sum = np.zeros(len(PHYSICAL_STATE_FIELDS), dtype=np.float64)
-    full_abs_sum = np.zeros(len(PHYSICAL_STATE_FIELDS), dtype=np.float64)
-    prog_count = 0
-    full_count = 0
-    n_windows = 0
-    n_rollout_steps = 0
-
-    model.eval()
-    with torch.no_grad():
-        for shard_entry in shard_entries:
-            raw_file = _resolve_raw_file_from_shard(
-                dataset_dir=dataset_dir,
-                shard_entry=shard_entry,
-            )
-            payload = _validated_raw_payload(raw_file, cfg=cfg)
-            conditioning_norm = normalize_conditioning(
-                payload["params"],
-                payload["transition_days"],
-                param_stats=stats.params,
-                transition_time_stats=stats.transition_time,
-            )
-            params_ext = vector_to_extended9(payload["params"])
-            current_state_phys = np.asarray(payload["state_inputs"][0], dtype=np.float64)
-
-            for step_index in range(int(payload["n_transitions"])):
-                state_input_norm = normalize_state_tensor(
-                    current_state_phys[None, ...],
-                    stats.input_state,
-                ).astype(np.float32)
-                state_input_tensor = torch.from_numpy(state_input_norm).to(device=device)
-                conditioning_tensor = torch.from_numpy(
-                    conditioning_norm[step_index : step_index + 1].astype(np.float32)
-                ).to(device=device)
-                with autocast_context(device, amp_mode):
-                    pred_target_norm = model(state_input_tensor, conditioning_tensor)
-                pred_target_phys = denormalize_state_tensor(
-                    pred_target_norm.detach().cpu().numpy(),
-                    stats.target_state,
-                )[0].astype(np.float64)
-                true_target_phys = np.asarray(
-                    payload["state_targets"][step_index],
-                    dtype=np.float64,
-                )
-
-                prognostic_diff = pred_target_phys - true_target_phys
-                prog_sq_sum += np.sum(prognostic_diff**2, axis=(1, 2))
-                prog_abs_sum += np.sum(np.abs(prognostic_diff), axis=(1, 2))
-                prog_count += int(pred_target_phys.shape[1] * pred_target_phys.shape[2])
-
-                pred_full_phys = reconstruct_full_state_from_prognostics(
-                    pred_target_phys,
-                    params=params_ext,
-                    M=int(cfg.solver.M),
-                    dt_seconds=float(cfg.solver.dt_seconds),
-                )
-                # Rollout metrics feed predictions back into the visible state to
-                # measure error accumulation over the sampled window.
-                if step_index + 1 < int(payload["n_transitions"]):
-                    true_full_phys = np.asarray(
-                        payload["state_inputs"][step_index + 1],
-                        dtype=np.float64,
-                    )
-                else:
-                    true_full_phys = reconstruct_full_state_from_prognostics(
-                        true_target_phys,
-                        params=params_ext,
-                        M=int(cfg.solver.M),
-                        dt_seconds=float(cfg.solver.dt_seconds),
-                    )
-
-                full_diff = pred_full_phys - true_full_phys
-                full_sq_sum += np.sum(full_diff**2, axis=(1, 2))
-                full_abs_sum += np.sum(np.abs(full_diff), axis=(1, 2))
-                full_count += int(pred_full_phys.shape[1] * pred_full_phys.shape[2])
-
-                current_state_phys = pred_full_phys
-                n_rollout_steps += 1
-
-            n_windows += 1
-
-    return {
-        "n_windows": int(n_windows),
-        "n_rollout_steps": int(n_rollout_steps),
-        "prognostic_physical": {
-            "global_rmse": float(
-                np.sqrt(
-                    np.sum(prog_sq_sum)
-                    / float(prog_count * len(PROGNOSTIC_TARGET_FIELDS))
-                )
-            ),
-            "per_channel_rmse": _named_scalar_map(
-                np.sqrt(prog_sq_sum / float(prog_count)),
-                PROGNOSTIC_TARGET_FIELDS,
-            ),
-            "per_channel_mae": _named_scalar_map(
-                prog_abs_sum / float(prog_count),
-                PROGNOSTIC_TARGET_FIELDS,
-            ),
-        },
-        "full_state_physical": {
-            "global_rmse": float(
-                np.sqrt(
-                    np.sum(full_sq_sum)
-                    / float(full_count * len(PHYSICAL_STATE_FIELDS))
-                )
-            ),
-            "per_channel_rmse": _named_scalar_map(
-                np.sqrt(full_sq_sum / float(full_count)),
-                PHYSICAL_STATE_FIELDS,
-            ),
-            "per_channel_mae": _named_scalar_map(
-                full_abs_sum / float(full_count),
-                PHYSICAL_STATE_FIELDS,
-            ),
-        },
-    }
-
-
 def _write_training_history_csv(*, history: Sequence[Dict[str, float]], csv_path: Path) -> None:
     """Write per-epoch training history rows to CSV."""
     field_names = ["epoch", "train_loss", "val_loss", "lr"]
@@ -1143,6 +988,19 @@ def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         group["lr"] = float(lr)
 
 
+def _linear_warmup_lr(*, epoch: int, base_lr: float, warmup_epochs: int) -> float:
+    """Compute a linear warmup that reaches the base LR at the last warmup epoch."""
+    if warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be >= 0")
+    if base_lr <= 0:
+        raise ValueError("base_lr must be > 0")
+    if warmup_epochs == 0:
+        return float(base_lr)
+    e = max(1, int(epoch))
+    progress = float(min(e, warmup_epochs)) / float(warmup_epochs)
+    return float(base_lr) * progress
+
+
 def _cosine_warmup_lr(
     *,
     epoch: int,
@@ -1176,6 +1034,26 @@ def _cosine_warmup_lr(
     return float(min_lr) + (float(base_lr) - float(min_lr)) * cosine
 
 
+def _loss_improved(*, current: float, best: float, min_delta: float) -> bool:
+    """Return whether the monitored loss improved beyond the absolute tolerance."""
+    if min_delta <= 0:
+        raise ValueError("min_delta must be > 0")
+    return float(current) < float(best) - float(min_delta)
+
+
+def _early_stopping_patience(*, scheduler_patience: int, warmup_epochs: int) -> int:
+    """Choose a conservative patience that still leaves room for LR reductions."""
+    if scheduler_patience < 0:
+        raise ValueError("scheduler_patience must be >= 0")
+    if warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be >= 0")
+    return max(
+        1,
+        int(warmup_epochs) + int(scheduler_patience),
+        int(scheduler_patience) * EARLY_STOPPING_PATIENCE_MULTIPLIER,
+    )
+
+
 def _set_determinism(seed: int) -> None:
     """Apply reproducible random-seed and deterministic-kernel settings."""
     np.random.seed(int(seed))
@@ -1191,10 +1069,8 @@ def _set_determinism(seed: int) -> None:
 def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
     """Train the transition emulator end-to-end and persist artifacts."""
     ensure_torch_harmonics_importable()
-    ensure_my_swamp_importable(None)
     processed_meta = preprocess_dataset(cfg, config_path=config_path)
     processed_dir = resolve_path(config_path, cfg.paths.processed_dir)
-    dataset_dir = resolve_path(config_path, cfg.paths.dataset_dir)
     model_dir = resolve_path(config_path, cfg.paths.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1336,14 +1212,21 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         weight_decay=float(cfg.training.weight_decay),
     )
     scheduler_type = str(cfg.training.scheduler.type)
+    scheduler_patience = int(cfg.training.scheduler.patience)
+    scheduler_min_lr = float(cfg.training.scheduler.min_lr)
+    scheduler_eps = float(cfg.training.scheduler.eps)
+    warmup_epochs = int(cfg.training.scheduler.warmup_epochs)
     scheduler = None
     if scheduler_type == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
             factor=float(cfg.training.scheduler.factor),
-            patience=int(cfg.training.scheduler.patience),
-            min_lr=float(cfg.training.scheduler.min_lr),
+            patience=scheduler_patience,
+            threshold=scheduler_eps,
+            threshold_mode="abs",
+            min_lr=scheduler_min_lr,
+            eps=scheduler_eps,
         )
 
     scaler = None
@@ -1356,6 +1239,11 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     last_path = model_dir / "last.pt"
     history: List[Dict[str, float]] = []
     base_learning_rate = float(cfg.training.learning_rate)
+    epochs_without_improvement = 0
+    early_stop_patience = _early_stopping_patience(
+        scheduler_patience=scheduler_patience,
+        warmup_epochs=warmup_epochs,
+    )
 
     # ------------------------------------------------------------------
     # Optimization loop
@@ -1368,8 +1256,17 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                     epoch=epoch,
                     total_epochs=epochs,
                     base_lr=base_learning_rate,
-                    min_lr=float(cfg.training.scheduler.min_lr),
-                    warmup_epochs=int(cfg.training.scheduler.warmup_epochs),
+                    min_lr=scheduler_min_lr,
+                    warmup_epochs=warmup_epochs,
+                ),
+            )
+        elif scheduler_type == "plateau" and warmup_epochs > 0 and epoch <= warmup_epochs:
+            _set_optimizer_lr(
+                optimizer,
+                _linear_warmup_lr(
+                    epoch=epoch,
+                    base_lr=base_learning_rate,
+                    warmup_epochs=warmup_epochs,
                 ),
             )
 
@@ -1440,7 +1337,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             raise RuntimeError("No training or validation batches were produced")
         train_loss = train_loss_sum / float(train_count)
         val_loss = val_loss_sum / float(val_count)
-        if scheduler is not None:
+        if scheduler is not None and epoch > warmup_epochs:
             scheduler.step(val_loss)
 
         current_lr = float(optimizer.param_groups[0]["lr"])
@@ -1491,9 +1388,23 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             "learning_rate": float(current_lr),
         }
         torch.save(checkpoint, last_path)
-        if val_loss < best_val:
+        if _loss_improved(current=val_loss, best=best_val, min_delta=scheduler_eps):
             best_val = val_loss
+            epochs_without_improvement = 0
             torch.save(checkpoint, best_path)
+        else:
+            epochs_without_improvement += 1
+
+        if epoch < epochs and epochs_without_improvement >= early_stop_patience:
+            LOGGER.info(
+                "Early stopping at epoch %4d/%4d after %d epochs without "
+                "validation improvement larger than %.1e",
+                epoch,
+                epochs,
+                epochs_without_improvement,
+                scheduler_eps,
+            )
+            break
 
     best_checkpoint = torch.load(best_path, map_location=device)
     model.load_state_dict(best_checkpoint["model_state"], strict=True)
@@ -1509,42 +1420,20 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         device=device,
         amp_mode=runtime_amp_mode,
     )
-    val_metrics = {
-        "one_step": _compute_one_step_metrics(
-            pred_norm=val_pred,
-            target_norm=val_target,
-            field_names=target_field_names,
-            state_stats=stats.target_state,
-            grid=cfg.model.grid,
-        ),
-        "rollout": _compute_rollout_metrics(
-            model=model,
-            shard_entries=processed_meta["splits"]["val"],
-            dataset_dir=dataset_dir,
-            stats=stats,
-            cfg=cfg,
-            device=device,
-            amp_mode=runtime_amp_mode,
-        ),
-    }
-    test_metrics = {
-        "one_step": _compute_one_step_metrics(
-            pred_norm=test_pred,
-            target_norm=test_target,
-            field_names=target_field_names,
-            state_stats=stats.target_state,
-            grid=cfg.model.grid,
-        ),
-        "rollout": _compute_rollout_metrics(
-            model=model,
-            shard_entries=processed_meta["splits"]["test"],
-            dataset_dir=dataset_dir,
-            stats=stats,
-            cfg=cfg,
-            device=device,
-            amp_mode=runtime_amp_mode,
-        ),
-    }
+    val_metrics = _compute_one_step_metrics(
+        pred_norm=val_pred,
+        target_norm=val_target,
+        field_names=target_field_names,
+        state_stats=stats.target_state,
+        grid=cfg.model.grid,
+    )
+    test_metrics = _compute_one_step_metrics(
+        pred_norm=test_pred,
+        target_norm=test_target,
+        field_names=target_field_names,
+        state_stats=stats.target_state,
+        grid=cfg.model.grid,
+    )
 
     (model_dir / "training_history.json").write_text(
         json.dumps(history, indent=2),
