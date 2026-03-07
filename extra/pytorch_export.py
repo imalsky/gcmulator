@@ -1,4 +1,15 @@
-"""Export a trained direct-jump GCMulator checkpoint as a physical-space TorchScript module."""
+"""Export a trained direct-jump checkpoint as a portable TorchScript bundle.
+
+The saved export is intended to be the easy-to-use inference artifact:
+
+1. ``model_export.torchscript.pt`` contains a physical-I/O forward pass with
+   all normalization transforms embedded as Torch buffers
+2. ``model_export.meta.json`` contains the runtime contract and the same
+   normalization metadata in JSON form for validation and tooling
+
+The retrieval runtime should be able to use the exported bundle directly,
+without rebuilding the model architecture from the checkpoint.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +33,14 @@ from config import TRANSITION_TIME_NAME
 from modeling import build_state_conditioned_transition_model, ensure_torch_harmonics_importable
 
 
+# ---------------------------------------------------------------------------
+# User-editable export settings
+#
+# In the common case you only need to change:
+# 1. RUN_NAME or CHECKPOINT_PATH
+# 2. DEVICE_MODE ("cpu" or "gpu")
+# 3. OUTPUT_PATH / META_OUTPUT_PATH if you do not want the default run folder
+# ---------------------------------------------------------------------------
 EXPORT_NAME = "model_export.torchscript.pt"
 EXPORT_META_NAME = "model_export.meta.json"
 EXAMPLE_BATCH_SIZE = 1
@@ -30,7 +49,10 @@ SUPPRESS_KNOWN_EXPORT_WARNINGS = True
 RUN_NAME = "v1"
 RUN_DIR: Path | None = (PROJECT_ROOT / "models" / RUN_NAME).resolve()
 CHECKPOINT_PATH: Path | None = None
-DEVICE_MODE = "auto"
+
+# Keep the device choice explicit for now. Supported values are only "cpu" and
+# "gpu" so the saved metadata is unambiguous for downstream users.
+DEVICE_MODE = "cpu"
 OUTPUT_PATH: Path | None = None
 META_OUTPUT_PATH: Path | None = None
 
@@ -67,18 +89,14 @@ def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -
 
 
 def _resolve_device(mode: str) -> torch.device:
-    """Resolve export device."""
+    """Resolve export device from the explicit ``cpu`` / ``gpu`` setting."""
     normalized = str(mode).lower()
     if normalized == "cpu":
         return torch.device("cpu")
     if normalized == "gpu":
         if not torch.cuda.is_available():
-            raise RuntimeError("Requested --device=gpu but CUDA is unavailable")
+            raise RuntimeError("Requested DEVICE_MODE='gpu' but CUDA is unavailable")
         return torch.device("cuda")
-    if normalized == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
     raise ValueError(f"Unsupported device mode: {mode}")
 
 
@@ -525,11 +543,12 @@ def main() -> None:
     core_model.to(device=device).eval()
 
     normalization = dict(ckpt["normalization"])
-    input_state_stats = dict(normalization["input_state"])
     params_stats = dict(normalization["params"])
     transition_time_stats = _require_transition_time_stats(normalization)
 
     with torch.inference_mode():
+        # Use normalization means as representative physical-space values so the
+        # traced graph stays valid without needing a real simulation sample.
         example_params = torch.tensor(
             params_stats["mean"],
             dtype=torch.float32,
@@ -541,49 +560,18 @@ def main() -> None:
             dtype=torch.float32,
             device=device,
         ).reshape(1).repeat(int(EXAMPLE_BATCH_SIZE))
-        input_state_mean = torch.tensor(
-            input_state_stats["mean"],
-            dtype=torch.float32,
-            device=device,
-        )
-        input_state_std = torch.tensor(
-            input_state_stats["std"],
-            dtype=torch.float32,
-            device=device,
-        )
-        input_state_mode_codes = torch.tensor(
-            _build_state_mode_codes(
-                fields=input_fields,
-                field_transforms=dict(input_state_stats.get("field_transforms", {})),
-            ),
-            dtype=torch.int64,
-            device=device,
-        )
-        zero_norm = torch.zeros(
-            (
-                int(EXAMPLE_BATCH_SIZE),
-                int(input_state_mean.numel()),
-                int(shape["H"]),
-                int(shape["W"]),
-            ),
-            dtype=torch.float32,
-            device=device,
-        )
-        example_state = _denormalize_state_with_stats(
-            zero_norm,
-            mean=input_state_mean,
-            std=input_state_std,
-            mode_codes=input_state_mode_codes,
-            zscore_eps=float(input_state_stats["zscore_eps"]),
-            signed_log1p_scale=float(input_state_stats["signed_log1p_scale"]),
-        )
-
         export_model = PhysicalStateExportModule(
             model=core_model,
             normalization=normalization,
             input_fields=input_fields,
             target_fields=target_fields,
         ).to(device=device).eval()
+        example_state = export_model.example_state(
+            batch_size=int(EXAMPLE_BATCH_SIZE),
+            height=int(shape["H"]),
+            width=int(shape["W"]),
+            device=device,
+        )
         reference_output = export_model(
             example_state,
             example_params,
@@ -611,11 +599,35 @@ def main() -> None:
     if max_abs_diff > 1.0e-4:
         raise RuntimeError(f"Export verification failed: max_abs_diff={max_abs_diff:.3e}")
 
+    # Keep the metadata self-contained so downstream inference code can use the
+    # exported bundle directly, without having to reach back into the checkpoint.
     meta = {
+        "artifact_kind": "direct_jump_physical_state_transition",
         "export_format": "torchscript",
         "checkpoint_path": str(ckpt_path),
         "export_path": str(export_path),
         "device": str(device),
+        "supported_devices": ["cpu", "gpu"],
+        "runtime_hints": {
+            "optimize_on_load": True,
+            "prefer_channels_last": True,
+            "allow_tf32_on_gpu": True,
+            "transition_time_feature": TRANSITION_TIME_NAME,
+            "normalization_embedded_in_export": True,
+            "normalization_embedded_in_metadata": True,
+        },
+        "physical_io": {
+            "state0": True,
+            "params": True,
+            "transition_days": True,
+            "state1": True,
+        },
+        "shape": {
+            "input_C": int(shape["input_C"]),
+            "target_C": int(shape["target_C"]),
+            "H": int(shape["H"]),
+            "W": int(shape["W"]),
+        },
         "input": {
             "state0": ["batch", int(shape["input_C"]), int(shape["H"]), int(shape["W"])],
             "params": ["batch", int(len(ckpt["param_names"]))],
@@ -628,6 +640,8 @@ def main() -> None:
         },
         "param_names": list(ckpt["param_names"]),
         "conditioning_names": list(ckpt["conditioning_names"]),
+        "solver": dict(ckpt["solver"]),
+        "sampling": dict(ckpt["sampling"]),
         "normalization": dict(ckpt["normalization"]),
         "verification": {
             "max_abs_diff_vs_reference": max_abs_diff,

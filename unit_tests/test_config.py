@@ -84,10 +84,12 @@ def _minimal_config_dict() -> dict[str, object]:
             "seed": 0,
             "device": "cpu",
             "amp_mode": "none",
+            "deterministic": True,
             "optimizer": "adamw",
             "epochs": 1,
             "batch_size": 1,
             "num_workers": 0,
+            "prefetch_factor": 2,
             "shuffle": True,
             "pin_memory": False,
             "preload_to_gpu": False,
@@ -164,15 +166,37 @@ def test_load_config_defaults_to_plateau_with_relative_min_lr(tmp_path: Path) ->
     payload = _minimal_config_dict()
     training_section = dict(payload["training"])
     training_section.pop("scheduler")
+    training_section.pop("deterministic")
     training_section["learning_rate"] = 1.0e-3
     payload["training"] = training_section
 
     config_path = _write_config(tmp_path, payload)
     cfg = load_config(config_path)
 
+    assert cfg.training.deterministic is False
     assert cfg.training.scheduler.type == "plateau"
     assert cfg.training.scheduler.warmup_epochs == 10
     assert cfg.training.scheduler.factor == pytest.approx(0.5)
     assert cfg.training.scheduler.patience == 10
     assert cfg.training.scheduler.min_lr == pytest.approx(2.0e-5)
     assert cfg.training.scheduler.eps == pytest.approx(1.0e-10)
+
+
+def test_load_config_accepts_training_throughput_flags(tmp_path: Path) -> None:
+    """Training throughput knobs should round-trip through the config parser."""
+    payload = _minimal_config_dict()
+    training_section = dict(payload["training"])
+    training_section["device"] = "cuda"
+    training_section["deterministic"] = False
+    training_section["num_workers"] = 3
+    training_section["prefetch_factor"] = 6
+    training_section["pin_memory"] = True
+    payload["training"] = training_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    assert cfg.training.deterministic is False
+    assert cfg.training.num_workers == 3
+    assert cfg.training.prefetch_factor == 6
+    assert cfg.training.pin_memory is True

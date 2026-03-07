@@ -941,7 +941,19 @@ def _compute_one_step_metrics(
 
 def _write_training_history_csv(*, history: Sequence[Dict[str, float]], csv_path: Path) -> None:
     """Write per-epoch training history rows to CSV."""
-    field_names = ["epoch", "train_loss", "val_loss", "lr", "epoch_seconds"]
+    field_names = [
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "lr",
+        "train_seconds",
+        "val_seconds",
+        "epoch_seconds",
+        "train_samples",
+        "val_samples",
+        "train_samples_per_second",
+        "val_samples_per_second",
+    ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=field_names)
         writer.writeheader()
@@ -949,19 +961,30 @@ def _write_training_history_csv(*, history: Sequence[Dict[str, float]], csv_path
             writer.writerow(
                 {
                     "epoch": int(round(float(row["epoch"]))),
-                    "train_loss": _format_sigfig(float(row["train_loss"])),
-                    "val_loss": _format_sigfig(float(row["val_loss"])),
-                    "lr": _format_sigfig(float(row["lr"])),
-                    "epoch_seconds": f"{float(row['epoch_seconds']):.2f}",
+                    "train_loss": _format_scientific(float(row["train_loss"])),
+                    "val_loss": _format_scientific(float(row["val_loss"])),
+                    "lr": _format_scientific(float(row["lr"])),
+                    "train_seconds": _format_scientific(float(row["train_seconds"])),
+                    "val_seconds": _format_scientific(float(row["val_seconds"])),
+                    "epoch_seconds": _format_scientific(float(row["epoch_seconds"])),
+                    "train_samples": _format_scientific(float(row["train_samples"])),
+                    "val_samples": _format_scientific(float(row["val_samples"])),
+                    "train_samples_per_second": _format_scientific(
+                        float(row["train_samples_per_second"])
+                    ),
+                    "val_samples_per_second": _format_scientific(
+                        float(row["val_samples_per_second"])
+                    ),
                 }
             )
 
 
-def _format_sigfig(value: float, *, digits: int = 4) -> str:
-    """Format one scalar with a fixed number of significant figures."""
+def _format_scientific(value: float, *, digits: int = 4) -> str:
+    """Format one scalar with fixed significant figures in scientific notation."""
     if digits < 1:
         raise ValueError("digits must be >= 1")
-    return f"{float(value):.{int(digits)}g}"
+    precision = int(digits) - 1
+    return f"{float(value):.{precision}e}"
 
 
 def _check_finite_tensor(tensor: torch.Tensor, *, name: str) -> None:
@@ -1065,16 +1088,19 @@ def _early_stopping_patience(*, scheduler_patience: int, warmup_epochs: int) -> 
     )
 
 
-def _set_determinism(seed: int) -> None:
-    """Apply reproducible random-seed and deterministic-kernel settings."""
+def _set_determinism(*, seed: int, deterministic: bool) -> None:
+    """Apply reproducible random seeds and optional deterministic-kernel settings."""
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.use_deterministic_algorithms(False)
     if torch.backends.cudnn.is_available():
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.benchmark = not bool(deterministic)
 
 
 def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
@@ -1146,7 +1172,10 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     if len(train_dataset) < int(cfg.training.batch_size):
         raise ValueError("Training split size is smaller than batch_size while drop_last=True")
 
-    _set_determinism(int(cfg.training.seed))
+    _set_determinism(
+        seed=int(cfg.training.seed),
+        deterministic=bool(cfg.training.deterministic),
+    )
 
     if preload_to_gpu:
         loader_common: Dict[str, Any] = {"num_workers": 0, "pin_memory": False}
@@ -1157,6 +1186,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         }
         if int(cfg.training.num_workers) > 0:
             loader_common["persistent_workers"] = True
+            loader_common["prefetch_factor"] = int(cfg.training.prefetch_factor)
 
     train_loader = DataLoader(
         train_dataset,
@@ -1214,6 +1244,22 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         requested_amp_mode=cfg.training.amp_mode,
         nlat=nlat,
         nlon=nlon,
+    )
+    LOGGER.info(
+        "Training runtime | device=%s | amp=%s | deterministic=%s | batch=%s | "
+        "workers=%s | prefetch=%s | pin_memory=%s | preload_to_gpu=%s",
+        device,
+        runtime_amp_mode,
+        str(bool(cfg.training.deterministic)).lower(),
+        _format_scientific(float(cfg.training.batch_size)),
+        _format_scientific(float(cfg.training.num_workers)),
+        (
+            _format_scientific(float(cfg.training.prefetch_factor))
+            if int(cfg.training.num_workers) > 0
+            else "n/a"
+        ),
+        str(bool(cfg.training.pin_memory)).lower(),
+        str(preload_to_gpu).lower(),
     )
 
     loss_fn = SphereLoss(nlat=nlat, nlon=nlon, grid=cfg.model.grid).to(device)
@@ -1285,6 +1331,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         model.train()
         train_loss_sum = 0.0
         train_count = 0
+        train_samples = 0
+        train_phase_start = time.perf_counter()
 
         for conditioning_batch, state_input_batch, state_target_batch in train_loader:
             conditioning_batch = conditioning_batch.to(device=device, non_blocking=use_non_blocking)
@@ -1313,10 +1361,14 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
 
             train_loss_sum += float(loss.detach().item())
             train_count += 1
+            train_samples += int(state_input_batch.shape[0])
+        train_seconds = time.perf_counter() - train_phase_start
 
         model.eval()
         val_loss_sum = 0.0
         val_count = 0
+        val_samples = 0
+        val_phase_start = time.perf_counter()
         with torch.no_grad():
             for conditioning_batch, state_input_batch, state_target_batch in val_loader:
                 conditioning_batch = conditioning_batch.to(
@@ -1344,6 +1396,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                     raise RuntimeError("Validation loss became non-finite")
                 val_loss_sum += float(vloss.detach().item())
                 val_count += 1
+                val_samples += int(state_input_batch.shape[0])
+        val_seconds = time.perf_counter() - val_phase_start
 
         if train_count == 0 or val_count == 0:
             raise RuntimeError("No training or validation batches were produced")
@@ -1354,14 +1408,22 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
 
         current_lr = float(optimizer.param_groups[0]["lr"])
         epoch_seconds = time.perf_counter() - epoch_start
+        train_samples_per_second = float(train_samples) / max(train_seconds, 1.0e-12)
+        val_samples_per_second = float(val_samples) / max(val_seconds, 1.0e-12)
         LOGGER.info(
-            "Epoch %4d/%4d | train=%s | val=%s | lr=%s | time=%.2fs",
+            "Epoch %4d/%4d | train=%s | val=%s | lr=%s | train_t=%s s | "
+            "val_t=%s s | epoch_t=%s s | train_rate=%s samples/s | "
+            "val_rate=%s samples/s",
             epoch,
             epochs,
-            _format_sigfig(train_loss),
-            _format_sigfig(val_loss),
-            _format_sigfig(current_lr),
-            epoch_seconds,
+            _format_scientific(train_loss),
+            _format_scientific(val_loss),
+            _format_scientific(current_lr),
+            _format_scientific(train_seconds),
+            _format_scientific(val_seconds),
+            _format_scientific(epoch_seconds),
+            _format_scientific(train_samples_per_second),
+            _format_scientific(val_samples_per_second),
         )
         history.append(
             {
@@ -1369,7 +1431,13 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "lr": current_lr,
+                "train_seconds": float(train_seconds),
+                "val_seconds": float(val_seconds),
                 "epoch_seconds": epoch_seconds,
+                "train_samples": float(train_samples),
+                "val_samples": float(val_samples),
+                "train_samples_per_second": float(train_samples_per_second),
+                "val_samples_per_second": float(val_samples_per_second),
             }
         )
 

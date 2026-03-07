@@ -2,9 +2,9 @@
 
 This module does two separate jobs:
 
-1. inspect a saved export/checkpoint pair and decide whether it satisfies the
+1. inspect a saved Torch export bundle and decide whether it satisfies the
    current direct-jump training contract
-2. provide a GPU-aware Torch inference runtime for valid direct-jump artifacts
+2. provide a CPU/GPU Torch inference runtime for valid direct-jump artifacts
 
 The runtime intentionally accepts physical ``transition_days``. The export is
 responsible for converting those durations into the normalized
@@ -44,8 +44,38 @@ def _load_optional_json(path: Path) -> Optional[Dict[str, Any]]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_required_export_meta(export_path: Path) -> Dict[str, Any]:
+    """Load the metadata companion that makes the export bundle self-contained."""
+    meta_path = export_path.with_name(
+        export_path.name.replace(".torchscript.pt", ".meta.json")
+    )
+    meta = _load_optional_json(meta_path)
+    if meta is None:
+        raise FileNotFoundError(
+            f"Export metadata not found: {meta_path}. "
+            "The retrieval runtime expects a self-contained export bundle."
+        )
+    return meta
+
+
+def _require_meta_mapping(meta: Dict[str, Any], *, key: str) -> Dict[str, Any]:
+    """Require one dictionary-valued metadata block."""
+    value = meta.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"Export metadata is missing the `{key}` mapping")
+    return dict(value)
+
+
+def _require_meta_sequence(meta: Dict[str, Any], *, key: str) -> tuple[Any, ...]:
+    """Require one list-like metadata block."""
+    value = meta.get(key)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"Export metadata is missing the `{key}` sequence")
+    return tuple(value)
+
+
 def _resolve_device(mode: str) -> torch.device:
-    """Resolve the requested runtime device."""
+    """Resolve the requested runtime device from explicit ``cpu`` / ``gpu`` modes."""
     normalized = str(mode).strip().lower()
     if normalized == "cpu":
         return torch.device("cpu")
@@ -53,10 +83,6 @@ def _resolve_device(mode: str) -> torch.device:
         if not torch.cuda.is_available():
             raise RuntimeError("Requested device_mode='gpu' but CUDA is unavailable")
         return torch.device("cuda")
-    if normalized == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
     raise ValueError(f"Unsupported device_mode: {mode!r}")
 
 
@@ -127,11 +153,13 @@ class SurrogateArtifactContract:
     """Summarize whether a saved surrogate can support the current retrieval contract."""
 
     export_path: Path
-    checkpoint_path: Path
+    checkpoint_path: Optional[Path]
     model_days: float
     export_format: str
+    supported_devices: tuple[str, ...]
     forward_schema: str
     export_arg_count: int
+    has_export_metadata: bool
     input_shape: tuple[int, int, int]
     output_shape: tuple[int, int, int]
     param_names: tuple[str, ...]
@@ -139,6 +167,7 @@ class SurrogateArtifactContract:
     input_fields: tuple[str, ...]
     output_fields: tuple[str, ...]
     transition_days_conditioned: bool
+    physical_io_forward: bool
     has_transition_time_stats: bool
     transition_time_name: Optional[str]
     sampling_transition_days_min: Optional[float]
@@ -146,9 +175,7 @@ class SurrogateArtifactContract:
     fixed_step_days: float
     rollout_steps_for_model_days: int
     direct_jump_torch_runtime_ready: bool
-    gpu_native_jax_retrieval_ready: bool
     torch_runtime_blockers: tuple[str, ...]
-    jax_runtime_blockers: tuple[str, ...]
     blockers: tuple[str, ...]
     recommendations: tuple[str, ...]
 
@@ -156,11 +183,15 @@ class SurrogateArtifactContract:
         """Return a JSON-friendly payload."""
         return {
             "export_path": str(self.export_path),
-            "checkpoint_path": str(self.checkpoint_path),
+            "checkpoint_path": (
+                None if self.checkpoint_path is None else str(self.checkpoint_path)
+            ),
             "model_days": float(self.model_days),
             "export_format": self.export_format,
+            "supported_devices": list(self.supported_devices),
             "forward_schema": self.forward_schema,
             "export_arg_count": int(self.export_arg_count),
+            "has_export_metadata": bool(self.has_export_metadata),
             "input_shape": list(self.input_shape),
             "output_shape": list(self.output_shape),
             "param_names": list(self.param_names),
@@ -168,6 +199,7 @@ class SurrogateArtifactContract:
             "input_fields": list(self.input_fields),
             "output_fields": list(self.output_fields),
             "transition_days_conditioned": bool(self.transition_days_conditioned),
+            "physical_io_forward": bool(self.physical_io_forward),
             "has_transition_time_stats": bool(self.has_transition_time_stats),
             "transition_time_name": self.transition_time_name,
             "sampling_transition_days_min": self.sampling_transition_days_min,
@@ -177,11 +209,7 @@ class SurrogateArtifactContract:
             "direct_jump_torch_runtime_ready": bool(
                 self.direct_jump_torch_runtime_ready
             ),
-            "gpu_native_jax_retrieval_ready": bool(
-                self.gpu_native_jax_retrieval_ready
-            ),
             "torch_runtime_blockers": list(self.torch_runtime_blockers),
-            "jax_runtime_blockers": list(self.jax_runtime_blockers),
             "blockers": list(self.blockers),
             "recommendations": list(self.recommendations),
         }
@@ -191,7 +219,9 @@ class SurrogateArtifactContract:
 class SurrogateRuntimeConfig:
     """User-tunable runtime settings for many-sample surrogate inference."""
 
-    device_mode: str = "auto"
+    # Keep the runtime choice explicit for now: retrieval should be either an
+    # intentional CPU run or an intentional GPU run.
+    device_mode: str = "gpu"
     max_batch_size: int = 256
     pin_host_memory: bool = True
     prefer_channels_last: bool = True
@@ -201,37 +231,84 @@ class SurrogateRuntimeConfig:
 def inspect_surrogate_artifact(
     *,
     export_path: Path,
-    checkpoint_path: Path,
+    checkpoint_path: Path | None = None,
     model_days: float = 100.0,
 ) -> SurrogateArtifactContract:
     """Inspect the saved artifact against the current direct-jump contract."""
     resolved_export = Path(export_path).resolve()
-    resolved_checkpoint = Path(checkpoint_path).resolve()
     if not resolved_export.is_file():
         raise FileNotFoundError(f"Export not found: {resolved_export}")
-    if not resolved_checkpoint.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint}")
     if model_days <= 0.0:
         raise ValueError(f"model_days must be > 0, got {model_days}")
 
     export_model = torch.jit.load(str(resolved_export), map_location="cpu").eval()
-    checkpoint: Dict[str, Any] = torch.load(resolved_checkpoint, map_location="cpu")
-    export_meta = _load_optional_json(
-        resolved_export.with_name(
-            resolved_export.name.replace(".torchscript.pt", ".meta.json")
-        )
+    export_meta = _load_required_export_meta(resolved_export)
+
+    resolved_checkpoint: Path | None = None
+    checkpoint: Dict[str, Any] | None = None
+    if checkpoint_path is not None:
+        resolved_checkpoint = Path(checkpoint_path).resolve()
+        if not resolved_checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint}")
+        checkpoint = torch.load(resolved_checkpoint, map_location="cpu")
+
+    solver = _require_meta_mapping(export_meta, key="solver")
+    shape = _require_meta_mapping(export_meta, key="shape")
+    sampling = _require_meta_mapping(export_meta, key="sampling")
+    normalization = _require_meta_mapping(export_meta, key="normalization")
+    input_meta = _require_meta_mapping(export_meta, key="input")
+    output_meta = _require_meta_mapping(export_meta, key="output")
+    runtime_hints = _require_meta_mapping(export_meta, key="runtime_hints")
+    physical_io = _require_meta_mapping(export_meta, key="physical_io")
+    param_names = tuple(
+        str(value) for value in _require_meta_sequence(export_meta, key="param_names")
+    )
+    conditioning_names = tuple(
+        str(value)
+        for value in _require_meta_sequence(export_meta, key="conditioning_names")
+    )
+    input_fields = tuple(
+        str(value) for value in _require_meta_sequence(input_meta, key="fields")
+    )
+    output_fields = tuple(
+        str(value) for value in _require_meta_sequence(output_meta, key="fields")
+    )
+    supported_devices = tuple(
+        str(value).lower()
+        for value in _require_meta_sequence(export_meta, key="supported_devices")
     )
 
-    solver = dict(checkpoint["solver"])
-    shape = dict(checkpoint["shape"])
-    sampling = dict(checkpoint.get("sampling", {}))
-    normalization = dict(checkpoint.get("normalization", {}))
-    input_fields = tuple(str(value) for value in checkpoint["input_fields"])
-    output_fields = tuple(str(value) for value in checkpoint["target_fields"])
-    param_names = tuple(str(value) for value in checkpoint["param_names"])
-    conditioning_names = tuple(
-        str(value) for value in checkpoint.get("conditioning_names", ())
-    )
+    if checkpoint is not None:
+        checkpoint_solver = dict(checkpoint["solver"])
+        checkpoint_shape = dict(checkpoint["shape"])
+        checkpoint_sampling = dict(checkpoint.get("sampling", {}))
+        checkpoint_normalization = dict(checkpoint.get("normalization", {}))
+        checkpoint_input_fields = tuple(str(value) for value in checkpoint["input_fields"])
+        checkpoint_output_fields = tuple(str(value) for value in checkpoint["target_fields"])
+        checkpoint_param_names = tuple(str(value) for value in checkpoint["param_names"])
+        checkpoint_conditioning_names = tuple(
+            str(value) for value in checkpoint.get("conditioning_names", ())
+        )
+        if solver != checkpoint_solver:
+            raise ValueError("Export metadata solver block does not match the checkpoint")
+        if shape != checkpoint_shape:
+            raise ValueError("Export metadata shape block does not match the checkpoint")
+        if sampling != checkpoint_sampling:
+            raise ValueError("Export metadata sampling block does not match the checkpoint")
+        if normalization != checkpoint_normalization:
+            raise ValueError(
+                "Export metadata normalization block does not match the checkpoint"
+            )
+        if input_fields != checkpoint_input_fields:
+            raise ValueError("Export metadata input fields do not match the checkpoint")
+        if output_fields != checkpoint_output_fields:
+            raise ValueError("Export metadata output fields do not match the checkpoint")
+        if param_names != checkpoint_param_names:
+            raise ValueError("Export metadata param_names do not match the checkpoint")
+        if conditioning_names != checkpoint_conditioning_names:
+            raise ValueError(
+                "Export metadata conditioning_names do not match the checkpoint"
+            )
 
     has_transition_time_stats = "transition_time" in normalization
     transition_time_name: Optional[str] = None
@@ -250,22 +327,140 @@ def inspect_surrogate_artifact(
 
     expected_conditioning_names = param_names + (TRANSITION_TIME_NAME,)
     torch_runtime_blockers: List[str] = []
-    jax_runtime_blockers: List[str] = []
     recommendations: List[str] = []
+    artifact_kind = str(export_meta.get("artifact_kind", ""))
+    export_format = str(export_meta.get("export_format", ""))
+    input_state_shape = tuple(input_meta.get("state0", ()))
+    output_state_shape = tuple(output_meta.get("state1", ()))
+    params_shape = tuple(input_meta.get("params", ()))
+    transition_days_shape = tuple(input_meta.get("transition_days", ()))
+    normalization_input_fields = tuple(
+        str(value)
+        for value in dict(normalization.get("input_state", {})).get("field_names", ())
+    )
+    normalization_target_fields = tuple(
+        str(value)
+        for value in dict(normalization.get("target_state", {})).get("field_names", ())
+    )
+    physical_io_forward = all(
+        bool(physical_io.get(name, False))
+        for name in ("state0", "params", "transition_days", "state1")
+    )
+
+    if artifact_kind != "direct_jump_physical_state_transition":
+        torch_runtime_blockers.append(
+            "The export metadata `artifact_kind` is not the expected direct-jump "
+            "physical-state transition bundle."
+        )
+        recommendations.append(
+            "Re-export the surrogate with the current physical-space Torch export script."
+        )
+
+    if export_format != "torchscript":
+        torch_runtime_blockers.append(
+            f"The export metadata declares format `{export_format}`, but retrieval "
+            "currently expects a TorchScript bundle."
+        )
+        recommendations.append(
+            "Re-export the surrogate with the TorchScript export entry point."
+        )
+
+    if supported_devices != ("cpu", "gpu"):
+        torch_runtime_blockers.append(
+            "The export metadata `supported_devices` must be exactly `['cpu', 'gpu']` "
+            "for the current runtime surface."
+        )
+        recommendations.append(
+            "Regenerate the export metadata so the supported runtime devices stay explicit."
+        )
+
+    if str(runtime_hints.get("transition_time_feature")) != TRANSITION_TIME_NAME:
+        torch_runtime_blockers.append(
+            "The export metadata does not declare the current "
+            f"`{TRANSITION_TIME_NAME}` transition-time feature."
+        )
+        recommendations.append(
+            "Regenerate the export metadata from a checkpoint trained with the "
+            "current direct-jump conditioning contract."
+        )
+
+    if not physical_io_forward:
+        torch_runtime_blockers.append(
+            "The export metadata does not mark all inputs/outputs as physical-space "
+            "tensors (`state0`, `params`, `transition_days`, `state1`)."
+        )
+        recommendations.append(
+            "Re-export the surrogate with the physical-state wrapper enabled."
+        )
+    if input_state_shape != (
+        "batch",
+        int(shape["input_C"]),
+        int(shape["H"]),
+        int(shape["W"]),
+    ):
+        torch_runtime_blockers.append(
+            "The export metadata `input.state0` shape does not match the saved "
+            "shape contract."
+        )
+        recommendations.append(
+            "Regenerate the export metadata from the same TorchScript artifact."
+        )
+    if params_shape != ("batch", int(len(param_names))):
+        torch_runtime_blockers.append(
+            "The export metadata `input.params` shape does not match `param_names`."
+        )
+        recommendations.append(
+            "Regenerate the export metadata so parameter dimensions stay explicit."
+        )
+    if transition_days_shape != ("batch",):
+        torch_runtime_blockers.append(
+            "The export metadata `input.transition_days` shape must be `['batch']`."
+        )
+        recommendations.append(
+            "Regenerate the export metadata so the time-jump input contract stays explicit."
+        )
+    if output_state_shape != (
+        "batch",
+        int(shape["target_C"]),
+        int(shape["H"]),
+        int(shape["W"]),
+    ):
+        torch_runtime_blockers.append(
+            "The export metadata `output.state1` shape does not match the saved "
+            "shape contract."
+        )
+        recommendations.append(
+            "Regenerate the export metadata from the same TorchScript artifact."
+        )
+    if normalization_input_fields and input_fields != normalization_input_fields:
+        torch_runtime_blockers.append(
+            "The export metadata input field list does not match "
+            "`normalization.input_state.field_names`."
+        )
+        recommendations.append(
+            "Regenerate the export so the physical field ordering is self-consistent."
+        )
+    if normalization_target_fields and output_fields != normalization_target_fields:
+        torch_runtime_blockers.append(
+            "The export metadata output field list does not match "
+            "`normalization.target_state.field_names`."
+        )
+        recommendations.append(
+            "Regenerate the export so the physical field ordering is self-consistent."
+        )
 
     if not has_transition_time_stats:
         torch_runtime_blockers.append(
-            "The checkpoint normalization does not include `transition_time`, so the export "
+            "The export metadata normalization does not include `transition_time`, so the export "
             "is missing the current variable-jump training contract."
         )
         recommendations.append(
-            "Regenerate checkpoints after variable-jump training so `normalization.transition_time` "
-            "is stored in the artifact."
+            "Re-export from a checkpoint that stores `normalization.transition_time`."
         )
 
     if transition_time_name is not None and transition_time_name != TRANSITION_TIME_NAME:
         torch_runtime_blockers.append(
-            f"The checkpoint transition-time feature is named `{transition_time_name}`, but the "
+            f"The export transition-time feature is named `{transition_time_name}`, but the "
             f"current training contract expects `{TRANSITION_TIME_NAME}`."
         )
         recommendations.append(
@@ -274,7 +469,7 @@ def inspect_surrogate_artifact(
 
     if conditioning_names != expected_conditioning_names:
         torch_runtime_blockers.append(
-            "The checkpoint conditioning vector does not match the direct-jump contract: "
+            "The export conditioning vector does not match the direct-jump contract: "
             f"expected {list(expected_conditioning_names)!r}, got {list(conditioning_names)!r}."
         )
         recommendations.append(
@@ -298,60 +493,40 @@ def inspect_surrogate_artifact(
         )
         recommendations.append(
             "Use log-spaced variable-jump training and export a long-horizon direct-jump artifact "
-            "before attempting full nested-sampling retrieval."
+            "before attempting long-horizon retrieval."
         )
 
     if sampling_transition_days_min is None or sampling_transition_days_max is None:
         torch_runtime_blockers.append(
-            "The checkpoint sampling metadata does not record a variable `transition_days` range, "
+            "The export sampling metadata does not record a variable `transition_days` range, "
             "so there is no evidence this artifact was trained for flexible jumps from initial "
             "state toward equilibrium."
         )
         recommendations.append(
             "Train with explicit random forward-only jump sampling over a broad day range and "
-            "store that range in checkpoint metadata."
+            "store that range in the export metadata."
         )
 
-    if export_meta is None:
-        recommendations.append(
-            "Keep `model_export.meta.json` next to the TorchScript artifact so retrieval can "
-            "validate the runtime contract without reloading the checkpoint."
-        )
-    else:
-        meta_input = dict(export_meta.get("input", {}))
-        if transition_days_conditioned and "transition_days" not in meta_input:
-            torch_runtime_blockers.append(
-                "The saved export metadata does not advertise `transition_days` even though "
-                "the runtime signature suggests time conditioning."
-            )
-            recommendations.append(
-                "Regenerate the export metadata from the same artifact so the contract is unambiguous."
-            )
-
-    if resolved_export.suffixes[-2:] != [".torchscript", ".pt"]:
-        jax_runtime_blockers.append(
-            "The retrieval runner currently knows how to load TorchScript exports only."
-        )
-    else:
-        jax_runtime_blockers.append(
-            "The checked-in export is TorchScript/PyTorch, so a JAX+jaxoplanet retrieval "
-            "would need a framework bridge instead of staying inside one GPU-native graph."
+    if transition_days_conditioned and "transition_days" not in input_meta:
+        torch_runtime_blockers.append(
+            "The saved export metadata does not advertise `transition_days` even though "
+            "the runtime signature suggests time conditioning."
         )
         recommendations.append(
-            "Export a JAX-native surrogate, or retrain/export the surrogate in a JAX stack "
-            "so the forward model and jaxoplanet share the same runtime."
+            "Regenerate the export metadata from the same artifact so the contract is unambiguous."
         )
 
     direct_jump_torch_ready = not torch_runtime_blockers
-    gpu_native_jax_ready = direct_jump_torch_ready and not jax_runtime_blockers
 
     return SurrogateArtifactContract(
         export_path=resolved_export,
         checkpoint_path=resolved_checkpoint,
         model_days=float(model_days),
-        export_format="torchscript",
+        export_format=export_format,
+        supported_devices=supported_devices,
         forward_schema=str(export_model.forward.schema),
         export_arg_count=int(export_arg_count),
+        has_export_metadata=bool(export_meta is not None),
         input_shape=(int(shape["input_C"]), int(shape["H"]), int(shape["W"])),
         output_shape=(int(shape["target_C"]), int(shape["H"]), int(shape["W"])),
         param_names=param_names,
@@ -359,6 +534,7 @@ def inspect_surrogate_artifact(
         input_fields=input_fields,
         output_fields=output_fields,
         transition_days_conditioned=bool(transition_days_conditioned),
+        physical_io_forward=bool(physical_io_forward),
         has_transition_time_stats=bool(has_transition_time_stats),
         transition_time_name=transition_time_name,
         sampling_transition_days_min=(
@@ -370,10 +546,8 @@ def inspect_surrogate_artifact(
         fixed_step_days=float(fixed_step_days),
         rollout_steps_for_model_days=int(rollout_steps),
         direct_jump_torch_runtime_ready=bool(direct_jump_torch_ready),
-        gpu_native_jax_retrieval_ready=bool(gpu_native_jax_ready),
         torch_runtime_blockers=tuple(torch_runtime_blockers),
-        jax_runtime_blockers=tuple(jax_runtime_blockers),
-        blockers=tuple(torch_runtime_blockers + jax_runtime_blockers),
+        blockers=tuple(torch_runtime_blockers),
         recommendations=tuple(recommendations),
     )
 
@@ -390,13 +564,18 @@ def assert_direct_jump_torch_runtime_ready(contract: SurrogateArtifactContract) 
 
 
 class TorchSurrogateRuntime:
-    """Batched Torch inference wrapper for many-sample direct-jump retrieval calls."""
+    """Batched Torch inference wrapper for many-sample direct-jump retrieval calls.
+
+    The runtime performs inference through the exported TorchScript bundle. The
+    training checkpoint is optional and only used when you want strict
+    export-versus-checkpoint validation.
+    """
 
     def __init__(
         self,
         *,
         export_path: Path,
-        checkpoint_path: Path,
+        checkpoint_path: Path | None = None,
         runtime_config: SurrogateRuntimeConfig | None = None,
         model_days: float = 100.0,
     ) -> None:
@@ -410,10 +589,7 @@ class TorchSurrogateRuntime:
         assert_direct_jump_torch_runtime_ready(self.contract)
 
         self.device = _resolve_device(self.config.device_mode)
-        self.checkpoint: Dict[str, Any] = torch.load(
-            self.contract.checkpoint_path,
-            map_location="cpu",
-        )
+        self.export_meta = _load_required_export_meta(self.contract.export_path)
         loaded = torch.jit.load(
             str(self.contract.export_path),
             map_location="cpu",
@@ -434,19 +610,19 @@ class TorchSurrogateRuntime:
                 torch.backends.cudnn.allow_tf32 = bool(self.config.allow_tf32)
                 torch.backends.cudnn.benchmark = True
 
-        shape = dict(self.checkpoint["shape"])
+        shape = dict(self.export_meta["shape"])
         self.input_shape = (int(shape["input_C"]), int(shape["H"]), int(shape["W"]))
-        self.param_dim = int(len(self.checkpoint["param_names"]))
+        self.param_dim = int(len(self.export_meta["param_names"]))
 
-        # Example tensors come from checkpoint means rather than hard-coded
+        # Example tensors come from the export metadata rather than hard-coded
         # constants so smoke checks stay valid even when field transforms change.
         self._example_state_cpu = self._build_example_state()
         self._example_params_cpu = torch.tensor(
-            self.checkpoint["normalization"]["params"]["mean"],
+            self.export_meta["normalization"]["params"]["mean"],
             dtype=torch.float32,
         ).reshape(1, -1)
         transition_mean_log10 = float(
-            self.checkpoint["normalization"]["transition_time"]["mean"][0]
+            self.export_meta["normalization"]["transition_time"]["mean"][0]
         )
         self._example_transition_days_cpu = torch.tensor(
             [10.0 ** transition_mean_log10],
@@ -455,9 +631,9 @@ class TorchSurrogateRuntime:
 
     def _build_example_state(self) -> torch.Tensor:
         """Construct one valid physical-space state from normalization statistics."""
-        normalization = dict(self.checkpoint["normalization"])
+        normalization = dict(self.export_meta["normalization"])
         input_state = dict(normalization["input_state"])
-        fields = list(self.checkpoint["input_fields"])
+        fields = list(self.export_meta["input"]["fields"])
         zero_norm = torch.zeros((1, *self.input_shape), dtype=torch.float32)
         return _denormalize_state_with_stats(
             zero_norm,

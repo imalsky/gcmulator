@@ -240,10 +240,12 @@ class TrainingConfig:
     seed: int = 0
     device: str = "auto"
     amp_mode: str = "none"
+    deterministic: bool = False
     optimizer: str = "adamw"
     epochs: int = 50
     batch_size: int = 8
     num_workers: int = 0
+    prefetch_factor: int = 4
     shuffle: bool = True
     pin_memory: bool = False
     preload_to_gpu: bool = False
@@ -318,10 +320,12 @@ TRAINING_KEYS = {
     "seed",
     "device",
     "amp_mode",
+    "deterministic",
     "optimizer",
     "epochs",
     "batch_size",
     "num_workers",
+    "prefetch_factor",
     "shuffle",
     "pin_memory",
     "preload_to_gpu",
@@ -545,10 +549,15 @@ def _parse_training(
         seed=int(d.get("seed", 0)),
         device=str(d.get("device", "auto")),
         amp_mode=str(d.get("amp_mode", "none")),
+        deterministic=_parse_bool(
+            d.get("deterministic", False),
+            field_name="training.deterministic",
+        ),
         optimizer=str(d.get("optimizer", "adamw")),
         epochs=int(d.get("epochs", 50)),
         batch_size=int(d.get("batch_size", 8)),
         num_workers=int(d.get("num_workers", 0)),
+        prefetch_factor=int(d.get("prefetch_factor", 4)),
         shuffle=_parse_bool(d.get("shuffle", True), field_name="training.shuffle"),
         pin_memory=_parse_bool(d.get("pin_memory", False), field_name="training.pin_memory"),
         preload_to_gpu=_parse_bool(
@@ -674,6 +683,8 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("training.batch_size must be >= 1")
     if cfg.training.num_workers < 0:
         raise ValueError("training.num_workers must be >= 0")
+    if cfg.training.prefetch_factor < 1:
+        raise ValueError("training.prefetch_factor must be >= 1")
     if cfg.training.preload_to_gpu and cfg.training.num_workers != 0:
         raise ValueError("training.num_workers must be 0 when training.preload_to_gpu=true")
     if cfg.training.learning_rate <= 0:

@@ -452,6 +452,20 @@ No planar FFT surrogate is part of the contract for spherical spectral metrics.
    Geometry transform and parameter-alias conversion checks.
 5. `unit_tests/test_data_generation.py`
    High-value generation integrity checks, including serial-vs-batched parity.
+6. `unit_tests/test_retrieval_backend.py`
+   Export-bundle and retrieval-runtime contract checks.
+7. `unit_tests/test_training_logging.py`
+   Training-history formatting and logging regression checks.
+
+### 6.5 Retrieval Utilities
+1. `retrieval/surrogate_backend.py`
+   Strict export-bundle inspection plus batched Torch runtime for direct-jump
+   surrogate inference on CPU or GPU.
+2. `retrieval/run_surrogate_nss.py`
+   Top-level retrieval runner with a small config block and JSON readiness
+   report output.
+3. `retrieval/README.md`
+   Usage notes and the current retrieval artifact contract.
 
 ## 7. Config Contract And Variable Definitions
 ### 7.1 `paths`
@@ -607,32 +621,37 @@ Parameter normalization keys:
    `auto`, `cpu`, or `cuda`.
 3. `amp_mode`
    `none`, `bf16`, or `fp16`.
-4. `optimizer`
+4. `deterministic`
+   Whether training forces deterministic kernels and disables cuDNN autotuning.
+   The active default is `false`.
+5. `optimizer`
    Active code uses `adamw`.
-5. `epochs`
+6. `epochs`
    Number of training epochs.
-6. `batch_size`
+7. `batch_size`
    Batch size for processed samples.
-7. `num_workers`
+8. `num_workers`
    Dataloader worker count.
-8. `shuffle`
+9. `prefetch_factor`
+   Dataloader prefetch depth, used only when `num_workers > 0`.
+10. `shuffle`
    Whether to shuffle the training dataset.
-9. `pin_memory`
+11. `pin_memory`
    Dataloader pinned-memory toggle.
-10. `preload_to_gpu`
-    Whether the processed splits are fully moved to GPU before training.
-11. `learning_rate`
-    Base optimizer learning rate.
-12. `weight_decay`
-    AdamW weight decay.
-13. `val_fraction`
-    File-level validation split fraction.
-14. `test_fraction`
-    File-level test split fraction.
-15. `split_seed`
-    Train/val/test split seed.
-16. `scheduler`
-    Scheduler configuration block.
+12. `preload_to_gpu`
+   Whether the processed splits are fully moved to GPU before training.
+13. `learning_rate`
+   Base optimizer learning rate.
+14. `weight_decay`
+   AdamW weight decay.
+15. `val_fraction`
+   File-level validation split fraction.
+16. `test_fraction`
+   File-level test split fraction.
+17. `split_seed`
+   Train/val/test split seed.
+18. `scheduler`
+   Scheduler configuration block.
 
 Scheduler keys:
 1. `type`
@@ -651,6 +670,15 @@ Active default scheduler behavior:
 5. if `min_lr` is omitted, it resolves to `learning_rate / 50` for active
    schedulers and to `0.0` for `type='none'`
 6. cosine scheduling remains supported via `type='cosine_warmup'`
+
+Active runtime behavior:
+1. `preload_to_gpu=true` requires CUDA and forces `num_workers=0`
+2. the active default is `deterministic=false`, favoring throughput
+3. `deterministic=true` enables deterministic algorithms and disables cuDNN
+   benchmark mode, favoring reproducibility over throughput
+4. the first-line GPU-throughput knobs are `batch_size`, `num_workers`,
+   `prefetch_factor`, `pin_memory`, `preload_to_gpu`, `amp_mode`, and
+   `deterministic=false`
 
 ### 7.8 Common Artifact Variable Names
 These names recur across raw files, processed metadata, checkpoints, and code:
@@ -885,6 +913,7 @@ The transition-time block contains the same fields, with
 18. `train_loss`
 19. `val_loss`
 20. `learning_rate`
+21. `epoch_seconds`
 
 These fields are part of the practical artifact contract because downstream
 tools in `extra/` read them directly.
@@ -900,22 +929,63 @@ Training writes at least:
 7. `config_used.resolved.json`
 8. `config_used.original.<suffix>`
 
+Per-epoch history rows in `training_history.json` and `training_history.csv`
+store:
+1. `epoch`
+2. `train_loss`
+3. `val_loss`
+4. `lr`
+5. `train_seconds`
+6. `val_seconds`
+7. `epoch_seconds`
+8. `train_samples`
+9. `val_samples`
+10. `train_samples_per_second`
+11. `val_samples_per_second`
+
+Console epoch logs print the same scalar diagnostics in scientific notation.
+
 ### 8.8 Export Output Contract
 TorchScript export writes:
 1. `model_export.torchscript.pt`
 2. `model_export.meta.json`
 
 The export metadata contains:
-1. `export_format`
-2. `checkpoint_path`
-3. `export_path`
-4. `device`
-5. `input`
-6. `output`
-7. `param_names`
-8. `conditioning_names`
-9. `normalization`
-10. `verification`
+1. `artifact_kind`
+2. `export_format`
+3. `checkpoint_path`
+4. `export_path`
+5. `device`
+6. `supported_devices`
+7. `runtime_hints`
+8. `physical_io`
+9. `shape`
+10. `input`
+11. `output`
+12. `param_names`
+13. `conditioning_names`
+14. `solver`
+15. `sampling`
+16. `normalization`
+17. `verification`
+
+Active exact semantics:
+1. `artifact_kind` must be `direct_jump_physical_state_transition`
+2. `supported_devices` must be `['cpu', 'gpu']`
+3. `physical_io.state0`, `physical_io.params`, `physical_io.transition_days`,
+   and `physical_io.state1` must all be `true`
+4. `runtime_hints.transition_time_feature` must be
+   `log10_transition_days`
+5. `input.state0` must be `['batch', input_C, H, W]`
+6. `input.params` must be `['batch', len(param_names)]`
+7. `input.transition_days` must be `['batch']`
+8. `output.state1` must be `['batch', target_C, H, W]`
+9. `conditioning_names` must equal
+   `param_names + ['log10_transition_days']`
+10. `normalization` must include the same `input_state`, `target_state`,
+    `params`, and `transition_time` statistics used during training
+11. the TorchScript module itself embeds those normalization transforms so the
+    export accepts physical inputs and returns physical outputs directly
 
 ## 9. Model And Evaluation Contract
 ### 9.1 Model Input And Output
