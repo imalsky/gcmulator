@@ -143,6 +143,10 @@ class ParameterSpec:
 class SamplingConfig:
     """Sampling strategy for raw simulation generation.
 
+    ``generation_workers`` is a trajectory batch size for vectorized JAX
+    generation, not an OS worker pool.  ``0`` selects the backend-aware auto
+    policy used by the generation entrypoint.
+
     Transition pairs are sampled with log-uniform time jumps between
     ``transition_jump_days_min`` and ``transition_jump_days_max``.  Each
     transition within a single simulation may use a different jump duration,
@@ -157,11 +161,24 @@ class SamplingConfig:
 
     seed: int = 0
     n_sims: int = 500
+    generation_workers: int = 0
     burn_in_days: float = 0.0
     transitions_per_simulation: int = 128
     transition_jump_days_min: float = 0.1
     transition_jump_days_max: float = 100.0
     parameters: List[ParameterSpec] = field(default_factory=list)
+
+    def min_transition_jump_days(self) -> float:
+        """Return the minimum sampled transition jump in physical days."""
+        return float(self.transition_jump_days_min)
+
+    def max_transition_jump_days(self) -> float:
+        """Return the maximum sampled transition jump in physical days."""
+        return float(self.transition_jump_days_max)
+
+    def uses_variable_transition_jump(self) -> bool:
+        """Return True when jump duration is sampled from a non-degenerate range."""
+        return self.max_transition_jump_days() > self.min_transition_jump_days()
 
 
 @dataclass(frozen=True)
@@ -266,6 +283,7 @@ GEOMETRY_KEYS = {"flip_latitude_to_north_south", "roll_longitude_to_0_2pi"}
 SAMPLING_KEYS = {
     "seed",
     "n_sims",
+    "generation_workers",
     "burn_in_days",
     "transitions_per_simulation",
     "transition_jump_days_min",
@@ -412,6 +430,7 @@ def _parse_sampling(d: Dict[str, Any]) -> SamplingConfig:
     return SamplingConfig(
         seed=int(d.get("seed", 0)),
         n_sims=int(d.get("n_sims", 500)),
+        generation_workers=int(d.get("generation_workers", 0)),
         burn_in_days=float(d.get("burn_in_days", 0.0)),
         transitions_per_simulation=int(d.get("transitions_per_simulation", 128)),
         transition_jump_days_min=float(d.get("transition_jump_days_min", 0.1)),
@@ -591,6 +610,8 @@ def validate_config(cfg: GCMulatorConfig) -> None:
 
     if cfg.sampling.n_sims < 1:
         raise ValueError("sampling.n_sims must be >= 1")
+    if cfg.sampling.generation_workers < 0:
+        raise ValueError("sampling.generation_workers must be >= 0")
     if cfg.sampling.burn_in_days < 0:
         raise ValueError("sampling.burn_in_days must be >= 0")
     if cfg.sampling.transitions_per_simulation < MIN_TRANSITIONS:
@@ -599,9 +620,9 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("sampling.transition_jump_days_min must be > 0")
     if cfg.sampling.transition_jump_days_max <= 0:
         raise ValueError("sampling.transition_jump_days_max must be > 0")
-    if cfg.sampling.transition_jump_days_min >= cfg.sampling.transition_jump_days_max:
+    if cfg.sampling.transition_jump_days_min > cfg.sampling.transition_jump_days_max:
         raise ValueError(
-            "sampling.transition_jump_days_min must be < "
+            "sampling.transition_jump_days_min must be <= "
             "sampling.transition_jump_days_max"
         )
     _validate_parameter_specs(cfg.sampling.parameters)

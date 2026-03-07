@@ -21,6 +21,9 @@ learns a surrogate of the visible flow map seen through the physical state.
 Use the local `swamp_compare` conda environment for generation, training,
 export, and repository checks.
 
+For the GH200 PBS entrypoint in `run.pbs`, the default cluster environment is
+`pyt2_8_gh`, overridden via `CONDA_ENV` when needed.
+
 Default operator routine:
 1. Activate the environment:
    `conda activate swamp_compare`
@@ -234,21 +237,16 @@ Definitions:
    Physical integration horizon for one raw simulation.
 3. `burn_in_days`
    Initial simulated duration discarded before transition sampling.
-4. `transition_jump_steps`
-   Integer solver-step gap between input and target states.
-5. `transition_jump_steps_max`
-   Optional maximum solver-step gap when variable-jump training is enabled.
+4. `transition_jump_days_min`
+   Minimum requested physical direct-jump horizon in days.
+5. `transition_jump_days_max`
+   Maximum requested physical direct-jump horizon in days.
 6. `transition_days`
-   Physical duration of one sampled jump:
-   `transition_jump_steps * dt_seconds / 86400`.
+   Physical duration of one sampled jump stored per transition.
 7. `anchor_steps`
    Integer solver step index of each input state inside a sampled trajectory window.
-   In the active contract, consecutive anchors are separated by `transition_jump_steps`
-   so that `state_targets[t]` becomes the next visible input in free-run rollout.
-8. `anchor_stride_steps`
-   Stored integer spacing between successive anchors. Active value:
-   `anchor_stride_steps = transition_jump_steps`.
-9. `starttime_index`
+   Anchors are sorted for deterministic storage, but their spacing may vary.
+8. `starttime_index`
    MY_SWAMP initial time index. The active config requires `>= 2`, matching the
    two-level solver initialization constraints enforced by the code.
 
@@ -259,17 +257,17 @@ behavior is the direct-jump horizon `transition_days`.
 
 ### 3.8 Flexible Jump Requirement
 The active contract supports both:
-1. fixed-jump training via `transition_jump_steps`
-2. variable-jump training via the inclusive solver-step range
-   `[transition_jump_steps, transition_jump_steps_max]`
+1. fixed-jump training via `transition_jump_days_min == transition_jump_days_max`
+2. variable-jump training via the inclusive day-valued range
+   `[transition_jump_days_min, transition_jump_days_max]`
 
 Required semantics:
 1. raw files store per-sample `transition_days`
-2. preprocessing normalizes `transition_days` explicitly
-3. model conditioning appends normalized `transition_days`
+2. preprocessing normalizes `log10(transition_days)` explicitly
+3. model conditioning appends normalized `log10_transition_days`
 4. no stage silently collapses variable-jump data into a fixed-jump assumption
-5. rollout windows must use `anchor_stride_steps = transition_jump_steps` so
-   direct-jump rollout is physically consistent
+5. rollout windows may use per-sample variable jump durations while preserving
+   the exact sampled `(anchor_step, target_step)` pairing
 
 ## 4. End-To-End Pipeline
 ### 4.1 CLI
@@ -284,8 +282,9 @@ Training performs preprocessing internally before optimization.
 `src/data_generation.py`:
 1. validates importability of `my_swamp`
 2. samples parameter sets
-3. samples one valid post-burn-in window start and one jump duration per simulation
-4. runs either serial or batched trajectory extraction
+3. samples valid post-burn-in `(anchor_step, target_step)` pairs per simulation
+4. runs serial extraction for single-item batches and vmapped JAX trajectory
+   extraction for larger generation batches
 5. writes `sim_XXXXXX.npy` raw files
 6. writes `manifest.json`
 
@@ -502,15 +501,16 @@ Internal MY_SWAMP geometry terms derived from `M`:
 2. `n_sims`
    Number of raw simulation files to generate.
 3. `generation_workers`
-   Vectorized JAX trajectory batch size during generation.
+   Vectorized JAX trajectory batch size during generation. `0` delegates to the
+   backend-aware auto policy used by `src/data_generation.py`.
 4. `burn_in_days`
    Discarded initial spin-up duration before the sampled window starts.
 5. `transitions_per_simulation`
    Number of transition pairs extracted from one simulation window.
-6. `transition_jump_steps`
-   Minimum or fixed solver-step offset between input and target.
-7. `transition_jump_steps_max`
-   Optional maximum solver-step offset for variable-jump training.
+6. `transition_jump_days_min`
+   Minimum or fixed physical jump duration in days.
+7. `transition_jump_days_max`
+   Optional maximum physical jump duration in days for variable-jump training.
 8. `parameters`
    List of per-parameter sampling rules.
 
@@ -519,25 +519,25 @@ Config examples:
 Fixed direct-jump training:
 ```json
 "sampling": {
-  "transition_jump_steps": 1,
-  "transition_jump_steps_max": 1
+  "transition_jump_days_min": 0.25,
+  "transition_jump_days_max": 0.25
 }
 ```
 
 Variable direct-jump training:
 ```json
 "sampling": {
-  "transition_jump_steps": 1,
-  "transition_jump_steps_max": 8
+  "transition_jump_days_min": 0.1,
+  "transition_jump_days_max": 8.0
 }
 ```
 
 Interpretation:
 1. `dt_seconds` remains the fixed MY_SWAMP solver step
-2. the sampled direct-jump horizon varies over the inclusive integer range
-   `[transition_jump_steps, transition_jump_steps_max]`
-3. the learned conditioning feature is the corresponding physical duration
-   `transition_days`
+2. the sampled direct-jump horizon varies over the inclusive physical-day range
+   `[transition_jump_days_min, transition_jump_days_max]`
+3. the learned conditioning feature is the corresponding normalized
+   `log10_transition_days`
 
 Supported sampling distributions:
 1. `uniform`
@@ -676,7 +676,7 @@ These names recur across raw files, processed metadata, checkpoints, and code:
     Ordered list of canonical physical conditioning parameter names.
 11. `conditioning_names`
     Ordered list of model-conditioning names. Active value:
-    `param_names + ['transition_days']`.
+    `param_names + ['log10_transition_days']`.
 12. `lat_order`
     Stored latitude ordering string. Active canonical value is `north_to_south`.
 13. `lon_origin`
@@ -711,8 +711,8 @@ Exact required keys:
 10. `burn_in_days`
 11. `dt_seconds`
 12. `starttime_index`
-13. `transition_jump_steps`
-14. `anchor_stride_steps`
+13. `transition_jump_days_min`
+14. `transition_jump_days_max`
 15. `n_transitions`
 16. `M`
 17. `nlat`
@@ -734,8 +734,10 @@ Shapes and dtypes as written by generation:
 
 Semantic contract:
 1. `state_inputs[t]` is the visible physical state at the anchor step
-2. `state_targets[t]` is the prognostic target at `anchor_steps[t] + transition_jump_steps`
-3. `anchor_steps[t+1] - anchor_steps[t] = anchor_stride_steps = transition_jump_steps`
+2. `state_targets[t]` is the prognostic target after the stored physical jump
+   `transition_days[t]`
+3. the integer solver-step jump is recovered as
+   `round(transition_days[t] * 86400 / dt_seconds)`
 4. all channels are already canonicalized into the configured geometry
 5. field ordering must exactly match the configured constants
 
@@ -767,8 +769,8 @@ Each `items[]` entry includes:
 8. `burn_in_days`
 9. `dt_seconds`
 10. `starttime_index`
-11. `transition_jump_steps`
-12. `anchor_stride_steps`
+11. `transition_jump_days_min`
+12. `transition_jump_days_max`
 13. `n_transitions`
 14. `anchor_step_start`
 15. `anchor_step_end`
@@ -804,7 +806,7 @@ Shapes and dtypes:
 
 Semantic notes:
 1. `conditioning_norm[t]` is the normalized concatenation of physical params
-   and `transition_days[t]`
+   and `log10_transition_days[t]`
 2. `params_norm` is retained separately for tooling that needs only the physical
    parameter vector
 3. current training loaders do not consume `anchor_steps`; it is retained for
@@ -829,7 +831,7 @@ Semantic notes:
 
 Important exact semantics:
 1. `task` must be `trajectory_transition`
-2. `conditioning_names` must equal `param_names + ['transition_days']`
+2. `conditioning_names` must equal `param_names + ['log10_transition_days']`
 3. `build_fingerprint` is the cache-reuse contract for processed data
 4. `geometry` currently stores:
    `flip_latitude_to_north_south`, `roll_longitude_to_0_2pi`, `lat_order`,
@@ -859,7 +861,7 @@ The params block contains:
 5. `zscore_eps`
 
 The transition-time block contains the same fields, with
-`param_names = ['transition_days']`.
+`param_names = ['log10_transition_days']`.
 
 ### 8.6 Checkpoint Contract
 `best.pt` and `last.pt` store:

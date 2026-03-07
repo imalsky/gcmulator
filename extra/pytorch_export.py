@@ -18,6 +18,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from config import TRANSITION_TIME_NAME
 from modeling import build_state_conditioned_transition_model, ensure_torch_harmonics_importable
 
 
@@ -254,17 +255,44 @@ def _normalize_transition_days_with_stats(
     is_constant: torch.Tensor,
     zscore_eps: float,
 ) -> torch.Tensor:
-    """Normalize scalar transition durations to the model conditioning space."""
+    """Normalize physical transition durations to the log-conditioned model space."""
     torch._assert(transition_days.dim() == 1, "transition_days must be rank-1")
+    torch._assert(
+        torch.all(torch.isfinite(transition_days)),
+        "transition_days must be finite",
+    )
+    torch._assert(
+        torch.all(transition_days > 0),
+        "transition_days must be strictly positive",
+    )
     mean = mean.to(device=transition_days.device, dtype=transition_days.dtype)
     std = std.to(device=transition_days.device, dtype=transition_days.dtype)
     out = (
-        transition_days.unsqueeze(-1) - mean.unsqueeze(0)
+        torch.log10(torch.clamp(transition_days, min=1.0e-30)).unsqueeze(-1)
+        - mean.unsqueeze(0)
     ) / (std.unsqueeze(0) + float(zscore_eps))
     const_mask = is_constant.to(device=transition_days.device)
     if torch.any(const_mask):
         out = out.masked_fill(const_mask.unsqueeze(0), 0.0)
     return out
+
+
+def _require_transition_time_stats(normalization: Dict[str, Any]) -> Dict[str, Any]:
+    """Require the direct-jump transition-time stats expected by current training."""
+    if "transition_time" not in normalization:
+        raise ValueError(
+            "Checkpoint normalization is missing `transition_time`. "
+            "Export requires a checkpoint trained with explicit "
+            f"`{TRANSITION_TIME_NAME}` conditioning."
+        )
+    transition_time = dict(normalization["transition_time"])
+    param_names = tuple(str(value) for value in transition_time.get("param_names", ()))
+    if param_names != (TRANSITION_TIME_NAME,):
+        raise ValueError(
+            "Checkpoint `transition_time.param_names` must be "
+            f"[{TRANSITION_TIME_NAME!r}], got {list(param_names)!r}"
+        )
+    return transition_time
 
 
 class PhysicalStateExportModule(nn.Module):
@@ -298,18 +326,7 @@ class PhysicalStateExportModule(nn.Module):
             "param_is_constant",
             torch.tensor(params["is_constant"], dtype=torch.bool),
         )
-        transition_time = dict(
-            normalization.get(
-                "transition_time",
-                {
-                    "param_names": ["transition_days"],
-                    "mean": [0.0],
-                    "std": [1.0],
-                    "is_constant": [True],
-                    "zscore_eps": float(params["zscore_eps"]),
-                },
-            )
-        )
+        transition_time = _require_transition_time_stats(normalization)
         self.register_buffer(
             "transition_time_mean",
             torch.tensor(transition_time["mean"], dtype=torch.float32),
@@ -474,6 +491,24 @@ def main() -> None:
     shape = dict(ckpt["shape"])
     input_fields = list(ckpt["input_fields"])
     target_fields = list(ckpt["target_fields"])
+    conditioning_names = tuple(str(value) for value in ckpt["conditioning_names"])
+    expected_conditioning_names = tuple(str(value) for value in ckpt["param_names"]) + (
+        TRANSITION_TIME_NAME,
+    )
+    if conditioning_names != expected_conditioning_names:
+        raise ValueError(
+            "Checkpoint conditioning_names do not match the direct-jump contract: "
+            f"expected {list(expected_conditioning_names)!r}, got {list(conditioning_names)!r}"
+        )
+    sampling = dict(ckpt.get("sampling", {}))
+    if (
+        "transition_jump_days_min" not in sampling
+        or "transition_jump_days_max" not in sampling
+    ):
+        raise ValueError(
+            "Checkpoint sampling metadata is missing the variable-jump day range. "
+            "Export only supports checkpoints trained with explicit day-valued jumps."
+        )
     residual_input_indices = [input_fields.index(field_name) for field_name in target_fields]
 
     core_model = build_state_conditioned_transition_model(
@@ -492,6 +527,7 @@ def main() -> None:
     normalization = dict(ckpt["normalization"])
     input_state_stats = dict(normalization["input_state"])
     params_stats = dict(normalization["params"])
+    transition_time_stats = _require_transition_time_stats(normalization)
 
     with torch.inference_mode():
         example_params = torch.tensor(
@@ -500,19 +536,8 @@ def main() -> None:
             device=device,
         )[None, :]
         example_params = example_params.repeat(int(EXAMPLE_BATCH_SIZE), 1)
-        transition_time_stats = dict(
-            normalization.get(
-                "transition_time",
-                {
-                    "mean": [0.0],
-                    "std": [1.0],
-                    "is_constant": [True],
-                    "zscore_eps": float(params_stats["zscore_eps"]),
-                },
-            )
-        )
         example_transition_days = torch.tensor(
-            transition_time_stats["mean"],
+            [10.0 ** float(transition_time_stats["mean"][0])],
             dtype=torch.float32,
             device=device,
         ).reshape(1).repeat(int(EXAMPLE_BATCH_SIZE))

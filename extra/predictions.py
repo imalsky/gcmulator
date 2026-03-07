@@ -287,15 +287,14 @@ def _load_comparison_example(
             dt_seconds=float(solver_cfg["dt_seconds"]),
         )
         anchor_step = 0
-        state_inputs_phys, state_targets_phys, _, _ = run_trajectory_window(
+        state_inputs_phys, state_targets_phys = run_trajectory_window(
             params,
             M=int(solver_cfg["M"]),
             dt_seconds=float(solver_cfg["dt_seconds"]),
             time_days=float(COMPARE_DAY),
             starttime_index=int(solver_cfg["starttime_index"]),
-            window_start_step=anchor_step,
-            n_transitions=1,
-            transition_jump_steps=int(target_step),
+            anchor_steps=np.asarray([anchor_step], dtype=np.int64),
+            target_steps=np.asarray([target_step], dtype=np.int64),
         )
         state0_norm = normalize_state_tensor(
             np.asarray(state_inputs_phys, dtype=np.float32),

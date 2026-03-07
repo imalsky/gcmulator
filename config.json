@@ -17,7 +17,8 @@
   },
   "sampling": {
     "seed": 42,
-    "n_sims": 100,
+    "n_sims": 50,
+    "generation_workers": 0,
     "burn_in_days": 0.0,
     "transitions_per_simulation": 128,
     "transition_jump_days_min": 0.1,

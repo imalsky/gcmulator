@@ -17,6 +17,7 @@ import logging
 import math
 from pathlib import Path
 import shutil
+import time
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -329,6 +330,8 @@ def _raw_file_signature(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str, A
 
 def _build_preprocess_fingerprint(*, cfg: GCMulatorConfig, files: Sequence[Path]) -> Dict[str, Any]:
     """Build reproducibility fingerprint for processed-data cache reuse."""
+    sampling_fingerprint = asdict(cfg.sampling)
+    sampling_fingerprint.pop("generation_workers", None)
     return {
         "version": PREPROCESS_FINGERPRINT_VERSION,
         "input_fields": list(PHYSICAL_STATE_FIELDS),
@@ -338,7 +341,7 @@ def _build_preprocess_fingerprint(*, cfg: GCMulatorConfig, files: Sequence[Path]
         "test_fraction": float(cfg.training.test_fraction),
         "normalization": asdict(cfg.normalization),
         "solver": asdict(cfg.solver),
-        "sampling": asdict(cfg.sampling),
+        "sampling": sampling_fingerprint,
         "geometry": asdict(cfg.geometry),
         "raw_files": [_raw_file_signature(file_path, cfg=cfg) for file_path in files],
     }
@@ -938,7 +941,7 @@ def _compute_one_step_metrics(
 
 def _write_training_history_csv(*, history: Sequence[Dict[str, float]], csv_path: Path) -> None:
     """Write per-epoch training history rows to CSV."""
-    field_names = ["epoch", "train_loss", "val_loss", "lr"]
+    field_names = ["epoch", "train_loss", "val_loss", "lr", "epoch_seconds"]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=field_names)
         writer.writeheader()
@@ -946,11 +949,19 @@ def _write_training_history_csv(*, history: Sequence[Dict[str, float]], csv_path
             writer.writerow(
                 {
                     "epoch": int(round(float(row["epoch"]))),
-                    "train_loss": f"{float(row['train_loss']):.8e}",
-                    "val_loss": f"{float(row['val_loss']):.8e}",
-                    "lr": f"{float(row['lr']):.8e}",
+                    "train_loss": _format_sigfig(float(row["train_loss"])),
+                    "val_loss": _format_sigfig(float(row["val_loss"])),
+                    "lr": _format_sigfig(float(row["lr"])),
+                    "epoch_seconds": f"{float(row['epoch_seconds']):.2f}",
                 }
             )
+
+
+def _format_sigfig(value: float, *, digits: int = 4) -> str:
+    """Format one scalar with a fixed number of significant figures."""
+    if digits < 1:
+        raise ValueError("digits must be >= 1")
+    return f"{float(value):.{int(digits)}g}"
 
 
 def _check_finite_tensor(tensor: torch.Tensor, *, name: str) -> None:
@@ -1249,6 +1260,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     # Optimization loop
     # ------------------------------------------------------------------
     for epoch in range(1, epochs + 1):
+        epoch_start = time.perf_counter()
         if scheduler_type == "cosine_warmup":
             _set_optimizer_lr(
                 optimizer,
@@ -1341,13 +1353,15 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             scheduler.step(val_loss)
 
         current_lr = float(optimizer.param_groups[0]["lr"])
+        epoch_seconds = time.perf_counter() - epoch_start
         LOGGER.info(
-            "Epoch %4d/%4d | train=%.6e | val=%.6e | lr=%.6e",
+            "Epoch %4d/%4d | train=%s | val=%s | lr=%s | time=%.2fs",
             epoch,
             epochs,
-            train_loss,
-            val_loss,
-            current_lr,
+            _format_sigfig(train_loss),
+            _format_sigfig(val_loss),
+            _format_sigfig(current_lr),
+            epoch_seconds,
         )
         history.append(
             {
@@ -1355,6 +1369,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "lr": current_lr,
+                "epoch_seconds": epoch_seconds,
             }
         )
 
@@ -1386,6 +1401,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             "train_loss": float(train_loss),
             "val_loss": float(val_loss),
             "learning_rate": float(current_lr),
+            "epoch_seconds": float(epoch_seconds),
         }
         torch.save(checkpoint, last_path)
         if _loss_improved(current=val_loss, best=best_val, min_delta=scheduler_eps):

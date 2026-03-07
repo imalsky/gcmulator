@@ -7,13 +7,14 @@ from pathlib import Path
 
 import numpy as np
 
-from config import CONDITIONING_PARAM_NAMES, load_config
+from config import CONDITIONING_PARAM_NAMES, TRANSITION_TIME_NAME, load_config
 from geometry import geometry_shift_for_nlon
 from training import preprocess_dataset
 
 
 def _config_dict() -> dict[str, object]:
     """Return a small preprocessing-only config."""
+    fixed_jump_days = 2.0 * 240.0 / 86400.0
     return {
         "paths": {
             "dataset_dir": "raw",
@@ -37,8 +38,8 @@ def _config_dict() -> dict[str, object]:
             "generation_workers": 0,
             "burn_in_days": 0.0,
             "transitions_per_simulation": 2,
-            "transition_jump_steps": 2,
-            "transition_jump_steps_max": 2,
+            "transition_jump_days_min": fixed_jump_days,
+            "transition_jump_days_max": fixed_jump_days,
             "parameters": [
                 {"name": "a_m", "dist": "fixed", "value": 8.2e7},
                 {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
@@ -141,8 +142,8 @@ def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
         "burn_in_days": np.asarray(0.0, dtype=np.float64),
         "dt_seconds": np.asarray(240.0, dtype=np.float64),
         "starttime_index": np.asarray(2, dtype=np.int64),
-        "transition_jump_steps": np.asarray(transition_jump_steps, dtype=np.int64),
-        "anchor_stride_steps": np.asarray(transition_jump_steps, dtype=np.int64),
+        "transition_jump_days_min": np.asarray(transition_days[0], dtype=np.float64),
+        "transition_jump_days_max": np.asarray(transition_days[0], dtype=np.float64),
         "n_transitions": np.asarray(2, dtype=np.int64),
         "M": np.asarray(42, dtype=np.int64),
         "nlat": np.asarray(nlat, dtype=np.int64),
@@ -166,7 +167,7 @@ def test_preprocess_dataset_writes_time_conditioned_shards(tmp_path: Path) -> No
     cfg = load_config(config_path)
     meta = preprocess_dataset(cfg, config_path=config_path)
 
-    assert meta["conditioning_names"] == list(CONDITIONING_PARAM_NAMES) + ["transition_days"]
+    assert meta["conditioning_names"] == list(CONDITIONING_PARAM_NAMES) + [TRANSITION_TIME_NAME]
 
     train_shard_path = tmp_path / "processed" / meta["splits"]["train"][0]["file"]
     with np.load(train_shard_path, allow_pickle=False) as npz:

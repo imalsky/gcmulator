@@ -1,75 +1,78 @@
-# Retrieval Status
+# Retrieval Contract
 
-This folder currently contains a contract check, not a runnable retrieval.
+This folder now contains two pieces:
 
-That is intentional. The checked-in surrogate artifact under
-[`gcmulator/models/v1`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/models/v1)
-does not satisfy the requirements for the retrieval you asked for:
+1. a strict artifact-contract check for the current direct-jump training design
+2. a batched Torch runtime for many-sample surrogate inference when the export is valid
 
-1. It is a PyTorch/TorchScript export, while the requested light-curve stage is
-   JAX / `jaxoplanet`.
-2. Its forward signature is fixed-step, not direct-jump. The export takes
-   `(state0, params)` instead of `(state0, params, transition_days)`.
-3. The saved checkpoint conditions on the 7 physical parameters only. It does
-   not include the current `transition_time` normalization block or the
-   `log10_transition_days` conditioning feature.
-4. The saved sampling metadata does not record a variable forward-only jump
-   range, so the artifact is stale relative to the current flexible-jump
-   training contract.
-5. With `dt_seconds = 120`, a `100` day state would require about `72,000`
-   recurrent surrogate steps per likelihood call.
+The important distinction is:
 
-Those four facts together mean the current artifact cannot support a fast,
-GPU-native nested-sampling retrieval through `jaxoplanet`.
+- A valid direct-jump Torch artifact is enough for fast batched surrogate calls on
+  one GPU.
+- It is still **not** enough for the originally requested fully GPU-native
+  `jaxoplanet` retrieval unless the surrogate itself is exported in a JAX-native
+  runtime.
 
-## What is in this folder
+## What changed
+
+The retrieval code now enforces the current time-jump contract instead of
+silently tolerating stale checkpoints:
+
+1. The checkpoint must include `normalization.transition_time`.
+2. That transition-time feature must be named `log10_transition_days`.
+3. The conditioning vector must be
+   `param_names + ["log10_transition_days"]`.
+4. The export forward signature must accept
+   `(state0, params, transition_days)`.
+5. The checkpoint sampling metadata must record
+   `transition_jump_days_min/max`.
+
+That matches the current training/export methodology:
+
+- raw data stores physical `transition_days`
+- conditioning is learned in log space through `log10_transition_days`
+- the export accepts physical `transition_days` and normalizes them internally
+
+## Files
 
 - [`surrogate_backend.py`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/retrieval/surrogate_backend.py)
-  inspects the saved export and checkpoint and reports whether they are ready
-  for the requested retrieval contract.
+  inspects artifacts and provides `TorchSurrogateRuntime`, a batched inference
+  wrapper for valid direct-jump Torch exports.
 - [`run_surrogate_nss.py`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/retrieval/run_surrogate_nss.py)
-  runs that inspection, writes
+  has a small config block at the top, writes
   [`artifact_readiness.json`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/retrieval/artifact_readiness.json),
-  and then fails fast with the blocker list.
+  and optionally benchmarks the Torch runtime when the artifact is valid.
 
-## Why the current artifact is not enough
+## GPU usage
 
-The earlier retrieval draft in this folder tried to bridge the Torch surrogate
-into JAX with callbacks. That path was removed because it violates the current
-requirements:
+For a valid direct-jump Torch artifact, the runtime is set up for throughput:
 
-1. A callback bridge is not GPU-native.
-2. A callback bridge still leaves the model fixed-step, so long-horizon
-   retrieval remains too slow.
-3. Keeping dead or misleading code here would make the repository contract
-   worse, not better.
+1. It batches likelihood-side surrogate calls with `max_batch_size`.
+2. On CUDA it uses pinned host memory for CPU-to-GPU transfers.
+3. State tensors can be moved in channels-last format for conv-heavy inference.
+4. TF32 can be enabled for faster inference on recent NVIDIA GPUs.
 
-## What has to change outside this folder
+Those controls live in the `SurrogateRuntimeConfig` nested inside the config
+block at the top of
+[`run_surrogate_nss.py`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/retrieval/run_surrogate_nss.py).
 
-The retrieval itself can only become fast once the saved model artifact changes.
-The important changes are outside `retrieval/`:
+## Current blocker
 
-1. Train a variable-jump surrogate that explicitly conditions on
-   `transition_days`, ideally in log-space via `log10_transition_days`.
-2. Export a direct-jump artifact whose runtime signature includes
-   `transition_days`.
-3. For the strict `jaxoplanet` requirement, export or port the surrogate to a
-   JAX-native runtime so the entire likelihood stays inside one compiled graph.
-4. Include long-horizon or equilibrium-target pairs in training so the model can
-   learn trajectories starting from the initial state and relaxing toward
-   equilibrium.
-5. Store the variable-jump day range and transition-time normalization stats in
-   the checkpoint/export metadata so retrieval can validate the artifact
-   contract before running.
+The checked-in artifact under
+[`models/v1`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/models/v1)
+is still stale relative to the new methodology:
 
-## Practical implication
+1. Its checkpoint does not contain `transition_time`.
+2. Its conditioning vector does not include `log10_transition_days`.
+3. Its export signature is fixed-step instead of direct-jump.
+4. Its sampling metadata still lacks the day-valued jump range.
 
-If you want a real retrieval now, one of these must happen first:
+So the repository now fails for the right reasons, with the right report, while
+still providing the runtime you need once a fresh direct-jump export exists.
 
-1. Provide a JAX-native direct-jump surrogate artifact.
-2. Retrain/export the current surrogate so it is direct-jump and time-aware,
-   then decide whether the light-curve stage must remain in JAX.
+## Practical use
 
-Until then, the best thing the retrieval folder can do is fail fast and report
-the exact blockers instead of advertising a retrieval path that will be slow or
-architecturally wrong.
+1. Leave `require_gpu_native_jax = true` if you want the runner to enforce the
+   full intended `jaxoplanet` architecture.
+2. Set `require_gpu_native_jax = false` if you want to smoke-test a valid
+   direct-jump Torch artifact before the JAX-native surrogate export exists.

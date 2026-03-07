@@ -275,18 +275,21 @@ def stats_from_json(data: Dict[str, object]) -> NormalizationStats:
     input_state = dict(data["input_state"])
     target_state = dict(data["target_state"])
     params = dict(data["params"])
-    transition_time = dict(
-        data.get(
-            "transition_time",
-            {
-                "param_names": [TRANSITION_TIME_NAME],
-                "mean": [0.0],
-                "std": [1.0],
-                "is_constant": [True],
-                "zscore_eps": float(params["zscore_eps"]),
-            },
+    if "transition_time" not in data:
+        raise ValueError(
+            "Invalid normalization JSON: missing `transition_time` block for "
+            f"`{TRANSITION_TIME_NAME}`"
         )
+    transition_time = dict(data["transition_time"])
+    transition_time_names = tuple(
+        str(value) for value in transition_time.get("param_names", ())
     )
+    if transition_time_names != (TRANSITION_TIME_NAME,):
+        raise ValueError(
+            "Invalid normalization JSON: "
+            f"`transition_time.param_names` must be [{TRANSITION_TIME_NAME!r}], "
+            f"got {list(transition_time_names)!r}"
+        )
 
     param_mean = np.asarray(params["mean"], dtype=np.float64)
     param_is_constant = np.asarray(

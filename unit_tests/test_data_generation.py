@@ -49,8 +49,8 @@ def _sample_params() -> list:
 def test_batched_trajectory_windows_match_serial() -> None:
     """The batched trajectory extractor must preserve serial results."""
     params_list = _sample_params()
-    window_starts = np.array([0, 2], dtype=np.int64)
-    transition_jump_steps = 2
+    anchor_steps_batch = np.array([[0, 2, 4], [1, 3, 5]], dtype=np.int64)
+    target_steps_batch = np.array([[1, 4, 5], [2, 5, 7]], dtype=np.int64)
     serial = [
         run_trajectory_window(
             params,
@@ -58,37 +58,33 @@ def test_batched_trajectory_windows_match_serial() -> None:
             dt_seconds=240.0,
             time_days=0.05,
             starttime_index=2,
-            window_start_step=int(window_starts[index]),
-            n_transitions=3,
-            transition_jump_steps=transition_jump_steps,
+            anchor_steps=anchor_steps_batch[index],
+            target_steps=target_steps_batch[index],
         )
         for index, params in enumerate(params_list)
     ]
     params_matrix = np.stack([params.to_vector() for params in params_list], axis=0)
-    batched = run_trajectory_windows_batched(
+    batched_inputs, batched_targets = run_trajectory_windows_batched(
         params_matrix,
         M=42,
         dt_seconds=240.0,
         time_days=0.05,
         starttime_index=2,
-        window_start_steps=window_starts,
-        n_transitions=3,
-        transition_jump_steps=transition_jump_steps,
+        anchor_steps_batch=anchor_steps_batch,
+        target_steps_batch=target_steps_batch,
         k6=params_list[0].K6,
         k6phi=params_list[0].K6Phi,
     )
 
     for index in range(len(params_list)):
-        state_inputs, state_targets, transition_days, anchor_steps = serial[index]
-        assert np.allclose(state_inputs, batched[0][index])
-        assert np.allclose(state_targets, batched[1][index])
-        assert np.allclose(transition_days, batched[2][index])
-        assert np.array_equal(anchor_steps, batched[3][index])
-        assert np.array_equal(np.diff(anchor_steps), np.full((2,), transition_jump_steps))
+        state_inputs, state_targets = serial[index]
+        assert np.allclose(state_inputs, batched_inputs[index])
+        assert np.allclose(state_targets, batched_targets[index])
 
 
 def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None:
     """A minimal generation run should work with burn-in disabled and batch size > 1."""
+    step_days = 240.0 / 86400.0
     cfg_dict = {
         "paths": {
             "dataset_dir": "raw",
@@ -112,8 +108,8 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "generation_workers": 2,
             "burn_in_days": 0.0,
             "transitions_per_simulation": 2,
-            "transition_jump_steps": 1,
-            "transition_jump_steps_max": 2,
+            "transition_jump_days_min": step_days,
+            "transition_jump_days_max": 2.0 * step_days,
             "parameters": [
                 {"name": "a_m", "dist": "fixed", "value": 8.2e7},
                 {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
@@ -182,15 +178,13 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
 
     assert manifest["n_sims_written"] == 2
     assert len(raw_files) == 2
+    assert manifest["sampling"]["generation_workers"] == 2
+    assert manifest["sampling"]["resolved_generation_batch_size"] == 2
     assert manifest["sampling"]["uses_variable_transition_jump"] is True
     for payload in raw_payloads:
-        jump_steps = int(np.asarray(payload["transition_jump_steps"], dtype=np.int64).item())
-        anchor_stride_steps = int(np.asarray(payload["anchor_stride_steps"], dtype=np.int64).item())
+        transition_days = np.asarray(payload["transition_days"], dtype=np.float64)
         anchor_steps = np.asarray(payload["anchor_steps"], dtype=np.int64)
-        assert jump_steps in {1, 2}
-        assert anchor_stride_steps == jump_steps
-        if anchor_steps.size > 1:
-            assert np.array_equal(
-                np.diff(anchor_steps),
-                np.full((anchor_steps.size - 1,), jump_steps, dtype=np.int64),
-            )
+        jump_steps = np.rint(transition_days * 86400.0 / 240.0).astype(np.int64)
+        assert np.all(jump_steps >= 1)
+        assert np.all(jump_steps <= 2)
+        assert np.all(anchor_steps[:-1] <= anchor_steps[1:])

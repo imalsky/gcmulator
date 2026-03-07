@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import ParameterSpec, SamplingConfig
+from config import ParameterSpec
 from geometry import apply_geometry_state, geometry_shift_for_nlon
-from sampling import sample_parameter_dict, sample_transition_jump_steps, to_extended9
+from sampling import sample_parameter_dict, sample_transition_pairs, to_extended9
 
 
 def test_apply_geometry_state_flips_latitude_and_rolls_longitude() -> None:
@@ -50,16 +50,26 @@ def test_sample_parameter_dict_converts_hour_aliases_to_seconds() -> None:
     assert params.taudrag_s == 6.0 * 3600.0
 
 
-def test_sample_transition_jump_steps_draws_uniform_integer_range() -> None:
-    """Transition jump sampling should cover the configured inclusive range."""
+def test_sample_transition_pairs_respects_bounds_and_integer_step_mapping() -> None:
+    """Sampled transition pairs must stay within the valid rollout horizon."""
     rng = np.random.default_rng(0)
-    draws = sample_transition_jump_steps(
+    anchor_steps, target_steps, transition_days = sample_transition_pairs(
         rng,
-        SamplingConfig(transition_jump_steps=2, transition_jump_steps_max=4),
-        n_samples=32,
+        n_transitions=64,
+        burn_in_steps=0,
+        n_steps_total=8,
+        dt_seconds=240.0,
+        transition_jump_days_min=240.0 / 86400.0,
+        transition_jump_days_max=3.0 * 240.0 / 86400.0,
     )
+    jump_steps = np.rint(transition_days * 86400.0 / 240.0).astype(np.int64)
 
-    assert draws.dtype == np.int64
-    assert np.all(draws >= 2)
-    assert np.all(draws <= 4)
-    assert set(draws.tolist()) == {2, 3, 4}
+    assert anchor_steps.dtype == np.int64
+    assert target_steps.dtype == np.int64
+    assert transition_days.dtype == np.float64
+    assert np.all(anchor_steps[:-1] <= anchor_steps[1:])
+    assert np.all(target_steps > anchor_steps)
+    assert np.array_equal(target_steps - anchor_steps, jump_steps)
+    assert np.all(jump_steps >= 1)
+    assert np.all(jump_steps <= 3)
+    assert np.all(target_steps <= 8)

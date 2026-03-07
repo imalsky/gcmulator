@@ -155,8 +155,8 @@ def sample_transition_pairs(
         raise ValueError("dt_seconds must be > 0")
     if transition_jump_days_min <= 0:
         raise ValueError("transition_jump_days_min must be > 0")
-    if transition_jump_days_min >= transition_jump_days_max:
-        raise ValueError("transition_jump_days_min must be < transition_jump_days_max")
+    if transition_jump_days_min > transition_jump_days_max:
+        raise ValueError("transition_jump_days_min must be <= transition_jump_days_max")
 
     min_jump_steps = max(1, int(math.ceil(
         transition_jump_days_min * SECONDS_PER_DAY / dt_seconds

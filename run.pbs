@@ -85,14 +85,16 @@ if [ ! -f "${MAIN_PY}" ]; then
   exit 1
 fi
 
-echo "Reinstalling my_swamp package only: ${MY_SWAMP_PACKAGE_SPEC}"
-python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
-: > "${MY_SWAMP_INSTALL_LOG}"
-if ! python -m pip install --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_PACKAGE_SPEC}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
-  echo "ERROR: failed to install my_swamp from spec: ${MY_SWAMP_PACKAGE_SPEC}"
-  tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
-  exit 1
-fi
+echo "Skipping my_swamp reinstall; using the existing environment/package path."
+# Re-enable this block if you need the job to reinstall my_swamp before running.
+# echo "Reinstalling my_swamp package only: ${MY_SWAMP_PACKAGE_SPEC}"
+# python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
+# : > "${MY_SWAMP_INSTALL_LOG}"
+# if ! python -m pip install --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_PACKAGE_SPEC}" >> "${MY_SWAMP_INSTALL_LOG}" 2>&1; then
+#   echo "ERROR: failed to install my_swamp from spec: ${MY_SWAMP_PACKAGE_SPEC}"
+#   tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
+#   exit 1
+# fi
 
 if ! python - <<'PY'
 import my_swamp
@@ -101,12 +103,20 @@ print(f"my_swamp import OK from: {getattr(my_swamp, '__file__', '<namespace>')}"
 print(f"python executable: {sys.executable}")
 PY
 then
-  echo "ERROR: my_swamp import failed after package install (${MY_SWAMP_PACKAGE_SPEC})"
+  echo "ERROR: my_swamp import failed from the existing environment/package path."
   tail -n 200 "${MY_SWAMP_INSTALL_LOG}" || true
   exit 1
 fi
 
-if [ "${TORCH_HARMONICS_FORCE_REINSTALL}" != "1" ] && python - <<'PY'
+if [ "${TORCH_HARMONICS_FORCE_REINSTALL}" = "1" ]; then
+  echo "ERROR: TORCH_HARMONICS_FORCE_REINSTALL=1 was requested, but reinstall steps are commented out in this script."
+  echo "Uncomment the torch_harmonics reinstall block below to restore that behavior."
+  exit 1
+fi
+
+# Original reinstall gate, kept here for easy restoration:
+# if [ "${TORCH_HARMONICS_FORCE_REINSTALL}" != "1" ] && python - <<'PY'
+if python - <<'PY'
 import sys
 import torch_harmonics
 print(f"torch_harmonics import OK from: {getattr(torch_harmonics, '__file__', '<namespace>')}")
@@ -115,36 +125,40 @@ PY
 then
   echo "Using existing torch_harmonics install; skipping reinstall."
 else
-  if [[ "${TORCH_HARMONICS_PACKAGE_SPEC}" == git+* ]] && ! command -v git >/dev/null 2>&1; then
-    echo "ERROR: git is required to install TORCH_HARMONICS_PACKAGE_SPEC='${TORCH_HARMONICS_PACKAGE_SPEC}'."
-    exit 1
-  fi
-  echo "Reinstalling torch_harmonics package: ${TORCH_HARMONICS_PACKAGE_SPEC}"
-  python -m pip uninstall -y torch_harmonics torch-harmonics >/dev/null 2>&1 || true
-  : > "${TORCH_HARMONICS_INSTALL_LOG}"
-  if [ "${TORCH_HARMONICS_FORCE_CPU_BUILD}" = "1" ]; then
-    echo "torch_harmonics install mode: CPU-extension build (CUDA_VISIBLE_DEVICES='')" >> "${TORCH_HARMONICS_INSTALL_LOG}"
-    TH_INSTALL_PREFIX=(env CUDA_VISIBLE_DEVICES= FORCE_CUDA_EXTENSION=0)
-  else
-    echo "torch_harmonics install mode: auto CUDA detection" >> "${TORCH_HARMONICS_INSTALL_LOG}"
-    TH_INSTALL_PREFIX=()
-  fi
-  if ! "${TH_INSTALL_PREFIX[@]}" python -m pip install --upgrade "${TORCH_HARMONICS_PIP_ARGS_ARR[@]}" "${TORCH_HARMONICS_PACKAGE_SPEC}" >> "${TORCH_HARMONICS_INSTALL_LOG}" 2>&1; then
-    echo "ERROR: failed to install torch_harmonics from spec: ${TORCH_HARMONICS_PACKAGE_SPEC}"
-    tail -n 200 "${TORCH_HARMONICS_INSTALL_LOG}" || true
-    exit 1
-  fi
-  if ! python - <<'PY'
-import sys
-import torch_harmonics
-print(f"torch_harmonics import OK from: {getattr(torch_harmonics, '__file__', '<namespace>')}")
-print(f"python executable: {sys.executable}")
-PY
-  then
-    echo "ERROR: torch_harmonics import failed after package install (${TORCH_HARMONICS_PACKAGE_SPEC})"
-    tail -n 200 "${TORCH_HARMONICS_INSTALL_LOG}" || true
-    exit 1
-  fi
+  echo "ERROR: torch_harmonics import failed from the existing environment/package path."
+  tail -n 200 "${TORCH_HARMONICS_INSTALL_LOG}" || true
+  # Re-enable this block if you need the job to reinstall torch_harmonics before running.
+  # if [[ "${TORCH_HARMONICS_PACKAGE_SPEC}" == git+* ]] && ! command -v git >/dev/null 2>&1; then
+  #   echo "ERROR: git is required to install TORCH_HARMONICS_PACKAGE_SPEC='${TORCH_HARMONICS_PACKAGE_SPEC}'."
+  #   exit 1
+  # fi
+  # echo "Reinstalling torch_harmonics package: ${TORCH_HARMONICS_PACKAGE_SPEC}"
+  # python -m pip uninstall -y torch_harmonics torch-harmonics >/dev/null 2>&1 || true
+  # : > "${TORCH_HARMONICS_INSTALL_LOG}"
+  # if [ "${TORCH_HARMONICS_FORCE_CPU_BUILD}" = "1" ]; then
+  #   echo "torch_harmonics install mode: CPU-extension build (CUDA_VISIBLE_DEVICES='')" >> "${TORCH_HARMONICS_INSTALL_LOG}"
+  #   TH_INSTALL_PREFIX=(env CUDA_VISIBLE_DEVICES= FORCE_CUDA_EXTENSION=0)
+  # else
+  #   echo "torch_harmonics install mode: auto CUDA detection" >> "${TORCH_HARMONICS_INSTALL_LOG}"
+  #   TH_INSTALL_PREFIX=()
+  # fi
+  # if ! "${TH_INSTALL_PREFIX[@]}" python -m pip install --upgrade "${TORCH_HARMONICS_PIP_ARGS_ARR[@]}" "${TORCH_HARMONICS_PACKAGE_SPEC}" >> "${TORCH_HARMONICS_INSTALL_LOG}" 2>&1; then
+  #   echo "ERROR: failed to install torch_harmonics from spec: ${TORCH_HARMONICS_PACKAGE_SPEC}"
+  #   tail -n 200 "${TORCH_HARMONICS_INSTALL_LOG}" || true
+  #   exit 1
+  # fi
+  # if ! python - <<'PY'
+  # import sys
+  # import torch_harmonics
+  # print(f"torch_harmonics import OK from: {getattr(torch_harmonics, '__file__', '<namespace>')}")
+  # print(f"python executable: {sys.executable}")
+  # PY
+  # then
+  #   echo "ERROR: torch_harmonics import failed after package install (${TORCH_HARMONICS_PACKAGE_SPEC})"
+  #   tail -n 200 "${TORCH_HARMONICS_INSTALL_LOG}" || true
+  #   exit 1
+  # fi
+  exit 1
 fi
 
 echo "Runtime preflight on host: $(hostname)"

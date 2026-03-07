@@ -203,6 +203,62 @@ def _initialize_trajectory_state(
     )
 
 
+def _initialize_trajectory_state_from_vector(
+    param_vector: Any,
+    *,
+    M: int,
+    dt_seconds: float,
+    starttime_index: int,
+    k6: float,
+    k6phi: float | None,
+) -> tuple[Any, Any, Any, Any]:
+    """Build static operators and initial state from a conditioning vector."""
+    import jax.numpy as jnp
+    from my_swamp.model import run_model_scan
+
+    (
+        a_m,
+        omega_rad_s,
+        Phibar,
+        DPhieq,
+        taurad_s,
+        taudrag_s,
+        g_m_s2,
+    ) = param_vector
+
+    init_out = run_model_scan(
+        M=int(M),
+        dt=float(dt_seconds),
+        Phibar=Phibar,
+        omega=omega_rad_s,
+        a=a_m,
+        test=None,
+        g=g_m_s2,
+        forcflag=True,
+        taurad=taurad_s,
+        taudrag=taudrag_s,
+        DPhieq=DPhieq,
+        diffflag=True,
+        modalflag=True,
+        expflag=False,
+        K6=float(k6),
+        K6Phi=k6phi,
+        diagnostics=False,
+        return_history=False,
+        starttime=int(starttime_index),
+        tmax=int(starttime_index),
+        jit_scan=True,
+        donate_state=True,
+    )
+    current_state_full = init_out["last_state"]
+    return (
+        init_out["static"],
+        current_state_full,
+        jnp.asarray(current_state_full.U_curr),
+        jnp.asarray(current_state_full.V_curr),
+    )
+
+
 @lru_cache(maxsize=1)
 def _get_reduced_carry_chunk_runner() -> Any:
     """Build and cache a jitted chunk runner returning reduced-carry outputs."""
@@ -228,6 +284,237 @@ def _get_reduced_carry_chunk_runner() -> Any:
         return jax.lax.scan(_step, state0, t_seq)
 
     return jax.jit(_scan_chunk, donate_argnums=(2,))
+
+
+@lru_cache(maxsize=8)
+def _get_batched_trajectory_initializer(
+    *,
+    M: int,
+    dt_seconds: float,
+    starttime_index: int,
+    k6: float,
+    k6phi: float | None,
+) -> Any:
+    """Return a cached batched initializer for trajectory extraction."""
+    import jax
+
+    return jax.vmap(
+        lambda param_vector: _initialize_trajectory_state_from_vector(
+            param_vector,
+            M=M,
+            dt_seconds=dt_seconds,
+            starttime_index=starttime_index,
+            k6=k6,
+            k6phi=k6phi,
+        )
+    )
+
+
+@lru_cache(maxsize=8)
+def _get_batched_trajectory_window_runner(
+    *,
+    n_steps_total: int,
+    starttime_index: int,
+    n_transitions: int,
+) -> Any:
+    """Return a cached batched rollout runner for arbitrary checkpoint pairs."""
+    import jax
+    import jax.numpy as jnp
+    from my_swamp.model import _step_once_state_only
+
+    flags = _build_run_flags(diagnostics=False)
+    rel_steps = jnp.arange(1, int(n_steps_total) + 1, dtype=jnp.int32)
+    current_field_indices = jnp.asarray(CURRENT_FIELD_INDICES, dtype=jnp.int32)
+    prognostic_field_indices = jnp.asarray(PROGNOSTIC_FIELD_INDICES, dtype=jnp.int32)
+
+    def _step_one_sample(
+        state_i: Any,
+        input_buffer_i: Any,
+        target_buffer_i: Any,
+        static_i: Any,
+        Uic_i: Any,
+        Vic_i: Any,
+        anchor_steps_i: Any,
+        target_steps_i: Any,
+        max_target_step_i: Any,
+        rel_step: Any,
+    ) -> tuple[Any, Any, Any]:
+        """Advance one sample by one step when it still has pending checkpoints."""
+
+        def _do_step(_: None) -> tuple[Any, Any, Any]:
+            abs_t = jnp.asarray(int(starttime_index), dtype=jnp.int32) + rel_step - 1
+            new_state = _step_once_state_only(
+                state_i,
+                abs_t,
+                static_i,
+                flags,
+                None,
+                Uic_i,
+                Vic_i,
+            )
+            reduced = _stack_reduced_carry_state_jax(new_state)
+            current_fields = jnp.take(reduced, current_field_indices, axis=0)
+            prognostic_fields = jnp.take(reduced, prognostic_field_indices, axis=0)
+            input_match = anchor_steps_i == rel_step
+            target_match = target_steps_i == rel_step
+            input_buffer_next = jnp.where(
+                input_match[:, None, None, None],
+                current_fields[None, ...],
+                input_buffer_i,
+            )
+            target_buffer_next = jnp.where(
+                target_match[:, None, None, None],
+                prognostic_fields[None, ...],
+                target_buffer_i,
+            )
+            return new_state, input_buffer_next, target_buffer_next
+
+        return jax.lax.cond(
+            rel_step <= max_target_step_i,
+            _do_step,
+            lambda _: (state_i, input_buffer_i, target_buffer_i),
+            operand=None,
+        )
+
+    def _run(
+        static_batch: Any,
+        state_batch: Any,
+        Uic_batch: Any,
+        Vic_batch: Any,
+        anchor_steps_batch: Any,
+        target_steps_batch: Any,
+    ) -> tuple[Any, Any]:
+        """Advance a batch of trajectories and materialize the requested windows."""
+        reduced0 = jax.vmap(_stack_reduced_carry_state_jax)(state_batch)
+        current_fields0 = jnp.take(reduced0, current_field_indices, axis=1)
+        batch_size = int(current_fields0.shape[0])
+        nlat = int(current_fields0.shape[-2])
+        nlon = int(current_fields0.shape[-1])
+        max_target_steps = jnp.max(target_steps_batch, axis=1)
+
+        input_buffer = jnp.zeros(
+            (batch_size, int(n_transitions), len(CURRENT_FIELD_INDICES), nlat, nlon),
+            dtype=current_fields0.dtype,
+        )
+        input_buffer = jnp.where(
+            anchor_steps_batch[:, :, None, None, None] == 0,
+            current_fields0[:, None, ...],
+            input_buffer,
+        )
+        target_buffer = jnp.zeros(
+            (batch_size, int(n_transitions), len(PROGNOSTIC_FIELD_INDICES), nlat, nlon),
+            dtype=current_fields0.dtype,
+        )
+
+        def _scan_step(
+            carry: tuple[Any, Any, Any],
+            rel_step: Any,
+        ) -> tuple[tuple[Any, Any, Any], None]:
+            state_curr, input_curr, target_curr = carry
+            state_next, input_next, target_next = jax.vmap(
+                _step_one_sample,
+                in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None),
+            )(
+                state_curr,
+                input_curr,
+                target_curr,
+                static_batch,
+                Uic_batch,
+                Vic_batch,
+                anchor_steps_batch,
+                target_steps_batch,
+                max_target_steps,
+                rel_step,
+            )
+            return (state_next, input_next, target_next), None
+
+        (_, input_buffer, target_buffer), _ = jax.lax.scan(
+            _scan_step,
+            (state_batch, input_buffer, target_buffer),
+            rel_steps,
+        )
+        return input_buffer, target_buffer
+
+    return jax.jit(_run)
+
+
+def run_trajectory_windows_batched(
+    params_batch: np.ndarray,
+    *,
+    M: int,
+    dt_seconds: float,
+    time_days: float,
+    starttime_index: int,
+    anchor_steps_batch: np.ndarray,
+    target_steps_batch: np.ndarray,
+    k6: float,
+    k6phi: float | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract many trajectory windows in parallel using one vectorized JAX rollout."""
+    import jax
+    import jax.numpy as jnp
+
+    params_batch = np.asarray(params_batch, dtype=np.float64)
+    anchor_steps_batch = np.asarray(anchor_steps_batch, dtype=np.int64)
+    target_steps_batch = np.asarray(target_steps_batch, dtype=np.int64)
+
+    if params_batch.ndim != 2 or params_batch.shape[1] != len(CONDITIONING_PARAM_NAMES):
+        raise ValueError(
+            "params_batch must have shape "
+            f"[B,{len(CONDITIONING_PARAM_NAMES)}], got {params_batch.shape}"
+        )
+    if anchor_steps_batch.ndim != 2 or target_steps_batch.ndim != 2:
+        raise ValueError("anchor_steps_batch and target_steps_batch must be rank-2 arrays")
+    if anchor_steps_batch.shape != target_steps_batch.shape:
+        raise ValueError("anchor_steps_batch and target_steps_batch must have the same shape")
+    if anchor_steps_batch.shape[0] != params_batch.shape[0]:
+        raise ValueError("Batch dimension of step arrays must align with params_batch")
+    if anchor_steps_batch.shape[1] < 1:
+        raise ValueError("At least one transition pair is required per batch element")
+    if time_days <= 0:
+        raise ValueError("time_days must be > 0")
+    if dt_seconds <= 0:
+        raise ValueError("dt_seconds must be > 0")
+    if np.any(anchor_steps_batch < 0):
+        raise ValueError("anchor_steps_batch must be >= 0")
+    if np.any(target_steps_batch <= anchor_steps_batch):
+        raise ValueError("Each target step must be greater than its anchor step")
+
+    n_steps_total = _total_rollout_steps(time_days=time_days, dt_seconds=dt_seconds)
+    if int(np.max(target_steps_batch)) > int(n_steps_total):
+        raise ValueError(
+            "Requested batched trajectory window exceeds the simulated horizon: "
+            f"max_target_step={int(np.max(target_steps_batch))}, available={int(n_steps_total)}"
+        )
+
+    param_batch_jax = jnp.asarray(params_batch, dtype=jnp.float64)
+    anchor_steps_jax = jnp.asarray(anchor_steps_batch, dtype=jnp.int32)
+    target_steps_jax = jnp.asarray(target_steps_batch, dtype=jnp.int32)
+    initializer = _get_batched_trajectory_initializer(
+        M=int(M),
+        dt_seconds=float(dt_seconds),
+        starttime_index=int(starttime_index),
+        k6=float(k6),
+        k6phi=k6phi,
+    )
+    static_batch, state_batch, Uic_batch, Vic_batch = initializer(param_batch_jax)
+    runner = _get_batched_trajectory_window_runner(
+        n_steps_total=int(n_steps_total),
+        starttime_index=int(starttime_index),
+        n_transitions=int(anchor_steps_batch.shape[1]),
+    )
+    state_inputs, state_targets = runner(
+        static_batch,
+        state_batch,
+        Uic_batch,
+        Vic_batch,
+        anchor_steps_jax,
+        target_steps_jax,
+    )
+    return (
+        np.asarray(jax.device_get(state_inputs), dtype=np.float64),
+        np.asarray(jax.device_get(state_targets), dtype=np.float64),
+    )
 
 
 def run_trajectory_window(

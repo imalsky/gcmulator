@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -28,7 +29,7 @@ from config import (
     SECONDS_PER_DAY,
     resolve_path,
 )
-from geometry import geometry_shift_for_nlon
+from geometry import apply_geometry_state
 from my_swamp_backend import (
     conditioning_param_names,
     detect_jax_backend,
@@ -36,11 +37,13 @@ from my_swamp_backend import (
     params_to_conditioning_vector,
     params_to_public_json_dict,
     run_trajectory_window,
+    run_trajectory_windows_batched,
 )
 from sampling import sample_parameter_dict, sample_transition_pairs, to_extended9
 
 
 LOGGER = logging.getLogger("generate")
+GPU_BACKENDS = {"gpu", "cuda", "rocm", "metal"}
 
 
 def _list_existing_raw_files(dataset_dir: Path) -> List[Path]:
@@ -83,33 +86,16 @@ def _write_sim_record(
     if int(state_inputs.shape[0]) == 0:
         raise RuntimeError("Failed to infer geometry metadata for trajectory record")
 
-    # Vectorized geometry canonicalization.
-    nlon = int(state_inputs.shape[3])
-    lon_shift = geometry_shift_for_nlon(nlon, cfg.geometry.roll_longitude_to_0_2pi)
-
-    inputs_geom = state_inputs.astype(np.float64, copy=True)
-    targets_geom = state_targets.astype(np.float64, copy=True)
-    if cfg.geometry.flip_latitude_to_north_south:
-        inputs_geom = inputs_geom[:, :, ::-1, :]
-        targets_geom = targets_geom[:, :, ::-1, :]
-    if lon_shift:
-        inputs_geom = np.roll(inputs_geom, shift=int(lon_shift), axis=-1)
-        targets_geom = np.roll(targets_geom, shift=int(lon_shift), axis=-1)
-    inputs_geom = np.ascontiguousarray(inputs_geom)
-    targets_geom = np.ascontiguousarray(targets_geom)
-
-    nlat = int(state_inputs.shape[2])
-    geometry_info = {
-        "lat_order": (
-            "north_to_south"
-            if cfg.geometry.flip_latitude_to_north_south
-            else "south_to_north"
-        ),
-        "lon_origin": "0_to_2pi" if cfg.geometry.roll_longitude_to_0_2pi else "minus_pi_to_pi",
-        "lon_shift": int(lon_shift),
-        "nlat": int(nlat),
-        "nlon": int(nlon),
-    }
+    inputs_geom, geometry_info = apply_geometry_state(
+        state_inputs.astype(np.float64, copy=True),
+        flip_latitude_to_north_south=cfg.geometry.flip_latitude_to_north_south,
+        roll_longitude_to_0_2pi=cfg.geometry.roll_longitude_to_0_2pi,
+    )
+    targets_geom, _ = apply_geometry_state(
+        state_targets.astype(np.float64, copy=True),
+        flip_latitude_to_north_south=cfg.geometry.flip_latitude_to_north_south,
+        roll_longitude_to_0_2pi=cfg.geometry.roll_longitude_to_0_2pi,
+    )
 
     raw_path = dataset_dir / f"sim_{sim_idx:06d}.npy"
     payload = {
@@ -185,6 +171,44 @@ def _log_progress(*, completed: int, total: int, start_time: float) -> None:
     )
 
 
+def _resolve_generation_batch_size(
+    *,
+    requested_workers: int,
+    n_sims: int,
+    jax_backend: str,
+) -> int:
+    """Resolve the vectorized JAX trajectory batch size for generation."""
+    if n_sims < 1:
+        raise ValueError("n_sims must be >= 1")
+    if requested_workers > 0:
+        return min(int(requested_workers), int(n_sims))
+
+    raw = os.environ.get("GCMULATOR_JAX_SIM_BATCH", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        if jax_backend.lower() in GPU_BACKENDS:
+            auto_gpu = int(os.environ.get("GCMULATOR_JAX_SIM_BATCH_AUTO_GPU", "8"))
+            if auto_gpu < 1:
+                raise ValueError(
+                    "GCMULATOR_JAX_SIM_BATCH_AUTO_GPU must be >= 1, "
+                    f"got {auto_gpu}"
+                )
+            batch_size = auto_gpu
+        else:
+            batch_size = 1
+    else:
+        try:
+            batch_size = int(raw)
+        except Exception as exc:
+            raise ValueError(
+                "GCMULATOR_JAX_SIM_BATCH must be 'auto' or an integer >= 1, "
+                f"got {raw!r}"
+            ) from exc
+        if batch_size < 1:
+            raise ValueError(f"GCMULATOR_JAX_SIM_BATCH must be >= 1, got {batch_size}")
+
+    return min(int(batch_size), int(n_sims))
+
+
 def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
     """Generate the raw transition dataset using MY_SWAMP as the source of truth.
 
@@ -230,24 +254,34 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
     ))
 
     jax_backend = detect_jax_backend()
+    generation_batch_size = _resolve_generation_batch_size(
+        requested_workers=int(cfg.sampling.generation_workers),
+        n_sims=n_sims,
+        jax_backend=jax_backend,
+    )
     LOGGER.info(
-        "Dataset generation | backend=%-6s | n_sims=%d | jump_days=[%.3f,%.3f] | "
-        "input_fields=%s | target_fields=%s",
+        "Dataset generation | backend=%-6s | n_sims=%d | generation_batch_size=%d "
+        "| jump_days=[%.3f,%.3f] | input_fields=%s | target_fields=%s",
         jax_backend,
         n_sims,
+        generation_batch_size,
         float(cfg.sampling.transition_jump_days_min),
         float(cfg.sampling.transition_jump_days_max),
         list(PHYSICAL_STATE_FIELDS),
         list(PROGNOSTIC_TARGET_FIELDS),
     )
+    if jax_backend.lower() in GPU_BACKENDS and generation_batch_size > 1:
+        LOGGER.info(
+            "GPU-vectorized trajectory generation is active with batch_size=%d.",
+            generation_batch_size,
+        )
 
     items: List[Dict[str, Any]] = []
     start_time = time.time()
     log_every = max(1, n_sims // 20)
-
+    sampled_runs: List[Dict[str, Any]] = []
     for sim_idx in range(n_sims):
         params = to_extended9(sample_parameter_dict(rng, cfg.sampling.parameters))
-
         anchor_steps, target_steps, transition_days = sample_transition_pairs(
             rng,
             n_transitions=int(cfg.sampling.transitions_per_simulation),
@@ -257,31 +291,80 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             transition_jump_days_min=float(cfg.sampling.transition_jump_days_min),
             transition_jump_days_max=float(cfg.sampling.transition_jump_days_max),
         )
-
-        state_inputs, state_targets = run_trajectory_window(
-            params,
-            M=int(cfg.solver.M),
-            dt_seconds=float(cfg.solver.dt_seconds),
-            time_days=float(cfg.solver.default_time_days),
-            starttime_index=int(cfg.solver.starttime_index),
-            anchor_steps=anchor_steps,
-            target_steps=target_steps,
+        sampled_runs.append(
+            {
+                "sim_idx": int(sim_idx),
+                "params": params,
+                "anchor_steps": anchor_steps,
+                "target_steps": target_steps,
+                "transition_days": transition_days,
+            }
         )
 
-        item = _write_sim_record(
-            sim_idx=sim_idx,
-            state_inputs=state_inputs,
-            state_targets=state_targets,
-            transition_days=transition_days,
-            anchor_steps=anchor_steps,
-            params_vector=params_to_conditioning_vector(params),
-            params_json=params_to_public_json_dict(params),
-            cfg=cfg,
-            dataset_dir=dataset_dir,
-        )
-        items.append(item)
+    for batch_start in range(0, n_sims, generation_batch_size):
+        batch = sampled_runs[batch_start:batch_start + generation_batch_size]
+        if len(batch) == 1:
+            entry = batch[0]
+            state_inputs, state_targets = run_trajectory_window(
+                entry["params"],
+                M=int(cfg.solver.M),
+                dt_seconds=float(cfg.solver.dt_seconds),
+                time_days=float(cfg.solver.default_time_days),
+                starttime_index=int(cfg.solver.starttime_index),
+                anchor_steps=entry["anchor_steps"],
+                target_steps=entry["target_steps"],
+            )
+            batch_state_inputs = np.asarray(state_inputs, dtype=np.float64)[None, ...]
+            batch_state_targets = np.asarray(state_targets, dtype=np.float64)[None, ...]
+        else:
+            k6_values = {float(entry["params"].K6) for entry in batch}
+            k6phi_values = {entry["params"].K6Phi for entry in batch}
+            if len(k6_values) != 1 or len(k6phi_values) != 1:
+                raise ValueError(
+                    "Batched trajectory generation requires shared internal diffusion controls"
+                )
+            params_batch = np.stack(
+                [
+                    params_to_conditioning_vector(entry["params"])
+                    for entry in batch
+                ],
+                axis=0,
+            )
+            anchor_steps_batch = np.stack(
+                [entry["anchor_steps"] for entry in batch],
+                axis=0,
+            )
+            target_steps_batch = np.stack(
+                [entry["target_steps"] for entry in batch],
+                axis=0,
+            )
+            batch_state_inputs, batch_state_targets = run_trajectory_windows_batched(
+                params_batch,
+                M=int(cfg.solver.M),
+                dt_seconds=float(cfg.solver.dt_seconds),
+                time_days=float(cfg.solver.default_time_days),
+                starttime_index=int(cfg.solver.starttime_index),
+                anchor_steps_batch=anchor_steps_batch,
+                target_steps_batch=target_steps_batch,
+                k6=float(next(iter(k6_values))),
+                k6phi=next(iter(k6phi_values)),
+            )
 
-        completed = sim_idx + 1
+        for batch_index, entry in enumerate(batch):
+            item = _write_sim_record(
+                sim_idx=int(entry["sim_idx"]),
+                state_inputs=batch_state_inputs[batch_index],
+                state_targets=batch_state_targets[batch_index],
+                transition_days=entry["transition_days"],
+                anchor_steps=entry["anchor_steps"],
+                params_vector=params_to_conditioning_vector(entry["params"]),
+                params_json=params_to_public_json_dict(entry["params"]),
+                cfg=cfg,
+                dataset_dir=dataset_dir,
+            )
+            items.append(item)
+
+        completed = min(batch_start + len(batch), n_sims)
         if (completed % log_every) == 0 or completed == n_sims:
             _log_progress(completed=completed, total=n_sims, start_time=start_time)
 
@@ -303,10 +386,13 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         "sampling": {
             "seed": int(cfg.sampling.seed),
             "n_sims": int(cfg.sampling.n_sims),
+            "generation_workers": int(cfg.sampling.generation_workers),
+            "resolved_generation_batch_size": int(generation_batch_size),
             "burn_in_days": float(cfg.sampling.burn_in_days),
             "transitions_per_simulation": int(cfg.sampling.transitions_per_simulation),
             "transition_jump_days_min": float(cfg.sampling.transition_jump_days_min),
             "transition_jump_days_max": float(cfg.sampling.transition_jump_days_max),
+            "uses_variable_transition_jump": bool(cfg.sampling.uses_variable_transition_jump()),
         },
         "geometry": {
             "flip_latitude_to_north_south": bool(cfg.geometry.flip_latitude_to_north_south),
