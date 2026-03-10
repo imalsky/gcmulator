@@ -15,19 +15,21 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
-from config import (
+from .config import (
     CONDITIONING_PARAM_NAMES,
     Extended9Params,
     PHYSICAL_STATE_FIELDS,
-    PROGNOSTIC_TARGET_FIELDS,
     SECONDS_PER_DAY,
 )
 
 
 MIN_ROLLOUT_STEPS = 1
+# Number of solver time-steps advanced per jitted scan chunk. Balances JIT
+# compilation overhead against peak memory from the stacked chunk history.
 CHUNK_STEPS = 256
-CURRENT_FIELD_INDICES = (0, 1, 2, 3, 4)
-PROGNOSTIC_FIELD_INDICES = (0, 3, 4)
+# Indices into the 8-field reduced carry that select the prognostic visible
+# state: Phi_curr(0), eta_curr(3), delta_curr(4).
+CURRENT_FIELD_INDICES = (0, 3, 4)
 
 
 @dataclass(frozen=True)
@@ -81,15 +83,13 @@ def enforce_no_tpu_backend() -> None:
 
 
 def detect_jax_backend() -> str:
-    """Return the active JAX backend name when available."""
-    try:
-        import jax
-    except Exception:
-        return "unknown"
-    try:
-        return str(jax.default_backend()).lower()
-    except Exception:
-        return "unknown"
+    """Return the active JAX backend name.
+
+    Raises if JAX is not importable or the backend cannot be determined.
+    """
+    import jax
+
+    return str(jax.default_backend()).lower()
 
 
 def ensure_my_swamp_importable(_: Path | None = None) -> None:
@@ -311,13 +311,13 @@ def _get_batched_trajectory_initializer(
 
 
 @lru_cache(maxsize=8)
-def _get_batched_trajectory_window_runner(
+def _get_batched_checkpoint_runner(
     *,
     n_steps_total: int,
     starttime_index: int,
-    n_transitions: int,
+    n_checkpoints: int,
 ) -> Any:
-    """Return a cached batched rollout runner for arbitrary checkpoint pairs."""
+    """Return a cached batched rollout runner for uniform checkpoint sequences."""
     import jax
     import jax.numpy as jnp
     from my_swamp.model import _step_once_state_only
@@ -325,23 +325,20 @@ def _get_batched_trajectory_window_runner(
     flags = _build_run_flags(diagnostics=False)
     rel_steps = jnp.arange(1, int(n_steps_total) + 1, dtype=jnp.int32)
     current_field_indices = jnp.asarray(CURRENT_FIELD_INDICES, dtype=jnp.int32)
-    prognostic_field_indices = jnp.asarray(PROGNOSTIC_FIELD_INDICES, dtype=jnp.int32)
 
     def _step_one_sample(
         state_i: Any,
-        input_buffer_i: Any,
-        target_buffer_i: Any,
+        checkpoint_buffer_i: Any,
         static_i: Any,
         Uic_i: Any,
         Vic_i: Any,
-        anchor_steps_i: Any,
-        target_steps_i: Any,
-        max_target_step_i: Any,
+        checkpoint_steps_i: Any,
+        max_checkpoint_step_i: Any,
         rel_step: Any,
-    ) -> tuple[Any, Any, Any]:
-        """Advance one sample by one step when it still has pending checkpoints."""
+    ) -> tuple[Any, Any]:
+        """Advance one sample by one step and materialize requested checkpoints."""
 
-        def _do_step(_: None) -> tuple[Any, Any, Any]:
+        def _do_step(_: None) -> tuple[Any, Any]:
             abs_t = jnp.asarray(int(starttime_index), dtype=jnp.int32) + rel_step - 1
             new_state = _step_once_state_only(
                 state_i,
@@ -354,25 +351,18 @@ def _get_batched_trajectory_window_runner(
             )
             reduced = _stack_reduced_carry_state_jax(new_state)
             current_fields = jnp.take(reduced, current_field_indices, axis=0)
-            prognostic_fields = jnp.take(reduced, prognostic_field_indices, axis=0)
-            input_match = anchor_steps_i == rel_step
-            target_match = target_steps_i == rel_step
-            input_buffer_next = jnp.where(
-                input_match[:, None, None, None],
+            checkpoint_match = checkpoint_steps_i == rel_step
+            checkpoint_buffer_next = jnp.where(
+                checkpoint_match[:, None, None, None],
                 current_fields[None, ...],
-                input_buffer_i,
+                checkpoint_buffer_i,
             )
-            target_buffer_next = jnp.where(
-                target_match[:, None, None, None],
-                prognostic_fields[None, ...],
-                target_buffer_i,
-            )
-            return new_state, input_buffer_next, target_buffer_next
+            return new_state, checkpoint_buffer_next
 
         return jax.lax.cond(
-            rel_step <= max_target_step_i,
+            rel_step <= max_checkpoint_step_i,
             _do_step,
-            lambda _: (state_i, input_buffer_i, target_buffer_i),
+            lambda _: (state_i, checkpoint_buffer_i),
             operand=None,
         )
 
@@ -381,115 +371,102 @@ def _get_batched_trajectory_window_runner(
         state_batch: Any,
         Uic_batch: Any,
         Vic_batch: Any,
-        anchor_steps_batch: Any,
-        target_steps_batch: Any,
-    ) -> tuple[Any, Any]:
-        """Advance a batch of trajectories and materialize the requested windows."""
+        checkpoint_steps_batch: Any,
+    ) -> Any:
+        """Advance a batch of trajectories and materialize checkpoint states."""
         reduced0 = jax.vmap(_stack_reduced_carry_state_jax)(state_batch)
         current_fields0 = jnp.take(reduced0, current_field_indices, axis=1)
         batch_size = int(current_fields0.shape[0])
         nlat = int(current_fields0.shape[-2])
         nlon = int(current_fields0.shape[-1])
-        max_target_steps = jnp.max(target_steps_batch, axis=1)
+        max_checkpoint_steps = jnp.max(checkpoint_steps_batch, axis=1)
 
-        input_buffer = jnp.zeros(
-            (batch_size, int(n_transitions), len(CURRENT_FIELD_INDICES), nlat, nlon),
+        checkpoint_buffer = jnp.zeros(
+            (batch_size, int(n_checkpoints), len(CURRENT_FIELD_INDICES), nlat, nlon),
             dtype=current_fields0.dtype,
         )
-        input_buffer = jnp.where(
-            anchor_steps_batch[:, :, None, None, None] == 0,
+        checkpoint_buffer = jnp.where(
+            checkpoint_steps_batch[:, :, None, None, None] == 0,
             current_fields0[:, None, ...],
-            input_buffer,
-        )
-        target_buffer = jnp.zeros(
-            (batch_size, int(n_transitions), len(PROGNOSTIC_FIELD_INDICES), nlat, nlon),
-            dtype=current_fields0.dtype,
+            checkpoint_buffer,
         )
 
         def _scan_step(
-            carry: tuple[Any, Any, Any],
+            carry: tuple[Any, Any],
             rel_step: Any,
-        ) -> tuple[tuple[Any, Any, Any], None]:
-            state_curr, input_curr, target_curr = carry
-            state_next, input_next, target_next = jax.vmap(
+        ) -> tuple[tuple[Any, Any], None]:
+            state_curr, checkpoint_curr = carry
+            state_next, checkpoint_next = jax.vmap(
                 _step_one_sample,
-                in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None),
+                in_axes=(0, 0, 0, 0, 0, 0, 0, None),
             )(
                 state_curr,
-                input_curr,
-                target_curr,
+                checkpoint_curr,
                 static_batch,
                 Uic_batch,
                 Vic_batch,
-                anchor_steps_batch,
-                target_steps_batch,
-                max_target_steps,
+                checkpoint_steps_batch,
+                max_checkpoint_steps,
                 rel_step,
             )
-            return (state_next, input_next, target_next), None
+            return (state_next, checkpoint_next), None
 
-        (_, input_buffer, target_buffer), _ = jax.lax.scan(
+        (_, checkpoint_buffer), _ = jax.lax.scan(
             _scan_step,
-            (state_batch, input_buffer, target_buffer),
+            (state_batch, checkpoint_buffer),
             rel_steps,
         )
-        return input_buffer, target_buffer
+        return checkpoint_buffer
 
     return jax.jit(_run)
 
 
-def run_trajectory_windows_batched(
+def run_trajectory_checkpoints_batched(
     params_batch: np.ndarray,
     *,
     M: int,
     dt_seconds: float,
     time_days: float,
     starttime_index: int,
-    anchor_steps_batch: np.ndarray,
-    target_steps_batch: np.ndarray,
+    checkpoint_steps_batch: np.ndarray,
     k6: float,
     k6phi: float | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Extract many trajectory windows in parallel using one vectorized JAX rollout."""
+) -> np.ndarray:
+    """Extract many checkpoint sequences in parallel using one vectorized JAX rollout."""
     import jax
     import jax.numpy as jnp
 
     params_batch = np.asarray(params_batch, dtype=np.float64)
-    anchor_steps_batch = np.asarray(anchor_steps_batch, dtype=np.int64)
-    target_steps_batch = np.asarray(target_steps_batch, dtype=np.int64)
+    checkpoint_steps_batch = np.asarray(checkpoint_steps_batch, dtype=np.int64)
 
     if params_batch.ndim != 2 or params_batch.shape[1] != len(CONDITIONING_PARAM_NAMES):
         raise ValueError(
             "params_batch must have shape "
             f"[B,{len(CONDITIONING_PARAM_NAMES)}], got {params_batch.shape}"
         )
-    if anchor_steps_batch.ndim != 2 or target_steps_batch.ndim != 2:
-        raise ValueError("anchor_steps_batch and target_steps_batch must be rank-2 arrays")
-    if anchor_steps_batch.shape != target_steps_batch.shape:
-        raise ValueError("anchor_steps_batch and target_steps_batch must have the same shape")
-    if anchor_steps_batch.shape[0] != params_batch.shape[0]:
-        raise ValueError("Batch dimension of step arrays must align with params_batch")
-    if anchor_steps_batch.shape[1] < 1:
-        raise ValueError("At least one transition pair is required per batch element")
+    if checkpoint_steps_batch.ndim != 2:
+        raise ValueError("checkpoint_steps_batch must be a rank-2 array")
+    if checkpoint_steps_batch.shape[0] != params_batch.shape[0]:
+        raise ValueError("Batch dimension of checkpoint_steps_batch must align with params_batch")
+    if checkpoint_steps_batch.shape[1] < 1:
+        raise ValueError("At least one checkpoint is required per batch element")
+    if np.any(checkpoint_steps_batch < 0):
+        raise ValueError("checkpoint_steps_batch must be >= 0")
     if time_days <= 0:
         raise ValueError("time_days must be > 0")
     if dt_seconds <= 0:
         raise ValueError("dt_seconds must be > 0")
-    if np.any(anchor_steps_batch < 0):
-        raise ValueError("anchor_steps_batch must be >= 0")
-    if np.any(target_steps_batch <= anchor_steps_batch):
-        raise ValueError("Each target step must be greater than its anchor step")
 
     n_steps_total = _total_rollout_steps(time_days=time_days, dt_seconds=dt_seconds)
-    if int(np.max(target_steps_batch)) > int(n_steps_total):
+    if int(np.max(checkpoint_steps_batch)) > int(n_steps_total):
         raise ValueError(
-            "Requested batched trajectory window exceeds the simulated horizon: "
-            f"max_target_step={int(np.max(target_steps_batch))}, available={int(n_steps_total)}"
+            "Requested checkpoint exceeds the simulated horizon: "
+            f"max_checkpoint_step={int(np.max(checkpoint_steps_batch))}, "
+            f"available={int(n_steps_total)}"
         )
 
     param_batch_jax = jnp.asarray(params_batch, dtype=jnp.float64)
-    anchor_steps_jax = jnp.asarray(anchor_steps_batch, dtype=jnp.int32)
-    target_steps_jax = jnp.asarray(target_steps_batch, dtype=jnp.int32)
+    checkpoint_steps_jax = jnp.asarray(checkpoint_steps_batch, dtype=jnp.int32)
     initializer = _get_batched_trajectory_initializer(
         M=int(M),
         dt_seconds=float(dt_seconds),
@@ -498,88 +475,56 @@ def run_trajectory_windows_batched(
         k6phi=k6phi,
     )
     static_batch, state_batch, Uic_batch, Vic_batch = initializer(param_batch_jax)
-    runner = _get_batched_trajectory_window_runner(
+    runner = _get_batched_checkpoint_runner(
         n_steps_total=int(n_steps_total),
         starttime_index=int(starttime_index),
-        n_transitions=int(anchor_steps_batch.shape[1]),
+        n_checkpoints=int(checkpoint_steps_batch.shape[1]),
     )
-    state_inputs, state_targets = runner(
+    checkpoint_states = runner(
         static_batch,
         state_batch,
         Uic_batch,
         Vic_batch,
-        anchor_steps_jax,
-        target_steps_jax,
+        checkpoint_steps_jax,
     )
-    return (
-        np.asarray(jax.device_get(state_inputs), dtype=np.float64),
-        np.asarray(jax.device_get(state_targets), dtype=np.float64),
-    )
+    return np.asarray(jax.device_get(checkpoint_states), dtype=np.float64)
 
 
-def run_trajectory_window(
+def run_trajectory_checkpoints(
     params: Extended9Params,
     *,
     M: int,
     dt_seconds: float,
     time_days: float,
     starttime_index: int,
-    anchor_steps: np.ndarray,
-    target_steps: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract visible states at arbitrary (anchor, target) checkpoint pairs.
-
-    The simulation is run for the full ``time_days`` duration and states are
-    collected at the union of requested anchor and target steps using a
-    memory-efficient chunked scan.  Each (anchor, target) pair may use a
-    different time gap, enabling variable-dt training data.
-
-    Args:
-        params: Physical parameters for the MY_SWAMP run.
-        M: Spectral truncation order.
-        dt_seconds: Solver time step in seconds.
-        time_days: Total simulation duration in days.
-        starttime_index: Number of warm-up steps for two-level scheme.
-        anchor_steps: (T,) int64 array of input-state step indices.
-        target_steps: (T,) int64 array of target-state step indices.
-
-    Returns:
-        state_inputs: (T, 5, H, W) float64 — full visible state at anchors.
-        state_targets: (T, 3, H, W) float64 — prognostic state at targets.
-    """
+    checkpoint_steps: np.ndarray,
+) -> np.ndarray:
+    """Extract visible-state checkpoints from one MY_SWAMP rollout."""
     import jax.numpy as jnp
 
-    anchor_steps = np.asarray(anchor_steps, dtype=np.int64)
-    target_steps = np.asarray(target_steps, dtype=np.int64)
+    checkpoint_steps = np.asarray(checkpoint_steps, dtype=np.int64)
 
-    if anchor_steps.ndim != 1 or target_steps.ndim != 1:
-        raise ValueError("anchor_steps and target_steps must be 1-D arrays")
-    if anchor_steps.shape[0] != target_steps.shape[0]:
-        raise ValueError("anchor_steps and target_steps must have the same length")
-    if anchor_steps.shape[0] < 1:
-        raise ValueError("At least one transition pair is required")
+    if checkpoint_steps.ndim != 1:
+        raise ValueError("checkpoint_steps must be a 1-D array")
+    if checkpoint_steps.shape[0] < 1:
+        raise ValueError("At least one checkpoint is required")
     if time_days <= 0:
         raise ValueError("time_days must be > 0")
     if dt_seconds <= 0:
         raise ValueError("dt_seconds must be > 0")
-    if np.any(anchor_steps < 0):
-        raise ValueError("anchor_steps must be >= 0")
-    if np.any(target_steps <= anchor_steps):
-        raise ValueError("Each target_step must be > its anchor_step")
+    if np.any(checkpoint_steps < 0):
+        raise ValueError("checkpoint_steps must be >= 0")
 
     n_steps_total = _total_rollout_steps(time_days=time_days, dt_seconds=dt_seconds)
-    if int(np.max(target_steps)) > n_steps_total:
+    if int(np.max(checkpoint_steps)) > n_steps_total:
         raise ValueError(
-            "Requested target step exceeds the simulated horizon: "
-            f"max_target_step={int(np.max(target_steps))}, "
+            "Requested checkpoint exceeds the simulated horizon: "
+            f"max_checkpoint_step={int(np.max(checkpoint_steps))}, "
             f"available={n_steps_total}"
         )
 
     required_steps = np.unique(
-        np.concatenate(
-            [np.asarray([0], dtype=np.int64), anchor_steps, target_steps],
-            axis=0,
-        )
+        np.concatenate([np.asarray([0], dtype=np.int64), checkpoint_steps], axis=0)
     )
 
     static, current_state_full, Uic, Vic = _initialize_trajectory_state(
@@ -589,7 +534,6 @@ def run_trajectory_window(
         starttime_index=int(starttime_index),
     )
     flags = _build_run_flags(diagnostics=False)
-
     states_by_step: Dict[int, np.ndarray] = {
         0: _snapshot_from_last_state(current_state_full).as_array().astype(
             np.float64, copy=False
@@ -603,8 +547,7 @@ def run_trajectory_window(
     while req_ptr < len(required_list):
         if step_cursor >= n_steps_total:
             raise RuntimeError(
-                "Failed to collect all requested trajectory checkpoints before "
-                "horizon end"
+                "Failed to collect all requested trajectory checkpoints before horizon end"
             )
         chunk_len = min(CHUNK_STEPS, n_steps_total - step_cursor)
         abs_t0 = starttime_index + step_cursor
@@ -621,16 +564,12 @@ def run_trajectory_window(
         chunk_history_np = np.asarray(chunk_history, dtype=np.float64)
         chunk_end = step_cursor + chunk_len
 
-        # ``chunk_history`` stores the state *after* each simulated step, so
-        # the requested checkpoint at absolute step ``req_step`` lives at
-        # relative index ``rel - 1``.
         while req_ptr < len(required_list) and required_list[req_ptr] <= chunk_end:
             req_step = required_list[req_ptr]
             rel = req_step - step_cursor
             if rel < 1:
                 raise RuntimeError(
-                    f"Invalid relative checkpoint offset {rel} "
-                    f"for req_step={req_step}"
+                    f"Invalid relative checkpoint offset {rel} for req_step={req_step}"
                 )
             states_by_step[req_step] = chunk_history_np[rel - 1].astype(
                 np.float64, copy=False
@@ -640,23 +579,13 @@ def run_trajectory_window(
         step_cursor = chunk_end
 
     current_field_indices = list(CURRENT_FIELD_INDICES)
-    prognostic_field_indices = list(PROGNOSTIC_FIELD_INDICES)
-
-    state_inputs = np.stack(
+    return np.stack(
         [
             np.take(states_by_step[int(step)], current_field_indices, axis=0)
-            for step in anchor_steps.tolist()
+            for step in checkpoint_steps.tolist()
         ],
         axis=0,
     ).astype(np.float64)
-    state_targets = np.stack(
-        [
-            np.take(states_by_step[int(step)], prognostic_field_indices, axis=0)
-            for step in target_steps.tolist()
-        ],
-        axis=0,
-    ).astype(np.float64)
-    return state_inputs, state_targets
 
 
 @lru_cache(maxsize=128)
@@ -701,7 +630,18 @@ def diagnose_winds(
     M: int,
     dt_seconds: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Diagnose physical-space ``U,V`` from physical-space ``eta,delta``."""
+    """Diagnose physical-space ``U,V`` from physical-space ``eta,delta``.
+
+    Args:
+        eta:
+            Physical-space vorticity-like field with shape ``[H, W]``.
+        delta:
+            Physical-space divergence field with shape ``[H, W]``.
+
+    Returns:
+        Two ``[H, W]`` arrays containing the reconstructed ``U`` and ``V``
+        fields.
+    """
     import jax.numpy as jnp
     from my_swamp import spectral_transform as st
 
@@ -751,11 +691,21 @@ def reconstruct_full_state_from_prognostics(
     M: int,
     dt_seconds: float,
 ) -> np.ndarray:
-    """Reconstruct a full physical 5-field state from prognostic ``Phi,eta,delta``."""
-    if prognostics.shape[0] != len(PROGNOSTIC_TARGET_FIELDS):
+    """Reconstruct a full physical 5-field state from prognostic ``Phi,eta,delta``.
+
+    Args:
+        prognostics:
+            Physical prognostic tensor with shape ``[3, H, W]`` ordered as
+            ``(Phi, eta, delta)``.
+
+    Returns:
+        Full visible state with shape ``[5, H, W]`` ordered as
+        ``(Phi, U, V, eta, delta)``.
+    """
+    if prognostics.shape[0] != len(PHYSICAL_STATE_FIELDS):
         raise ValueError(
             "prognostics must have "
-            f"{len(PROGNOSTIC_TARGET_FIELDS)} channels, "
+            f"{len(PHYSICAL_STATE_FIELDS)} channels, "
             f"got {prognostics.shape[0]}"
         )
     phi = np.asarray(prognostics[0], dtype=np.float64)

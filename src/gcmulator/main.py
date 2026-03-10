@@ -7,19 +7,12 @@ import json
 import logging
 import os
 from pathlib import Path
-import sys
 import warnings
 
-
-SRC_ROOT = Path(__file__).resolve().parent
-if str(SRC_ROOT) not in sys.path:
-    # Allow running ``python src/main.py`` without requiring editable install.
-    sys.path.insert(0, str(SRC_ROOT))
-
-from config import load_config
-from data_generation import generate_dataset
-from my_swamp_backend import enforce_no_tpu_backend
-from training import train_emulator
+from .config import load_config
+from .data_generation import generate_dataset
+from .my_swamp_backend import enforce_no_tpu_backend
+from .training import train_emulator
 
 
 def _setup_logging() -> None:

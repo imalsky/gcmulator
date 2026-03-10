@@ -9,10 +9,10 @@ import tempfile
 import numpy as np
 import pytest
 
-from config import load_config
-from data_generation import generate_dataset
-from my_swamp_backend import run_trajectory_window, run_trajectory_windows_batched
-from sampling import to_extended9
+from gcmulator.config import load_config
+from gcmulator.data_generation import generate_dataset
+from gcmulator.my_swamp_backend import run_trajectory_checkpoints, run_trajectory_checkpoints_batched
+from gcmulator.sampling import build_uniform_checkpoint_schedule, to_extended9
 
 
 pytest.importorskip("my_swamp")
@@ -46,45 +46,42 @@ def _sample_params() -> list:
     ]
 
 
-def test_batched_trajectory_windows_match_serial() -> None:
-    """The batched trajectory extractor must preserve serial results."""
+def test_batched_checkpoint_sequences_match_serial() -> None:
+    """The batched checkpoint extractor must preserve serial results."""
     params_list = _sample_params()
-    anchor_steps_batch = np.array([[0, 2, 4], [1, 3, 5]], dtype=np.int64)
-    target_steps_batch = np.array([[1, 4, 5], [2, 5, 7]], dtype=np.int64)
+    checkpoint_steps = np.array([0, 2, 4, 6], dtype=np.int64)
     serial = [
-        run_trajectory_window(
+        run_trajectory_checkpoints(
             params,
             M=42,
             dt_seconds=240.0,
             time_days=0.05,
             starttime_index=2,
-            anchor_steps=anchor_steps_batch[index],
-            target_steps=target_steps_batch[index],
+            checkpoint_steps=checkpoint_steps,
         )
-        for index, params in enumerate(params_list)
+        for params in params_list
     ]
     params_matrix = np.stack([params.to_vector() for params in params_list], axis=0)
-    batched_inputs, batched_targets = run_trajectory_windows_batched(
+    checkpoint_steps_batch = np.repeat(checkpoint_steps[None, :], len(params_list), axis=0)
+    batched = run_trajectory_checkpoints_batched(
         params_matrix,
         M=42,
         dt_seconds=240.0,
         time_days=0.05,
         starttime_index=2,
-        anchor_steps_batch=anchor_steps_batch,
-        target_steps_batch=target_steps_batch,
+        checkpoint_steps_batch=checkpoint_steps_batch,
         k6=params_list[0].K6,
         k6phi=params_list[0].K6Phi,
     )
 
     for index in range(len(params_list)):
-        state_inputs, state_targets = serial[index]
-        assert np.allclose(state_inputs, batched_inputs[index])
-        assert np.allclose(state_targets, batched_targets[index])
+        assert np.allclose(serial[index], batched[index])
 
 
 def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None:
-    """A minimal generation run should work with burn-in disabled and batch size > 1."""
+    """A minimal generation run should write checkpoint sequences with batch size > 1."""
     step_days = 240.0 / 86400.0
+    saved_interval_days = 2.0 * step_days
     cfg_dict = {
         "paths": {
             "dataset_dir": "raw",
@@ -107,9 +104,11 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "n_sims": 2,
             "generation_workers": 2,
             "burn_in_days": 0.0,
-            "transitions_per_simulation": 2,
-            "transition_jump_days_min": step_days,
-            "transition_jump_days_max": 2.0 * step_days,
+            "saved_checkpoint_interval_days": saved_interval_days,
+            "live_pairs_per_sequence": 4,
+            "live_transition_days_min": saved_interval_days,
+            "live_transition_days_max": 2.0 * saved_interval_days,
+            "live_transition_tolerance_fraction": 0.1,
             "parameters": [
                 {"name": "a_m", "dist": "fixed", "value": 8.2e7},
                 {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
@@ -142,7 +141,6 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "residual_init_scale": 1.0e-2,
             "pos_embed": "spectral",
             "bias": False,
-            "include_coord_channels": True,
         },
         "training": {
             "seed": 0,
@@ -150,11 +148,10 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "amp_mode": "none",
             "optimizer": "adamw",
             "epochs": 1,
-            "batch_size": 1,
+            "batch_size": 4,
             "num_workers": 0,
             "shuffle": True,
-            "pin_memory": False,
-            "preload_to_gpu": False,
+            "preload_to_gpu": True,
             "learning_rate": 1.0e-3,
             "weight_decay": 0.0,
             "val_fraction": 0.2,
@@ -171,20 +168,28 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
         cfg = load_config(config_path)
         manifest = generate_dataset(cfg, config_path=config_path)
         raw_files = sorted((root / "raw").glob("sim_*.npy"))
-        raw_payloads = [
-            np.load(path, allow_pickle=True).item()
-            for path in raw_files
-        ]
+        raw_payloads = [np.load(path, allow_pickle=True).item() for path in raw_files]
 
+    expected_schedule = build_uniform_checkpoint_schedule(
+        time_days=0.05,
+        dt_seconds=240.0,
+        saved_checkpoint_interval_days=saved_interval_days,
+    )
     assert manifest["n_sims_written"] == 2
     assert len(raw_files) == 2
     assert manifest["sampling"]["generation_workers"] == 2
     assert manifest["sampling"]["resolved_generation_batch_size"] == 2
-    assert manifest["sampling"]["uses_variable_transition_jump"] is True
+    assert manifest["sampling"]["uses_variable_live_transition"] is True
+    assert manifest["n_saved_checkpoints"] == int(expected_schedule.checkpoint_steps.shape[0])
+    assert np.allclose(manifest["checkpoint_days"], expected_schedule.checkpoint_days)
     for payload in raw_payloads:
-        transition_days = np.asarray(payload["transition_days"], dtype=np.float64)
-        anchor_steps = np.asarray(payload["anchor_steps"], dtype=np.int64)
-        jump_steps = np.rint(transition_days * 86400.0 / 240.0).astype(np.int64)
-        assert np.all(jump_steps >= 1)
-        assert np.all(jump_steps <= 2)
-        assert np.all(anchor_steps[:-1] <= anchor_steps[1:])
+        checkpoint_states = np.asarray(payload["checkpoint_states"], dtype=np.float64)
+        checkpoint_steps = np.asarray(payload["checkpoint_steps"], dtype=np.int64)
+        checkpoint_days = np.asarray(payload["checkpoint_days"], dtype=np.float64)
+        assert "transition_days" not in payload
+        assert "anchor_steps" not in payload
+        assert checkpoint_states.ndim == 4
+        assert checkpoint_states.shape[0] == expected_schedule.checkpoint_steps.shape[0]
+        assert checkpoint_states.shape[1] == 3
+        assert np.array_equal(checkpoint_steps, expected_schedule.checkpoint_steps)
+        assert np.allclose(checkpoint_days, expected_schedule.checkpoint_days)

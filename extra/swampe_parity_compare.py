@@ -44,8 +44,8 @@ except Exception as exc:  # pragma: no cover
         "Install it in your environment first."
     ) from exc
 
-from config import Extended9Params
-from my_swamp_backend import ensure_my_swamp_importable
+from gcmulator.config import Extended9Params
+from gcmulator.my_swamp_backend import ensure_my_swamp_importable
 
 # ---------------------------------------------------------------------------
 # User-editable run settings

@@ -29,8 +29,11 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from config import TRANSITION_TIME_NAME
-from modeling import build_state_conditioned_transition_model, ensure_torch_harmonics_importable
+from gcmulator.config import TRANSITION_TIME_NAME
+from gcmulator.modeling import (
+    build_state_conditioned_transition_model,
+    ensure_torch_harmonics_importable,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -321,15 +324,13 @@ class PhysicalStateExportModule(nn.Module):
         *,
         model: nn.Module,
         normalization: Dict[str, Any],
-        input_fields: list[str],
-        target_fields: list[str],
+        state_fields: list[str],
     ) -> None:
         """Store the normalized model and its physical-space normalization metadata."""
         super().__init__()
         self.model = model
 
-        input_state = dict(normalization["input_state"])
-        target_state = dict(normalization["target_state"])
+        state = dict(normalization["state"])
         params = dict(normalization["params"])
 
         self.register_buffer(
@@ -358,49 +359,26 @@ class PhysicalStateExportModule(nn.Module):
             torch.tensor(transition_time["is_constant"], dtype=torch.bool),
         )
 
-        self.register_buffer(
-            "input_state_mean",
-            torch.tensor(input_state["mean"], dtype=torch.float32),
+        state_mode_codes = _build_state_mode_codes(
+            fields=state_fields,
+            field_transforms=dict(state.get("field_transforms", {})),
         )
         self.register_buffer(
-            "input_state_std",
-            torch.tensor(input_state["std"], dtype=torch.float32),
+            "state_mean",
+            torch.tensor(state["mean"], dtype=torch.float32),
         )
         self.register_buffer(
-            "input_state_mode_codes",
-            torch.tensor(
-                _build_state_mode_codes(
-                    fields=input_fields,
-                    field_transforms=dict(input_state.get("field_transforms", {})),
-                ),
-                dtype=torch.int64,
-            ),
+            "state_std",
+            torch.tensor(state["std"], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "state_mode_codes",
+            torch.tensor(state_mode_codes, dtype=torch.int64),
         )
 
-        self.register_buffer(
-            "target_state_mean",
-            torch.tensor(target_state["mean"], dtype=torch.float32),
-        )
-        self.register_buffer(
-            "target_state_std",
-            torch.tensor(target_state["std"], dtype=torch.float32),
-        )
-        self.register_buffer(
-            "target_state_mode_codes",
-            torch.tensor(
-                _build_state_mode_codes(
-                    fields=target_fields,
-                    field_transforms=dict(target_state.get("field_transforms", {})),
-                ),
-                dtype=torch.int64,
-            ),
-        )
-
-        self.input_state_zscore_eps = float(input_state["zscore_eps"])
-        self.input_log10_eps = float(input_state["log10_eps"])
-        self.input_signed_log1p_scale = float(input_state["signed_log1p_scale"])
-        self.target_state_zscore_eps = float(target_state["zscore_eps"])
-        self.target_signed_log1p_scale = float(target_state["signed_log1p_scale"])
+        self.state_zscore_eps = float(state["zscore_eps"])
+        self.state_log10_eps = float(state["log10_eps"])
+        self.state_signed_log1p_scale = float(state["signed_log1p_scale"])
         self.param_zscore_eps = float(params["zscore_eps"])
         self.transition_time_zscore_eps = float(transition_time["zscore_eps"])
 
@@ -424,27 +402,27 @@ class PhysicalStateExportModule(nn.Module):
             zscore_eps=self.transition_time_zscore_eps,
         )
 
-    def _normalize_input_state(self, state: torch.Tensor) -> torch.Tensor:
-        """Normalize the full visible state to model space."""
+    def _normalize_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Normalize a physical-space state to model space."""
         return _normalize_state_with_stats(
             state,
-            mean=self.input_state_mean,
-            std=self.input_state_std,
-            mode_codes=self.input_state_mode_codes,
-            zscore_eps=self.input_state_zscore_eps,
-            log10_eps=self.input_log10_eps,
-            signed_log1p_scale=self.input_signed_log1p_scale,
+            mean=self.state_mean,
+            std=self.state_std,
+            mode_codes=self.state_mode_codes,
+            zscore_eps=self.state_zscore_eps,
+            log10_eps=self.state_log10_eps,
+            signed_log1p_scale=self.state_signed_log1p_scale,
         )
 
-    def _denormalize_target_state(self, state_norm: torch.Tensor) -> torch.Tensor:
-        """Map normalized prognostic outputs back to physical space."""
+    def _denormalize_state(self, state_norm: torch.Tensor) -> torch.Tensor:
+        """Map normalized state output back to physical space."""
         return _denormalize_state_with_stats(
             state_norm,
-            mean=self.target_state_mean,
-            std=self.target_state_std,
-            mode_codes=self.target_state_mode_codes,
-            zscore_eps=self.target_state_zscore_eps,
-            signed_log1p_scale=self.target_signed_log1p_scale,
+            mean=self.state_mean,
+            std=self.state_std,
+            mode_codes=self.state_mode_codes,
+            zscore_eps=self.state_zscore_eps,
+            signed_log1p_scale=self.state_signed_log1p_scale,
         )
 
     def example_state(
@@ -457,17 +435,17 @@ class PhysicalStateExportModule(nn.Module):
     ) -> torch.Tensor:
         """Construct a valid physical-space example tensor for tracing."""
         zero_norm = torch.zeros(
-            (batch_size, int(self.input_state_mean.numel()), height, width),
+            (batch_size, int(self.state_mean.numel()), height, width),
             dtype=torch.float32,
             device=device,
         )
         return _denormalize_state_with_stats(
             zero_norm,
-            mean=self.input_state_mean,
-            std=self.input_state_std,
-            mode_codes=self.input_state_mode_codes,
-            zscore_eps=self.input_state_zscore_eps,
-            signed_log1p_scale=self.input_signed_log1p_scale,
+            mean=self.state_mean,
+            std=self.state_std,
+            mode_codes=self.state_mode_codes,
+            zscore_eps=self.state_zscore_eps,
+            signed_log1p_scale=self.state_signed_log1p_scale,
         )
 
     def forward(
@@ -477,12 +455,12 @@ class PhysicalStateExportModule(nn.Module):
         transition_days: torch.Tensor,
     ) -> torch.Tensor:
         """Run one physical-space direct-jump transition."""
-        state0_norm = self._normalize_input_state(state0)
+        state0_norm = self._normalize_state(state0)
         params_norm = self._normalize_params(params)
         transition_days_norm = self._normalize_transition_days(transition_days)
         conditioning_norm = torch.cat((params_norm, transition_days_norm), dim=1)
         state1_norm = self.model(state0_norm, conditioning_norm)
-        return self._denormalize_target_state(state1_norm)
+        return self._denormalize_state(state1_norm)
 
 
 def main() -> None:
@@ -507,8 +485,8 @@ def main() -> None:
 
     model_cfg = _dict_to_namespace(ckpt["model_config"])
     shape = dict(ckpt["shape"])
-    input_fields = list(ckpt["input_fields"])
-    target_fields = list(ckpt["target_fields"])
+    state_fields = list(ckpt["state_fields"])
+    state_chans = int(shape["C"])
     conditioning_names = tuple(str(value) for value in ckpt["conditioning_names"])
     expected_conditioning_names = tuple(str(value) for value in ckpt["param_names"]) + (
         TRANSITION_TIME_NAME,
@@ -520,19 +498,21 @@ def main() -> None:
         )
     sampling = dict(ckpt.get("sampling", {}))
     if (
-        "transition_jump_days_min" not in sampling
-        or "transition_jump_days_max" not in sampling
+        "saved_checkpoint_interval_days" not in sampling
+        or "live_transition_days_min" not in sampling
+        or "live_transition_days_max" not in sampling
+        or "live_transition_tolerance_fraction" not in sampling
     ):
         raise ValueError(
-            "Checkpoint sampling metadata is missing the variable-jump day range. "
-            "Export only supports checkpoints trained with explicit day-valued jumps."
+            "Checkpoint sampling metadata is missing the sequence-cadence or live-jump fields. "
+            "Export only supports checkpoints trained with the sequence-based live-sampling path."
         )
-    residual_input_indices = [input_fields.index(field_name) for field_name in target_fields]
+    residual_input_indices = list(range(state_chans))
 
     core_model = build_state_conditioned_transition_model(
         img_size=(int(shape["H"]), int(shape["W"])),
-        input_state_chans=int(shape["input_C"]),
-        target_state_chans=int(shape["target_C"]),
+        input_state_chans=state_chans,
+        target_state_chans=state_chans,
         param_dim=int(len(ckpt["conditioning_names"])),
         residual_input_indices=residual_input_indices,
         cfg_model=model_cfg,
@@ -563,8 +543,7 @@ def main() -> None:
         export_model = PhysicalStateExportModule(
             model=core_model,
             normalization=normalization,
-            input_fields=input_fields,
-            target_fields=target_fields,
+            state_fields=state_fields,
         ).to(device=device).eval()
         example_state = export_model.example_state(
             batch_size=int(EXAMPLE_BATCH_SIZE),
@@ -623,20 +602,19 @@ def main() -> None:
             "state1": True,
         },
         "shape": {
-            "input_C": int(shape["input_C"]),
-            "target_C": int(shape["target_C"]),
+            "C": state_chans,
             "H": int(shape["H"]),
             "W": int(shape["W"]),
         },
         "input": {
-            "state0": ["batch", int(shape["input_C"]), int(shape["H"]), int(shape["W"])],
+            "state0": ["batch", state_chans, int(shape["H"]), int(shape["W"])],
             "params": ["batch", int(len(ckpt["param_names"]))],
             "transition_days": ["batch"],
-            "fields": input_fields,
+            "fields": state_fields,
         },
         "output": {
-            "state1": ["batch", int(shape["target_C"]), int(shape["H"]), int(shape["W"])],
-            "fields": target_fields,
+            "state1": ["batch", state_chans, int(shape["H"]), int(shape["W"])],
+            "fields": state_fields,
         },
         "param_names": list(ckpt["param_names"]),
         "conditioning_names": list(ckpt["conditioning_names"]),

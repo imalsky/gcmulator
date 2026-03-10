@@ -1,7 +1,7 @@
 """Normalization helpers for states and conditioning parameters.
 
-The emulator normalizes full visible states and prognostic targets slightly
-differently, so this module keeps the shared bookkeeping in one place.
+The autoregressive emulator uses a single set of per-channel statistics for
+both model input and model output since the prognostic fields are identical.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from typing import Dict, Sequence, Tuple
 
 import numpy as np
 
-from config import NormalizationConfig, TRANSITION_TIME_NAME
+from .config import NormalizationConfig, TRANSITION_TIME_NAME
 
 
 STD_FLOOR = 1.0e-12
@@ -43,10 +43,14 @@ class ParamNormalizationStats:
 
 @dataclass(frozen=True)
 class NormalizationStats:
-    """Complete normalization bundle stored in metadata and checkpoints."""
+    """Complete normalization bundle stored in metadata and checkpoints.
 
-    input_state: StateNormalizationStats
-    target_state: StateNormalizationStats
+    The autoregressive model uses a single ``state`` stat for both input
+    normalization and target denormalization since the prognostic fields
+    (Phi, eta, delta) are the same on both sides.
+    """
+
+    state: StateNormalizationStats
     params: ParamNormalizationStats
     transition_time: ParamNormalizationStats
 
@@ -116,7 +120,19 @@ def apply_state_transforms(
 
 
 def normalize_state_tensor(states_nchw: np.ndarray, stats: StateNormalizationStats) -> np.ndarray:
-    """Transform and z-score normalize state tensors."""
+    """Transform and z-score normalize a state tensor.
+
+    Args:
+        states_nchw:
+            Physical-space state tensor with shape ``[N, C, H, W]`` aligned to
+            ``stats.field_names``.
+        stats:
+            Per-channel transform and z-score statistics for the same ``C``
+            channels.
+
+    Returns:
+        Float32 tensor with shape ``[N, C, H, W]`` in normalized model space.
+    """
     cfg = NormalizationConfig(
         field_transforms={str(k): str(v) for k, v in stats.field_transforms.items()},
         zscore_eps=float(stats.zscore_eps),
@@ -134,7 +150,18 @@ def denormalize_state_tensor(
     states_norm_nchw: np.ndarray,
     stats: StateNormalizationStats,
 ) -> np.ndarray:
-    """Invert z-score and field transforms for normalized state tensors."""
+    """Invert z-score and field transforms for a normalized state tensor.
+
+    Args:
+        states_norm_nchw:
+            Normalized tensor with shape ``[N, C, H, W]``.
+        stats:
+            Per-channel transform and z-score statistics for the same ``C``
+            channels.
+
+    Returns:
+        Float32 physical-space tensor with shape ``[N, C, H, W]``.
+    """
     states = states_norm_nchw.astype(np.float64, copy=False)
     restored = (
         states * (stats.std.reshape(1, -1, 1, 1) + stats.zscore_eps)
@@ -179,6 +206,17 @@ def normalize_conditioning(
     wide dynamic range (e.g. 0.1–100 days) into a well-conditioned input space.
     The ``transition_time_stats`` must have been fitted on log10-transformed
     values for consistency.
+
+    Args:
+        params_np:
+            Physical parameter array with shape ``[P]`` or ``[N, P]``.
+        transition_days_np:
+            Transition-duration array with shape ``[]`` or ``[N]`` in physical
+            days.
+
+    Returns:
+        Float32 conditioning matrix with shape ``[N, P + 1]`` where the final
+        channel is the normalized ``log10_transition_days`` feature.
     """
     params = np.asarray(params_np, dtype=np.float64)
     if params.ndim == 1:
@@ -215,23 +253,14 @@ def normalize_conditioning(
 def stats_to_json(stats: NormalizationStats) -> Dict[str, object]:
     """Serialize normalization stats into JSON-friendly primitives."""
     return {
-        "input_state": {
-            "field_names": list(stats.input_state.field_names),
-            "field_transforms": dict(stats.input_state.field_transforms),
-            "mean": stats.input_state.mean.tolist(),
-            "std": stats.input_state.std.tolist(),
-            "zscore_eps": float(stats.input_state.zscore_eps),
-            "log10_eps": float(stats.input_state.log10_eps),
-            "signed_log1p_scale": float(stats.input_state.signed_log1p_scale),
-        },
-        "target_state": {
-            "field_names": list(stats.target_state.field_names),
-            "field_transforms": dict(stats.target_state.field_transforms),
-            "mean": stats.target_state.mean.tolist(),
-            "std": stats.target_state.std.tolist(),
-            "zscore_eps": float(stats.target_state.zscore_eps),
-            "log10_eps": float(stats.target_state.log10_eps),
-            "signed_log1p_scale": float(stats.target_state.signed_log1p_scale),
+        "state": {
+            "field_names": list(stats.state.field_names),
+            "field_transforms": dict(stats.state.field_transforms),
+            "mean": stats.state.mean.tolist(),
+            "std": stats.state.std.tolist(),
+            "zscore_eps": float(stats.state.zscore_eps),
+            "log10_eps": float(stats.state.log10_eps),
+            "signed_log1p_scale": float(stats.state.signed_log1p_scale),
         },
         "params": {
             "param_names": list(stats.params.param_names),
@@ -252,8 +281,7 @@ def stats_to_json(stats: NormalizationStats) -> Dict[str, object]:
 
 def stats_from_json(data: Dict[str, object]) -> NormalizationStats:
     """Deserialize JSON metadata into ``NormalizationStats``."""
-    input_state = dict(data["input_state"])
-    target_state = dict(data["target_state"])
+    state_block = dict(data["state"])
     params = dict(data["params"])
     if "transition_time" not in data:
         raise ValueError(
@@ -290,29 +318,17 @@ def stats_from_json(data: Dict[str, object]) -> NormalizationStats:
         )
 
     return NormalizationStats(
-        input_state=StateNormalizationStats(
-            field_names=tuple(str(value) for value in input_state["field_names"]),
+        state=StateNormalizationStats(
+            field_names=tuple(str(value) for value in state_block["field_names"]),
             field_transforms={
                 str(k): str(v)
-                for k, v in dict(input_state["field_transforms"]).items()
+                for k, v in dict(state_block["field_transforms"]).items()
             },
-            mean=np.asarray(input_state["mean"], dtype=np.float64),
-            std=np.asarray(input_state["std"], dtype=np.float64),
-            zscore_eps=float(input_state["zscore_eps"]),
-            log10_eps=float(input_state["log10_eps"]),
-            signed_log1p_scale=float(input_state["signed_log1p_scale"]),
-        ),
-        target_state=StateNormalizationStats(
-            field_names=tuple(str(value) for value in target_state["field_names"]),
-            field_transforms={
-                str(k): str(v)
-                for k, v in dict(target_state["field_transforms"]).items()
-            },
-            mean=np.asarray(target_state["mean"], dtype=np.float64),
-            std=np.asarray(target_state["std"], dtype=np.float64),
-            zscore_eps=float(target_state["zscore_eps"]),
-            log10_eps=float(target_state["log10_eps"]),
-            signed_log1p_scale=float(target_state["signed_log1p_scale"]),
+            mean=np.asarray(state_block["mean"], dtype=np.float64),
+            std=np.asarray(state_block["std"], dtype=np.float64),
+            zscore_eps=float(state_block["zscore_eps"]),
+            log10_eps=float(state_block["log10_eps"]),
+            signed_log1p_scale=float(state_block["signed_log1p_scale"]),
         ),
         params=ParamNormalizationStats(
             param_names=tuple(str(value) for value in params["param_names"]),

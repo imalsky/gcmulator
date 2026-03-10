@@ -1,4 +1,4 @@
-"""Processed-shard regression tests for time-conditioned training."""
+"""Processed-shard regression tests for checkpoint-sequence preprocessing."""
 
 from __future__ import annotations
 
@@ -7,14 +7,16 @@ from pathlib import Path
 
 import numpy as np
 
-from config import CONDITIONING_PARAM_NAMES, TRANSITION_TIME_NAME, load_config
-from geometry import geometry_shift_for_nlon
-from training import preprocess_dataset
+from gcmulator.config import CONDITIONING_PARAM_NAMES, TRANSITION_TIME_NAME, load_config
+from gcmulator.geometry import geometry_shift_for_nlon
+from gcmulator.sampling import build_uniform_checkpoint_schedule
+from gcmulator.training import preprocess_dataset
 
 
 def _config_dict() -> dict[str, object]:
     """Return a small preprocessing-only config."""
-    fixed_jump_days = 2.0 * 240.0 / 86400.0
+    step_days = 240.0 / 86400.0
+    fixed_jump_days = 2.0 * step_days
     return {
         "paths": {
             "dataset_dir": "raw",
@@ -37,9 +39,11 @@ def _config_dict() -> dict[str, object]:
             "n_sims": 3,
             "generation_workers": 0,
             "burn_in_days": 0.0,
-            "transitions_per_simulation": 2,
-            "transition_jump_days_min": fixed_jump_days,
-            "transition_jump_days_max": fixed_jump_days,
+            "saved_checkpoint_interval_days": fixed_jump_days,
+            "live_pairs_per_sequence": 2,
+            "live_transition_days_min": fixed_jump_days,
+            "live_transition_days_max": fixed_jump_days,
+            "live_transition_tolerance_fraction": 0.1,
             "parameters": [
                 {"name": "a_m", "dist": "fixed", "value": 8.2e7},
                 {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
@@ -72,7 +76,6 @@ def _config_dict() -> dict[str, object]:
             "residual_init_scale": 1.0e-2,
             "pos_embed": "spectral",
             "bias": False,
-            "include_coord_channels": True,
         },
         "training": {
             "seed": 0,
@@ -80,11 +83,10 @@ def _config_dict() -> dict[str, object]:
             "amp_mode": "none",
             "optimizer": "adamw",
             "epochs": 1,
-            "batch_size": 1,
+            "batch_size": 4,
             "num_workers": 0,
             "shuffle": True,
-            "pin_memory": False,
-            "preload_to_gpu": False,
+            "preload_to_gpu": True,
             "learning_rate": 1.0e-3,
             "weight_decay": 0.0,
             "val_fraction": 0.2,
@@ -96,24 +98,25 @@ def _config_dict() -> dict[str, object]:
 
 
 def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
-    """Write one small raw trajectory payload."""
+    """Write one small raw checkpoint-sequence payload."""
     nlat = 2
     nlon = 4
-    transition_jump_steps = 2
-    transition_days = np.full((2,), transition_jump_steps * 240.0 / 86400.0, dtype=np.float64)
-    anchor_steps = np.array([0, 2], dtype=np.int64)
-    base = float(sim_idx + 1)
-    state_inputs = np.stack(
-        [
-            np.full((5, nlat, nlon), fill_value=base, dtype=np.float64),
-            np.full((5, nlat, nlon), fill_value=base + 1.0, dtype=np.float64),
-        ],
-        axis=0,
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=0.05,
+        dt_seconds=240.0,
+        saved_checkpoint_interval_days=2.0 * 240.0 / 86400.0,
     )
-    state_targets = np.stack(
+    base = float(sim_idx + 1)
+    checkpoint_states = np.stack(
         [
-            np.full((3, nlat, nlon), fill_value=base + 2.0, dtype=np.float64),
-            np.full((3, nlat, nlon), fill_value=base + 3.0, dtype=np.float64),
+            np.stack(
+                [
+                    np.full((nlat, nlon), fill_value=base + checkpoint_index + channel_index, dtype=np.float64)
+                    for channel_index in range(3)
+                ],
+                axis=0,
+            )
+            for checkpoint_index in range(int(schedule.checkpoint_steps.shape[0]))
         ],
         axis=0,
     )
@@ -130,21 +133,18 @@ def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
         dtype=np.float64,
     )
     payload = {
-        "state_inputs": state_inputs,
-        "state_targets": state_targets,
-        "transition_days": transition_days,
-        "anchor_steps": anchor_steps,
-        "input_fields": np.asarray(["Phi", "U", "V", "eta", "delta"], dtype=object),
-        "target_fields": np.asarray(["Phi", "eta", "delta"], dtype=object),
+        "checkpoint_states": checkpoint_states,
+        "checkpoint_steps": schedule.checkpoint_steps,
+        "checkpoint_days": schedule.checkpoint_days,
+        "state_fields": np.asarray(["Phi", "eta", "delta"], dtype=object),
         "params": params,
         "param_names": np.asarray(list(CONDITIONING_PARAM_NAMES), dtype=object),
         "default_time_days": np.asarray(0.05, dtype=np.float64),
         "burn_in_days": np.asarray(0.0, dtype=np.float64),
         "dt_seconds": np.asarray(240.0, dtype=np.float64),
         "starttime_index": np.asarray(2, dtype=np.int64),
-        "transition_jump_days_min": np.asarray(transition_days[0], dtype=np.float64),
-        "transition_jump_days_max": np.asarray(transition_days[0], dtype=np.float64),
-        "n_transitions": np.asarray(2, dtype=np.int64),
+        "saved_checkpoint_interval_days": np.asarray(schedule.interval_days, dtype=np.float64),
+        "n_saved_checkpoints": np.asarray(int(schedule.checkpoint_steps.shape[0]), dtype=np.int64),
         "M": np.asarray(42, dtype=np.int64),
         "nlat": np.asarray(nlat, dtype=np.int64),
         "nlon": np.asarray(nlon, dtype=np.int64),
@@ -155,8 +155,8 @@ def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
     np.save(raw_dir / f"sim_{sim_idx:06d}.npy", payload, allow_pickle=True)
 
 
-def test_preprocess_dataset_writes_time_conditioned_shards(tmp_path: Path) -> None:
-    """Processed shards should store per-sample conditioning with transition time appended."""
+def test_preprocess_dataset_writes_sequence_shards(tmp_path: Path) -> None:
+    """Processed shards should store normalized checkpoint sequences, not pairs."""
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(_config_dict()), encoding="utf-8")
     raw_dir = tmp_path / "raw"
@@ -167,23 +167,24 @@ def test_preprocess_dataset_writes_time_conditioned_shards(tmp_path: Path) -> No
     cfg = load_config(config_path)
     meta = preprocess_dataset(cfg, config_path=config_path)
 
+    assert meta["task"] == "checkpoint_sequence_transition"
     assert meta["conditioning_names"] == list(CONDITIONING_PARAM_NAMES) + [TRANSITION_TIME_NAME]
+    assert meta["sequence_length"] == 10
 
     train_shard_path = tmp_path / "processed" / meta["splits"]["train"][0]["file"]
     with np.load(train_shard_path, allow_pickle=False) as npz:
-        conditioning_norm = np.asarray(npz["conditioning_norm"], dtype=np.float32)
+        states_norm = np.asarray(npz["states_norm"], dtype=np.float32)
         params_norm = np.asarray(npz["params_norm"], dtype=np.float32)
-        transition_days = np.asarray(npz["transition_days"], dtype=np.float64)
-        anchor_steps = np.asarray(npz["anchor_steps"], dtype=np.int64)
+        checkpoint_days = np.asarray(npz["checkpoint_days"], dtype=np.float64)
 
-    assert conditioning_norm.shape == (2, len(CONDITIONING_PARAM_NAMES) + 1)
+    assert states_norm.shape == (10, 3, 2, 4)
     assert params_norm.shape == (len(CONDITIONING_PARAM_NAMES),)
-    assert np.allclose(transition_days, np.full((2,), 2 * 240.0 / 86400.0))
-    assert np.array_equal(anchor_steps, np.array([0, 2], dtype=np.int64))
+    assert checkpoint_days.shape == (10,)
+    assert np.allclose(checkpoint_days, np.asarray(meta["checkpoint_days"], dtype=np.float64))
 
 
-def test_preprocess_dataset_fits_target_stats_from_train_targets(tmp_path: Path) -> None:
-    """Training-target normalization should be centered on the training targets themselves."""
+def test_preprocess_dataset_fits_state_stats_from_train_checkpoints(tmp_path: Path) -> None:
+    """State normalization should be centered on train checkpoints."""
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(_config_dict()), encoding="utf-8")
     raw_dir = tmp_path / "raw"
@@ -194,12 +195,12 @@ def test_preprocess_dataset_fits_target_stats_from_train_targets(tmp_path: Path)
     cfg = load_config(config_path)
     meta = preprocess_dataset(cfg, config_path=config_path)
 
-    train_target_rows: list[np.ndarray] = []
+    train_state_rows: list[np.ndarray] = []
     for entry in meta["splits"]["train"]:
         with np.load(tmp_path / "processed" / str(entry["file"]), allow_pickle=False) as npz:
-            train_target_rows.append(np.asarray(npz["state_targets_norm"], dtype=np.float32))
+            train_state_rows.append(np.asarray(npz["states_norm"], dtype=np.float32))
 
-    train_targets_norm = np.concatenate(train_target_rows, axis=0)
-    train_channel_means = train_targets_norm.mean(axis=(0, 2, 3))
+    train_states_norm = np.concatenate(train_state_rows, axis=0)
+    train_channel_means = train_states_norm.mean(axis=(0, 2, 3))
 
     assert np.allclose(train_channel_means, 0.0, atol=1.0e-6)

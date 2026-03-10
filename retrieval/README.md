@@ -13,11 +13,14 @@ an extra export-versus-checkpoint consistency check.
 
 The current training and export methodology is:
 
-1. raw data stores physical `transition_days`
-2. conditioning is learned in log space through `log10_transition_days`
-3. the export accepts physical `state0`, physical `params`, and physical
+1. raw data stores uniformly spaced physical checkpoint sequences
+2. processed splits store normalized checkpoint sequences, not precomputed
+   `(anchor, target)` pairs
+3. training samples direct-jump pairs live from those saved checkpoints and
+   conditions on `log10_transition_days`
+4. the export accepts physical `state0`, physical `params`, and physical
    `transition_days`
-4. the export normalizes those inputs internally and returns physical `state1`
+5. the export normalizes those inputs internally and returns physical `state1`
 
 For a retrieval artifact to be valid, the export bundle must satisfy all of the
 following:
@@ -31,7 +34,8 @@ following:
    `param_names + ["log10_transition_days"]`
 6. `normalization.transition_time.param_names` must be
    `["log10_transition_days"]`
-7. `sampling.transition_jump_days_min/max` must be present
+7. `sampling.saved_checkpoint_interval_days` and
+   `sampling.live_transition_days_min/max` must be present
 8. the exported forward signature must accept
    `(state0, params, transition_days)`
 

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import ParameterSpec
-from geometry import apply_geometry_state, geometry_shift_for_nlon
-from sampling import sample_parameter_dict, sample_transition_pairs, to_extended9
+from gcmulator.config import ParameterSpec
+from gcmulator.geometry import apply_geometry_state, geometry_shift_for_nlon
+from gcmulator.sampling import (
+    build_live_transition_catalog,
+    build_uniform_checkpoint_schedule,
+    sample_parameter_dict,
+    to_extended9,
+)
 
 
 def test_apply_geometry_state_flips_latitude_and_rolls_longitude() -> None:
@@ -50,26 +55,65 @@ def test_sample_parameter_dict_converts_hour_aliases_to_seconds() -> None:
     assert params.taudrag_s == 6.0 * 3600.0
 
 
-def test_sample_transition_pairs_respects_bounds_and_integer_step_mapping() -> None:
-    """Sampled transition pairs must stay within the valid rollout horizon."""
-    rng = np.random.default_rng(0)
-    anchor_steps, target_steps, transition_days = sample_transition_pairs(
-        rng,
-        n_transitions=64,
-        burn_in_steps=0,
-        n_steps_total=8,
+def test_uniform_checkpoint_schedule_maps_to_solver_grid() -> None:
+    """Saved checkpoints should land on a uniform discrete solver cadence."""
+    step_days = 240.0 / 86400.0
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=0.05,
         dt_seconds=240.0,
-        transition_jump_days_min=240.0 / 86400.0,
-        transition_jump_days_max=3.0 * 240.0 / 86400.0,
+        saved_checkpoint_interval_days=2.0 * step_days,
     )
-    jump_steps = np.rint(transition_days * 86400.0 / 240.0).astype(np.int64)
 
-    assert anchor_steps.dtype == np.int64
-    assert target_steps.dtype == np.int64
-    assert transition_days.dtype == np.float64
-    assert np.all(anchor_steps[:-1] <= anchor_steps[1:])
-    assert np.all(target_steps > anchor_steps)
-    assert np.array_equal(target_steps - anchor_steps, jump_steps)
-    assert np.all(jump_steps >= 1)
-    assert np.all(jump_steps <= 3)
-    assert np.all(target_steps <= 8)
+    assert schedule.interval_steps == 2
+    assert schedule.interval_days == np.float64(2.0 * step_days)
+    assert np.array_equal(schedule.checkpoint_steps, np.arange(0, 19, 2, dtype=np.int64))
+    assert np.allclose(
+        schedule.checkpoint_days,
+        schedule.checkpoint_steps.astype(np.float64) * step_days,
+    )
+
+
+def test_fixed_live_transition_catalog_picks_exact_gap() -> None:
+    """A fixed live jump should resolve to the nearest feasible checkpoint gap."""
+    step_days = 240.0 / 86400.0
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=0.05,
+        dt_seconds=240.0,
+        saved_checkpoint_interval_days=2.0 * step_days,
+    )
+    catalog = build_live_transition_catalog(
+        checkpoint_days=schedule.checkpoint_days,
+        burn_in_days=0.0,
+        transition_days_min=4.0 * step_days,
+        transition_days_max=4.0 * step_days,
+        tolerance_fraction=0.0,
+    )
+
+    assert np.array_equal(catalog.gap_offsets, np.array([2], dtype=np.int64))
+    assert np.allclose(catalog.transition_days, np.array([4.0 * step_days], dtype=np.float64))
+    assert np.allclose(catalog.probabilities, np.array([1.0], dtype=np.float64))
+    assert catalog.burn_in_start_index == 0
+
+
+def test_variable_live_transition_catalog_stays_within_saved_gaps() -> None:
+    """Variable live jumps should only use feasible saved checkpoint gaps."""
+    step_days = 240.0 / 86400.0
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=0.05,
+        dt_seconds=240.0,
+        saved_checkpoint_interval_days=2.0 * step_days,
+    )
+    catalog = build_live_transition_catalog(
+        checkpoint_days=schedule.checkpoint_days,
+        burn_in_days=2.0 * step_days,
+        transition_days_min=4.0 * step_days,
+        transition_days_max=10.0 * step_days,
+        tolerance_fraction=0.1,
+    )
+
+    assert np.array_equal(catalog.gap_offsets, np.array([2, 3, 4, 5], dtype=np.int64))
+    assert np.all(catalog.transition_days >= 4.0 * step_days)
+    assert np.all(catalog.transition_days <= 10.0 * step_days)
+    assert np.isclose(np.sum(catalog.probabilities), 1.0)
+    assert catalog.burn_in_start_index == 1
+    assert catalog.probabilities[0] > catalog.probabilities[-1]

@@ -18,7 +18,7 @@ cd "$PROJECT_ROOT"
 
 CONDA_ENV="${CONDA_ENV:-swamp_compare}"
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
-MAIN_PY="${MAIN_PY:-src/main.py}"
+MAIN_MODULE="${MAIN_MODULE:-gcmulator}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
 MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
 MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
@@ -61,8 +61,8 @@ if [ ! -f "$CONFIG_PATH" ]; then
   echo "ERROR: config not found: $CONFIG_PATH"
   exit 1
 fi
-if [ ! -f "$MAIN_PY" ]; then
-  echo "ERROR: main script not found: $MAIN_PY"
+if [ ! -d "$PROJECT_ROOT/src/gcmulator" ]; then
+  echo "ERROR: package directory not found: $PROJECT_ROOT/src/gcmulator"
   exit 1
 fi
 
@@ -110,7 +110,7 @@ if [ "$RUN_GEN_IF_MISSING" = "1" ]; then
   mapfile -t DATA_CFG < <(python - "$CONFIG_PATH" <<'PY'
 from pathlib import Path
 import sys
-from config import load_config, resolve_path
+from gcmulator.config import load_config, resolve_path
 
 config_path = Path(sys.argv[1]).resolve()
 cfg = load_config(config_path)
@@ -126,7 +126,7 @@ PY
   fi
   if [ "$SIM_COUNT" -eq 0 ]; then
     # Generate only when raw trajectory transition files are not already present.
-    python "$MAIN_PY" --gen --config "$CONFIG_PATH"
+    python -m "$MAIN_MODULE" --gen --config "$CONFIG_PATH"
   elif [ "$SIM_COUNT" -ne "$EXPECTED_SIMS" ]; then
     echo "ERROR: dataset file count mismatch: found $SIM_COUNT files in $DATASET_DIR, expected $EXPECTED_SIMS from config.sampling.n_sims."
     echo "Set paths.overwrite_dataset=true and regenerate, or align config.sampling.n_sims with existing data."
@@ -135,4 +135,4 @@ PY
 fi
 
 # Train using existing or newly generated dataset.
-python "$MAIN_PY" --train --config "$CONFIG_PATH"
+python -m "$MAIN_MODULE" --train --config "$CONFIG_PATH"

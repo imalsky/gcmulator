@@ -70,26 +70,18 @@ def _write_direct_jump_artifact(tmp_path: Path) -> tuple[Path, Path]:
 
     checkpoint = {
         "solver": {"dt_seconds": 240.0},
-        "shape": {"input_C": 1, "target_C": 1, "H": 2, "W": 2},
-        "input_fields": ["Phi"],
-        "target_fields": ["Phi"],
+        "shape": {"C": 1, "H": 2, "W": 2},
+        "state_fields": ["Phi"],
         "param_names": ["a_m"],
         "conditioning_names": ["a_m", "log10_transition_days"],
         "sampling": {
-            "transition_jump_days_min": 0.1,
-            "transition_jump_days_max": 10.0,
+            "saved_checkpoint_interval_days": 1.0,
+            "live_transition_days_min": 0.1,
+            "live_transition_days_max": 10.0,
+            "live_transition_tolerance_fraction": 0.1,
         },
         "normalization": {
-            "input_state": {
-                "field_names": ["Phi"],
-                "field_transforms": {"Phi": "signed_log1p"},
-                "mean": [0.0],
-                "std": [1.0],
-                "zscore_eps": 1.0e-8,
-                "log10_eps": 1.0e-6,
-                "signed_log1p_scale": 1.0,
-            },
-            "target_state": {
+            "state": {
                 "field_names": ["Phi"],
                 "field_transforms": {"Phi": "signed_log1p"},
                 "mean": [0.0],
@@ -133,7 +125,7 @@ def _write_direct_jump_artifact(tmp_path: Path) -> tuple[Path, Path]:
                     "transition_days": True,
                     "state1": True,
                 },
-                "shape": {"input_C": 1, "target_C": 1, "H": 2, "W": 2},
+                "shape": {"C": 1, "H": 2, "W": 2},
                 "input": {
                     "state0": ["batch", 1, 2, 2],
                     "params": ["batch", 1],
@@ -148,8 +140,10 @@ def _write_direct_jump_artifact(tmp_path: Path) -> tuple[Path, Path]:
                 "conditioning_names": ["a_m", "log10_transition_days"],
                 "solver": {"dt_seconds": 240.0},
                 "sampling": {
-                    "transition_jump_days_min": 0.1,
-                    "transition_jump_days_max": 10.0,
+                    "saved_checkpoint_interval_days": 1.0,
+                    "live_transition_days_min": 0.1,
+                    "live_transition_days_max": 10.0,
+                    "live_transition_tolerance_fraction": 0.1,
                 },
                 "normalization": checkpoint["normalization"],
             }
@@ -176,16 +170,7 @@ def test_export_transition_days_normalization_uses_log10() -> None:
 def test_physical_state_export_module_uses_physical_inputs() -> None:
     """The export wrapper should normalize physical inputs and return physical outputs."""
     normalization = {
-        "input_state": {
-            "field_names": ["Phi"],
-            "field_transforms": {"Phi": "none"},
-            "mean": [0.0],
-            "std": [1.0],
-            "zscore_eps": 1.0e-8,
-            "log10_eps": 1.0e-6,
-            "signed_log1p_scale": 1.0,
-        },
-        "target_state": {
+        "state": {
             "field_names": ["Phi"],
             "field_transforms": {"Phi": "none"},
             "mean": [0.0],
@@ -212,8 +197,7 @@ def test_physical_state_export_module_uses_physical_inputs() -> None:
     export_model = PhysicalStateExportModule(
         model=_TinyNormalizedCoreModel(),
         normalization=normalization,
-        input_fields=["Phi"],
-        target_fields=["Phi"],
+        state_fields=["Phi"],
     ).eval()
     state0 = torch.full((2, 1, 2, 2), 3.0, dtype=torch.float32)
     params = torch.tensor([[3.0], [5.0]], dtype=torch.float32)
@@ -250,6 +234,9 @@ def test_inspect_surrogate_artifact_accepts_direct_jump_torch_contract(
     assert contract.transition_days_conditioned is True
     assert contract.physical_io_forward is True
     assert contract.transition_time_name == "log10_transition_days"
+    assert contract.sampling_saved_checkpoint_interval_days == pytest.approx(1.0)
+    assert contract.sampling_live_transition_days_min == pytest.approx(0.1)
+    assert contract.sampling_live_transition_days_max == pytest.approx(10.0)
     assert contract.blockers == ()
 
 
@@ -322,6 +309,50 @@ def test_torch_surrogate_runtime_batches_predictions(tmp_path: Path) -> None:
     expected = state0 + 0.5 + transition_days[:, None, None, None]
     assert pred.shape == state0.shape
     assert np.allclose(pred, expected, atol=1.0e-6)
+
+
+def test_torch_surrogate_runtime_keeps_tensor_output_on_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tensor-returning predictions should not force eager host copies."""
+    export_path, _ = _write_direct_jump_artifact(tmp_path)
+    runtime = TorchSurrogateRuntime(
+        export_path=export_path,
+        checkpoint_path=None,
+        runtime_config=SurrogateRuntimeConfig(
+            device_mode="cpu",
+            max_batch_size=2,
+            pin_host_memory=False,
+            prefer_channels_last=False,
+            allow_tf32=False,
+        ),
+        model_days=10.0,
+    )
+
+    def _unexpected_cpu(_: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("predict(return_numpy=False) should not call Tensor.cpu()")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", _unexpected_cpu, raising=False)
+
+    state0 = np.ones((2, 1, 2, 2), dtype=np.float32)
+    params = np.array([0.5], dtype=np.float32)
+    transition_days = np.array([1.0, 2.0], dtype=np.float32)
+    pred = runtime.predict(
+        state0=state0,
+        params=params,
+        transition_days=transition_days,
+        return_numpy=False,
+    )
+
+    expected = (
+        torch.from_numpy(state0)
+        + 0.5
+        + torch.tensor(transition_days, dtype=torch.float32)[:, None, None, None]
+    )
+    assert isinstance(pred, torch.Tensor)
+    assert pred.device.type == runtime.device.type
+    assert torch.allclose(pred, expected, atol=1.0e-6)
 
 
 def test_torch_surrogate_runtime_rejects_auto_device_mode(tmp_path: Path) -> None:

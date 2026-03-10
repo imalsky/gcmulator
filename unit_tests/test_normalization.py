@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import TRANSITION_TIME_NAME
-from normalization import (
+from gcmulator.config import TRANSITION_TIME_NAME
+from gcmulator.normalization import (
     ParamNormalizationStats,
     StateNormalizationStats,
     denormalize_state_tensor,
@@ -96,16 +96,7 @@ def test_normalize_conditioning_appends_transition_time_channel() -> None:
 def test_stats_from_json_requires_transition_time_block() -> None:
     """Strict loading should reject stale normalization payloads."""
     payload = {
-        "input_state": {
-            "field_names": ["Phi"],
-            "field_transforms": {"Phi": "none"},
-            "mean": [0.0],
-            "std": [1.0],
-            "zscore_eps": 1.0e-8,
-            "log10_eps": 1.0e-6,
-            "signed_log1p_scale": 1.0,
-        },
-        "target_state": {
+        "state": {
             "field_names": ["Phi"],
             "field_transforms": {"Phi": "none"},
             "mean": [0.0],

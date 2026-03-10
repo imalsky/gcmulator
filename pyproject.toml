@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcmulator"
+version = "0.1.0"
+description = "Direct-jump spherical surrogate training package for MY_SWAMP data."
+readme = "spec.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.4.0",
+    "torch-harmonics==0.8.1",
+    "matplotlib>=3.8",
+    "PyYAML>=6.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

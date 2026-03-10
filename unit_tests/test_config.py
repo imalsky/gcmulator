@@ -7,12 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from config import load_config
+from gcmulator.config import load_config
 
 
 def _minimal_config_dict() -> dict[str, object]:
     """Return a small but fully valid config payload."""
-    fixed_jump_days = 2.0 * 240.0 / 86400.0
+    step_days = 240.0 / 86400.0
+    fixed_jump_days = 2.0 * step_days
     return {
         "paths": {
             "dataset_dir": "data/raw",
@@ -35,9 +36,11 @@ def _minimal_config_dict() -> dict[str, object]:
             "n_sims": 2,
             "generation_workers": 2,
             "burn_in_days": 0.0,
-            "transitions_per_simulation": 2,
-            "transition_jump_days_min": fixed_jump_days,
-            "transition_jump_days_max": fixed_jump_days,
+            "saved_checkpoint_interval_days": fixed_jump_days,
+            "live_pairs_per_sequence": 2,
+            "live_transition_days_min": fixed_jump_days,
+            "live_transition_days_max": fixed_jump_days,
+            "live_transition_tolerance_fraction": 0.1,
             "parameters": [
                 {"name": "a_m", "dist": "fixed", "value": 8.2e7},
                 {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
@@ -52,8 +55,6 @@ def _minimal_config_dict() -> dict[str, object]:
             "state": {
                 "field_transforms": {
                     "Phi": "signed_log1p",
-                    "U": "signed_log1p",
-                    "V": "signed_log1p",
                     "eta": "signed_log1p",
                     "delta": "signed_log1p",
                 },
@@ -78,7 +79,6 @@ def _minimal_config_dict() -> dict[str, object]:
             "residual_init_scale": 1.0e-2,
             "pos_embed": "spectral",
             "bias": False,
-            "include_coord_channels": True,
         },
         "training": {
             "seed": 0,
@@ -87,12 +87,10 @@ def _minimal_config_dict() -> dict[str, object]:
             "deterministic": True,
             "optimizer": "adamw",
             "epochs": 1,
-            "batch_size": 1,
+            "batch_size": 4,
             "num_workers": 0,
-            "prefetch_factor": 2,
             "shuffle": True,
-            "pin_memory": False,
-            "preload_to_gpu": False,
+            "preload_to_gpu": True,
             "learning_rate": 1.0e-3,
             "weight_decay": 0.0,
             "val_fraction": 0.2,
@@ -117,35 +115,35 @@ def test_load_config_allows_zero_burn_in(tmp_path: Path) -> None:
 
     assert cfg.sampling.burn_in_days == pytest.approx(0.0)
     assert cfg.sampling.generation_workers == 2
-    assert cfg.sampling.uses_variable_transition_jump() is False
+    assert cfg.sampling.uses_variable_live_transition() is False
 
 
-def test_load_config_accepts_variable_transition_jump_range(tmp_path: Path) -> None:
+def test_load_config_accepts_variable_live_transition_range(tmp_path: Path) -> None:
     """Variable jump training should parse as an explicit day-valued range."""
     payload = _minimal_config_dict()
     sampling_section = dict(payload["sampling"])
-    sampling_section["transition_jump_days_min"] = 0.01
-    sampling_section["transition_jump_days_max"] = 0.04
+    sampling_section["live_transition_days_min"] = 0.01
+    sampling_section["live_transition_days_max"] = 0.04
     payload["sampling"] = sampling_section
 
     config_path = _write_config(tmp_path, payload)
     cfg = load_config(config_path)
 
-    assert cfg.sampling.min_transition_jump_days() == pytest.approx(0.01)
-    assert cfg.sampling.max_transition_jump_days() == pytest.approx(0.04)
-    assert cfg.sampling.uses_variable_transition_jump() is True
+    assert cfg.sampling.min_live_transition_days() == pytest.approx(0.01)
+    assert cfg.sampling.max_live_transition_days() == pytest.approx(0.04)
+    assert cfg.sampling.uses_variable_live_transition() is True
 
 
-def test_load_config_rejects_inverted_transition_jump_range(tmp_path: Path) -> None:
-    """The max jump must not be smaller than the min jump."""
+def test_load_config_rejects_inverted_live_transition_range(tmp_path: Path) -> None:
+    """The max live jump must not be smaller than the min live jump."""
     payload = _minimal_config_dict()
     sampling_section = dict(payload["sampling"])
-    sampling_section["transition_jump_days_min"] = 0.4
-    sampling_section["transition_jump_days_max"] = 0.1
+    sampling_section["live_transition_days_min"] = 0.4
+    sampling_section["live_transition_days_max"] = 0.1
     payload["sampling"] = sampling_section
 
     config_path = _write_config(tmp_path, payload)
-    with pytest.raises(ValueError, match="transition_jump_days_min"):
+    with pytest.raises(ValueError, match="live_transition_days_min"):
         load_config(config_path)
 
 
@@ -154,6 +152,18 @@ def test_load_config_rejects_unknown_keys(tmp_path: Path) -> None:
     payload = _minimal_config_dict()
     model_section = dict(payload["model"])
     model_section["unexpected"] = 123
+    payload["model"] = model_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_removed_coord_channel_flag(tmp_path: Path) -> None:
+    """The legacy explicit coordinate-channel option must stay unsupported."""
+    payload = _minimal_config_dict()
+    model_section = dict(payload["model"])
+    model_section["include_coord_channels"] = True
     payload["model"] = model_section
 
     config_path = _write_config(tmp_path, payload)
@@ -184,21 +194,25 @@ def test_load_config_defaults_to_plateau_with_relative_min_lr(tmp_path: Path) ->
     assert cfg.training.scheduler.eps == pytest.approx(1.0e-10)
 
 
-def test_load_config_accepts_training_throughput_flags(tmp_path: Path) -> None:
-    """Training throughput knobs should round-trip through the config parser."""
+def test_load_config_rejects_legacy_pair_sampling_keys(tmp_path: Path) -> None:
+    """Legacy pair-sampling config keys should no longer be accepted."""
+    payload = _minimal_config_dict()
+    sampling_section = dict(payload["sampling"])
+    sampling_section["transitions_per_simulation"] = 4
+    payload["sampling"] = sampling_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_config(config_path)
+
+
+def test_load_config_requires_batch_size_divisible_by_live_pairs(tmp_path: Path) -> None:
+    """The effective pair batch must decompose into whole sequences."""
     payload = _minimal_config_dict()
     training_section = dict(payload["training"])
-    training_section["device"] = "cuda"
-    training_section["deterministic"] = False
-    training_section["num_workers"] = 3
-    training_section["prefetch_factor"] = 6
-    training_section["pin_memory"] = True
+    training_section["batch_size"] = 3
     payload["training"] = training_section
 
     config_path = _write_config(tmp_path, payload)
-    cfg = load_config(config_path)
-
-    assert cfg.training.deterministic is False
-    assert cfg.training.num_workers == 3
-    assert cfg.training.prefetch_factor == 6
-    assert cfg.training.pin_memory is True
+    with pytest.raises(ValueError, match="batch_size"):
+        load_config(config_path)

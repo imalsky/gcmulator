@@ -9,8 +9,8 @@ This module covers three stages:
 
 from __future__ import annotations
 
-from bisect import bisect_right
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+import gc
 import csv
 import json
 import logging
@@ -18,29 +18,27 @@ import math
 from pathlib import Path
 import shutil
 import time
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
 
-from config import (
+from .config import (
     CONDITIONING_PARAM_NAMES,
     GCMulatorConfig,
     PHYSICAL_STATE_FIELDS,
-    PROGNOSTIC_TARGET_FIELDS,
     TRANSITION_TIME_NAME,
     resolve_path,
 )
-from geometry import geometry_shift_for_nlon
-from modeling import (
+from .geometry import geometry_shift_for_nlon
+from .modeling import (
     SphereLoss,
     autocast_context,
     build_state_conditioned_transition_model,
     choose_device,
     ensure_torch_harmonics_importable,
 )
-from normalization import (
+from .normalization import (
     NormalizationStats,
     ParamNormalizationStats,
     STD_FLOOR,
@@ -53,27 +51,30 @@ from normalization import (
     stats_from_json,
     stats_to_json,
 )
+from .sampling import (
+    LiveTransitionCatalog,
+    build_live_transition_catalog,
+    build_uniform_checkpoint_schedule,
+    weighted_log10_transition_stats,
+)
 
 
 LOGGER = logging.getLogger("train")
 
-PREPROCESS_FINGERPRINT_VERSION = 14
+PREPROCESS_FINGERPRINT_VERSION = 16
 RAW_REQUIRED_KEYS = (
-    "state_inputs",
-    "state_targets",
-    "transition_days",
-    "anchor_steps",
-    "input_fields",
-    "target_fields",
+    "checkpoint_states",
+    "checkpoint_steps",
+    "checkpoint_days",
+    "state_fields",
     "params",
     "param_names",
     "default_time_days",
     "burn_in_days",
     "dt_seconds",
     "starttime_index",
-    "transition_jump_days_min",
-    "transition_jump_days_max",
-    "n_transitions",
+    "saved_checkpoint_interval_days",
+    "n_saved_checkpoints",
     "M",
     "nlat",
     "nlon",
@@ -82,6 +83,14 @@ RAW_REQUIRED_KEYS = (
     "lon_shift",
 )
 EARLY_STOPPING_PATIENCE_MULTIPLIER = 3
+# Seed offsets ensure validation and test pair tables are deterministic but
+# independent from the per-epoch training pair tables.
+VAL_PAIR_SEED_OFFSET = 100_000
+TEST_PAIR_SEED_OFFSET = 200_000
+# Multiplicative headroom applied when checking whether a processed split fits
+# in GPU VRAM.  The 20% margin covers model parameters, optimizer state, and
+# temporary activations that live alongside the preloaded data.
+VRAM_HEADROOM_FACTOR = 1.2
 
 
 def _load_npy_payload_dict(file_path: Path) -> Dict[str, Any]:
@@ -126,29 +135,20 @@ def _list_raw_dataset_files(dataset_dir: Path) -> List[Path]:
 
 
 def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str, Any]:
-    """Load and validate one raw transition payload against the config contract."""
+    """Load and validate one raw checkpoint-sequence payload against the config contract."""
     payload = _load_npy_payload_dict(file_path)
     missing = [key for key in RAW_REQUIRED_KEYS if key not in payload]
     if missing:
         raise ValueError(f"Raw file {file_path} is missing required keys: {missing}")
 
-    input_fields = [
+    state_fields = [
         str(value)
-        for value in np.asarray(payload["input_fields"], dtype=object).tolist()
+        for value in np.asarray(payload["state_fields"], dtype=object).tolist()
     ]
-    target_fields = [
-        str(value)
-        for value in np.asarray(payload["target_fields"], dtype=object).tolist()
-    ]
-    if tuple(input_fields) != tuple(PHYSICAL_STATE_FIELDS):
+    if tuple(state_fields) != tuple(PHYSICAL_STATE_FIELDS):
         raise ValueError(
-            f"Raw file {file_path} has input_fields={input_fields}, "
+            f"Raw file {file_path} has state_fields={state_fields}, "
             f"expected {list(PHYSICAL_STATE_FIELDS)}"
-        )
-    if tuple(target_fields) != tuple(PROGNOSTIC_TARGET_FIELDS):
-        raise ValueError(
-            f"Raw file {file_path} has target_fields={target_fields}, "
-            f"expected {list(PROGNOSTIC_TARGET_FIELDS)}"
         )
 
     param_names = [
@@ -161,22 +161,18 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
             f"expected {list(CONDITIONING_PARAM_NAMES)}"
         )
 
-    state_inputs = np.asarray(payload["state_inputs"], dtype=np.float32)
-    state_targets = np.asarray(payload["state_targets"], dtype=np.float32)
-    transition_days = np.asarray(payload["transition_days"], dtype=np.float64)
-    anchor_steps = np.asarray(payload["anchor_steps"], dtype=np.int64)
+    checkpoint_states = np.asarray(payload["checkpoint_states"], dtype=np.float32)
+    checkpoint_steps = np.asarray(payload["checkpoint_steps"], dtype=np.int64)
+    checkpoint_days = np.asarray(payload["checkpoint_days"], dtype=np.float64)
     params = np.asarray(payload["params"], dtype=np.float64)
     default_time_days = float(np.asarray(payload["default_time_days"], dtype=np.float64).item())
     burn_in_days = float(np.asarray(payload["burn_in_days"], dtype=np.float64).item())
     dt_seconds = float(np.asarray(payload["dt_seconds"], dtype=np.float64).item())
     starttime_index = int(np.asarray(payload["starttime_index"], dtype=np.int64).item())
-    transition_jump_days_min = float(
-        np.asarray(payload["transition_jump_days_min"], dtype=np.float64).item()
+    saved_checkpoint_interval_days = float(
+        np.asarray(payload["saved_checkpoint_interval_days"], dtype=np.float64).item()
     )
-    transition_jump_days_max = float(
-        np.asarray(payload["transition_jump_days_max"], dtype=np.float64).item()
-    )
-    n_transitions = int(np.asarray(payload["n_transitions"], dtype=np.int64).item())
+    n_saved_checkpoints = int(np.asarray(payload["n_saved_checkpoints"], dtype=np.int64).item())
     M = int(np.asarray(payload["M"], dtype=np.int64).item())
     nlat = int(np.asarray(payload["nlat"], dtype=np.int64).item())
     nlon = int(np.asarray(payload["nlon"], dtype=np.int64).item())
@@ -184,26 +180,24 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
     lon_origin = str(np.asarray(payload["lon_origin"], dtype=object).item())
     lon_shift = int(np.asarray(payload["lon_shift"], dtype=np.int64).item())
 
-    if state_inputs.ndim != 4 or state_targets.ndim != 4:
-        raise ValueError(f"Raw states in {file_path} must be [T,C,H,W]")
-    if state_inputs.shape[0] != state_targets.shape[0]:
-        raise ValueError(f"Raw transition count mismatch in {file_path}")
-    if state_inputs.shape[1] != len(PHYSICAL_STATE_FIELDS):
-        raise ValueError(f"Input channel count mismatch in {file_path}")
-    if state_targets.shape[1] != len(PROGNOSTIC_TARGET_FIELDS):
-        raise ValueError(f"Target channel count mismatch in {file_path}")
-    if transition_days.shape != (state_inputs.shape[0],):
-        raise ValueError(f"transition_days shape mismatch in {file_path}")
-    if anchor_steps.shape != (state_inputs.shape[0],):
-        raise ValueError(f"anchor_steps shape mismatch in {file_path}")
+    if checkpoint_states.ndim != 4:
+        raise ValueError(f"Raw checkpoint states in {file_path} must be [S,C,H,W]")
+    if checkpoint_states.shape[1] != len(PHYSICAL_STATE_FIELDS):
+        raise ValueError(f"Checkpoint channel count mismatch in {file_path}")
+    if checkpoint_steps.shape != (checkpoint_states.shape[0],):
+        raise ValueError(f"checkpoint_steps shape mismatch in {file_path}")
+    if checkpoint_days.shape != (checkpoint_states.shape[0],):
+        raise ValueError(f"checkpoint_days shape mismatch in {file_path}")
     if params.shape != (len(CONDITIONING_PARAM_NAMES),):
         raise ValueError(f"params shape mismatch in {file_path}: {params.shape}")
-    if int(state_inputs.shape[0]) != n_transitions:
-        raise ValueError(f"n_transitions mismatch in {file_path}")
-    if int(state_inputs.shape[2]) != nlat or int(state_inputs.shape[3]) != nlon:
-        raise ValueError(f"Input spatial metadata mismatch in {file_path}")
-    if int(state_targets.shape[2]) != nlat or int(state_targets.shape[3]) != nlon:
-        raise ValueError(f"Target spatial metadata mismatch in {file_path}")
+    if int(checkpoint_states.shape[0]) != n_saved_checkpoints:
+        raise ValueError(f"n_saved_checkpoints mismatch in {file_path}")
+    if int(checkpoint_states.shape[2]) != nlat or int(checkpoint_states.shape[3]) != nlon:
+        raise ValueError(f"Checkpoint spatial metadata mismatch in {file_path}")
+    if np.any(np.diff(checkpoint_steps) <= 0):
+        raise ValueError(f"checkpoint_steps must be strictly increasing in {file_path}")
+    if np.any(np.diff(checkpoint_days) <= 0.0):
+        raise ValueError(f"checkpoint_days must be strictly increasing in {file_path}")
 
     if M != int(cfg.solver.M):
         raise ValueError(f"Raw file {file_path} has M={M}, expected {cfg.solver.M}")
@@ -236,33 +230,35 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
             f"Raw file {file_path} has starttime_index={starttime_index}, "
             f"expected {cfg.solver.starttime_index}"
         )
+
+    expected_schedule = build_uniform_checkpoint_schedule(
+        time_days=float(cfg.solver.default_time_days),
+        dt_seconds=float(cfg.solver.dt_seconds),
+        saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+    )
     if not math.isclose(
-        transition_jump_days_min,
-        float(cfg.sampling.transition_jump_days_min),
+        saved_checkpoint_interval_days,
+        float(expected_schedule.interval_days),
         rel_tol=0.0,
         abs_tol=0.0,
     ):
         raise ValueError(
-            f"Raw file {file_path} has transition_jump_days_min={transition_jump_days_min}, "
-            f"expected {cfg.sampling.transition_jump_days_min}"
+            f"Raw file {file_path} has saved_checkpoint_interval_days="
+            f"{saved_checkpoint_interval_days}, expected {expected_schedule.interval_days}"
         )
-    if not math.isclose(
-        transition_jump_days_max,
-        float(cfg.sampling.transition_jump_days_max),
-        rel_tol=0.0,
-        abs_tol=0.0,
+    if not np.array_equal(checkpoint_steps, expected_schedule.checkpoint_steps):
+        raise ValueError(
+            f"Raw file {file_path} checkpoint_steps do not match the configured cadence"
+        )
+    if not np.allclose(
+        checkpoint_days,
+        expected_schedule.checkpoint_days,
+        rtol=0.0,
+        atol=0.0,
     ):
         raise ValueError(
-            f"Raw file {file_path} has transition_jump_days_max={transition_jump_days_max}, "
-            f"expected {cfg.sampling.transition_jump_days_max}"
+            f"Raw file {file_path} checkpoint_days do not match the configured cadence"
         )
-    if n_transitions != int(cfg.sampling.transitions_per_simulation):
-        raise ValueError(
-            f"Raw file {file_path} has n_transitions={n_transitions}, "
-            f"expected {cfg.sampling.transitions_per_simulation}"
-        )
-    if np.any(transition_days <= 0.0):
-        raise ValueError(f"Raw file {file_path} contains non-positive transition_days")
 
     expected_geometry = _expected_geometry(cfg, nlon=nlon)
     if lat_order != expected_geometry["lat_order"] or lon_origin != expected_geometry["lon_origin"]:
@@ -277,21 +273,18 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
         )
 
     return {
-        "state_inputs": state_inputs,
-        "state_targets": state_targets,
-        "transition_days": transition_days,
-        "anchor_steps": anchor_steps,
-        "input_fields": input_fields,
-        "target_fields": target_fields,
+        "checkpoint_states": checkpoint_states,
+        "checkpoint_steps": checkpoint_steps,
+        "checkpoint_days": checkpoint_days,
+        "state_fields": state_fields,
         "params": params,
         "param_names": param_names,
         "default_time_days": default_time_days,
         "burn_in_days": burn_in_days,
         "dt_seconds": dt_seconds,
         "starttime_index": starttime_index,
-        "transition_jump_days_min": transition_jump_days_min,
-        "transition_jump_days_max": transition_jump_days_max,
-        "n_transitions": n_transitions,
+        "saved_checkpoint_interval_days": saved_checkpoint_interval_days,
+        "n_saved_checkpoints": n_saved_checkpoints,
         "M": M,
         "nlat": nlat,
         "nlon": nlon,
@@ -309,16 +302,14 @@ def _raw_file_signature(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str, A
         "name": file_path.name,
         "size": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
-        "input_fields": list(metadata["input_fields"]),
-        "target_fields": list(metadata["target_fields"]),
+        "state_fields": list(metadata["state_fields"]),
         "param_names": list(metadata["param_names"]),
         "default_time_days": float(metadata["default_time_days"]),
         "burn_in_days": float(metadata["burn_in_days"]),
         "dt_seconds": float(metadata["dt_seconds"]),
         "starttime_index": int(metadata["starttime_index"]),
-        "transition_jump_days_min": float(metadata["transition_jump_days_min"]),
-        "transition_jump_days_max": float(metadata["transition_jump_days_max"]),
-        "n_transitions": int(metadata["n_transitions"]),
+        "saved_checkpoint_interval_days": float(metadata["saved_checkpoint_interval_days"]),
+        "n_saved_checkpoints": int(metadata["n_saved_checkpoints"]),
         "nlat": int(metadata["nlat"]),
         "nlon": int(metadata["nlon"]),
         "lat_order": str(metadata["lat_order"]),
@@ -333,8 +324,7 @@ def _build_preprocess_fingerprint(*, cfg: GCMulatorConfig, files: Sequence[Path]
     sampling_fingerprint.pop("generation_workers", None)
     return {
         "version": PREPROCESS_FINGERPRINT_VERSION,
-        "input_fields": list(PHYSICAL_STATE_FIELDS),
-        "target_fields": list(PROGNOSTIC_TARGET_FIELDS),
+        "state_fields": list(PHYSICAL_STATE_FIELDS),
         "split_seed": int(cfg.training.split_seed),
         "val_fraction": float(cfg.training.val_fraction),
         "test_fraction": float(cfg.training.test_fraction),
@@ -353,29 +343,86 @@ def _processed_cache_is_valid(
     processed_dir: Path,
 ) -> bool:
     """Return True when processed data matches the current preprocessing fingerprint."""
-    if str(meta.get("task", "")) != "trajectory_transition":
+    if str(meta.get("task", "")) != "checkpoint_sequence_transition":
         return False
     if meta.get("build_fingerprint") != fingerprint:
         return False
     splits = meta.get("splits")
     if not isinstance(splits, dict):
         return False
+    sequence_length = meta.get("sequence_length")
+    split_sequence_counts = meta.get("split_sequence_counts")
+    live_transition_catalog = meta.get("live_transition_catalog")
+    if not isinstance(sequence_length, int) or sequence_length < 2:
+        return False
+    if not isinstance(split_sequence_counts, dict):
+        return False
+    if not isinstance(live_transition_catalog, dict):
+        return False
     for split_name in ("train", "val", "test"):
         entries = splits.get(split_name)
         if not isinstance(entries, list) or not entries:
             return False
+        total_sequences = 0
         for entry in entries:
             if not isinstance(entry, dict):
                 return False
             rel_path = entry.get("file")
-            n_samples = entry.get("n_samples")
-            if not isinstance(rel_path, str) or not isinstance(n_samples, int):
+            n_sequences = entry.get("n_sequences")
+            entry_sequence_length = entry.get("sequence_length")
+            if (
+                not isinstance(rel_path, str)
+                or not isinstance(n_sequences, int)
+                or not isinstance(entry_sequence_length, int)
+            ):
                 return False
-            if n_samples < 1:
+            if n_sequences < 1 or entry_sequence_length != sequence_length:
                 return False
             if not (processed_dir / rel_path).is_file():
                 return False
+            total_sequences += int(n_sequences)
+        if int(split_sequence_counts.get(split_name, -1)) != total_sequences:
+            return False
     return True
+
+
+def _expected_checkpoint_schedule_and_catalog(
+    cfg: GCMulatorConfig,
+) -> tuple[Any, LiveTransitionCatalog]:
+    """Build the checkpoint schedule and discrete live jump catalog from config."""
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=float(cfg.solver.default_time_days),
+        dt_seconds=float(cfg.solver.dt_seconds),
+        saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+    )
+    catalog = build_live_transition_catalog(
+        checkpoint_days=schedule.checkpoint_days,
+        burn_in_days=float(cfg.sampling.burn_in_days),
+        transition_days_min=float(cfg.sampling.live_transition_days_min),
+        transition_days_max=float(cfg.sampling.live_transition_days_max),
+        tolerance_fraction=float(cfg.sampling.live_transition_tolerance_fraction),
+    )
+    return schedule, catalog
+
+
+def _live_transition_catalog_to_json(catalog: LiveTransitionCatalog) -> Dict[str, Any]:
+    """Serialize one discrete live transition catalog for metadata storage."""
+    return {
+        "gap_offsets": catalog.gap_offsets.astype(np.int64).tolist(),
+        "transition_days": catalog.transition_days.astype(np.float64).tolist(),
+        "probabilities": catalog.probabilities.astype(np.float64).tolist(),
+        "burn_in_start_index": int(catalog.burn_in_start_index),
+    }
+
+
+def _live_transition_catalog_from_json(payload: Dict[str, Any]) -> LiveTransitionCatalog:
+    """Reconstruct a discrete live transition catalog from stored metadata."""
+    return LiveTransitionCatalog(
+        gap_offsets=np.asarray(payload["gap_offsets"], dtype=np.int64),
+        transition_days=np.asarray(payload["transition_days"], dtype=np.float64),
+        probabilities=np.asarray(payload["probabilities"], dtype=np.float64),
+        burn_in_start_index=int(payload["burn_in_start_index"]),
+    )
 
 
 def _split_files(
@@ -419,65 +466,37 @@ def _fit_stats_streaming(
     *,
     train_files: Sequence[Path],
     cfg: GCMulatorConfig,
+    live_catalog: LiveTransitionCatalog,
 ) -> NormalizationStats:
     """Compute normalization statistics from the train split using streaming moments."""
-    input_state_sum: np.ndarray | None = None
-    input_state_sum2: np.ndarray | None = None
-    input_state_count = 0
-
-    target_state_sum: np.ndarray | None = None
-    target_state_sum2: np.ndarray | None = None
-    target_state_count = 0
+    state_sum: np.ndarray | None = None
+    state_sum2: np.ndarray | None = None
+    state_count = 0
 
     param_mean: np.ndarray | None = None
     param_m2: np.ndarray | None = None
     param_count = 0
 
-    transition_time_sum: np.ndarray | None = None
-    transition_time_sum2: np.ndarray | None = None
-    transition_time_count = 0
-
     for file_path in train_files:
         payload = _validated_raw_payload(file_path, cfg=cfg)
-        input_transformed = apply_state_transforms(
-            payload["state_inputs"],
-            payload["input_fields"],
-            cfg.normalization.state,
-        ).astype(np.float64, copy=False)
-        target_transformed = apply_state_transforms(
-            payload["state_targets"],
-            payload["target_fields"],
+        transformed = apply_state_transforms(
+            payload["checkpoint_states"],
+            PHYSICAL_STATE_FIELDS,
             cfg.normalization.state,
         ).astype(np.float64, copy=False)
 
-        # Count every grid point in every transition frame because state
-        # normalization is applied channel-wise over the full training corpus.
-        input_chunk_sum = input_transformed.sum(axis=(0, 2, 3))
-        input_chunk_sum2 = (input_transformed * input_transformed).sum(axis=(0, 2, 3))
-        input_n_samples = int(
-            input_transformed.shape[0] * input_transformed.shape[2] * input_transformed.shape[3]
+        chunk_sum = transformed.sum(axis=(0, 2, 3))
+        chunk_sum2 = (transformed * transformed).sum(axis=(0, 2, 3))
+        n_samples = int(
+            transformed.shape[0] * transformed.shape[2] * transformed.shape[3]
         )
-        if input_state_sum is None:
-            input_state_sum = input_chunk_sum
-            input_state_sum2 = input_chunk_sum2
+        if state_sum is None:
+            state_sum = chunk_sum
+            state_sum2 = chunk_sum2
         else:
-            input_state_sum += input_chunk_sum
-            input_state_sum2 += input_chunk_sum2
-        input_state_count += input_n_samples
-
-        # Fit target-channel statistics on the training targets themselves.
-        target_chunk_sum = target_transformed.sum(axis=(0, 2, 3))
-        target_chunk_sum2 = (target_transformed * target_transformed).sum(axis=(0, 2, 3))
-        target_n_samples = int(
-            target_transformed.shape[0] * target_transformed.shape[2] * target_transformed.shape[3]
-        )
-        if target_state_sum is None:
-            target_state_sum = target_chunk_sum
-            target_state_sum2 = target_chunk_sum2
-        else:
-            target_state_sum += target_chunk_sum
-            target_state_sum2 += target_chunk_sum2
-        target_state_count += target_n_samples
+            state_sum += chunk_sum
+            state_sum2 += chunk_sum2
+        state_count += n_samples
 
         params = payload["params"].astype(np.float64, copy=False)
         if param_mean is None:
@@ -491,44 +510,20 @@ def _fit_stats_streaming(
             delta2 = params - param_mean
             param_m2 += delta * delta2
 
-        log10_transition_days = np.log10(
-            np.maximum(payload["transition_days"].astype(np.float64, copy=False), 1.0e-30)
-        ).reshape(-1, 1)
-        transition_chunk_sum = log10_transition_days.sum(axis=0)
-        transition_chunk_sum2 = (log10_transition_days * log10_transition_days).sum(axis=0)
-        if transition_time_sum is None:
-            transition_time_sum = transition_chunk_sum
-            transition_time_sum2 = transition_chunk_sum2
-        else:
-            transition_time_sum += transition_chunk_sum
-            transition_time_sum2 += transition_chunk_sum2
-        transition_time_count += int(log10_transition_days.shape[0])
-
     if (
-        input_state_sum is None
-        or input_state_sum2 is None
-        or target_state_sum is None
-        or target_state_sum2 is None
+        state_sum is None
+        or state_sum2 is None
         or param_mean is None
         or param_m2 is None
-        or transition_time_sum is None
-        or transition_time_sum2 is None
     ):
         raise RuntimeError("Could not infer normalization statistics from the training split")
 
-    input_state_mean = input_state_sum / float(input_state_count)
-    input_state_var = np.maximum(
-        input_state_sum2 / float(input_state_count) - input_state_mean * input_state_mean,
+    state_mean = state_sum / float(state_count)
+    state_var = np.maximum(
+        state_sum2 / float(state_count) - state_mean * state_mean,
         0.0,
     )
-    input_state_std = np.maximum(np.sqrt(input_state_var), STD_FLOOR)
-
-    target_state_mean = target_state_sum / float(target_state_count)
-    target_state_var = np.maximum(
-        target_state_sum2 / float(target_state_count) - target_state_mean * target_state_mean,
-        0.0,
-    )
-    target_state_std = np.maximum(np.sqrt(target_state_var), STD_FLOOR)
+    state_std = np.maximum(np.sqrt(state_var), STD_FLOOR)
 
     if cfg.normalization.params.mode == "zscore":
         if param_count > 1:
@@ -543,45 +538,25 @@ def _fit_stats_streaming(
         param_is_constant = np.zeros_like(param_mean, dtype=bool)
         param_std = np.ones_like(param_mean, dtype=np.float64)
         param_mean_out = np.zeros_like(param_mean, dtype=np.float64)
-        transition_time_is_constant = np.zeros((1,), dtype=bool)
-        transition_time_std = np.ones((1,), dtype=np.float64)
-        transition_time_mean_out = np.zeros((1,), dtype=np.float64)
     else:
         raise ValueError(f"Unsupported param normalization mode: {cfg.normalization.params.mode}")
 
     if cfg.normalization.params.mode == "zscore":
-        transition_time_mean = transition_time_sum / float(transition_time_count)
-        transition_time_var = np.maximum(
-            transition_time_sum2 / float(transition_time_count)
-            - transition_time_mean * transition_time_mean,
-            0.0,
-        )
-        transition_time_std_raw = np.sqrt(transition_time_var)
-        transition_time_is_constant = transition_time_std_raw <= STD_FLOOR
-        transition_time_std = np.where(
+        (
+            transition_time_mean_out,
+            transition_time_std,
             transition_time_is_constant,
-            1.0,
-            np.maximum(transition_time_std_raw, STD_FLOOR),
-        )
-        transition_time_mean_out = transition_time_mean
+        ) = weighted_log10_transition_stats(live_catalog)
+    else:
+        transition_time_mean_out = np.zeros((1,), dtype=np.float64)
+        transition_time_std = np.ones((1,), dtype=np.float64)
+        transition_time_is_constant = np.zeros((1,), dtype=bool)
 
-    input_state_stats = StateNormalizationStats(
+    state_stats = StateNormalizationStats(
         field_names=tuple(PHYSICAL_STATE_FIELDS),
         field_transforms=dict(cfg.normalization.state.field_transforms),
-        mean=input_state_mean.astype(np.float64),
-        std=input_state_std.astype(np.float64),
-        zscore_eps=float(cfg.normalization.state.zscore_eps),
-        log10_eps=float(cfg.normalization.state.log10_eps),
-        signed_log1p_scale=float(cfg.normalization.state.signed_log1p_scale),
-    )
-    target_state_stats = StateNormalizationStats(
-        field_names=tuple(PROGNOSTIC_TARGET_FIELDS),
-        field_transforms={
-            str(name): str(cfg.normalization.state.field_transforms.get(str(name), "none"))
-            for name in PROGNOSTIC_TARGET_FIELDS
-        },
-        mean=target_state_mean.astype(np.float64),
-        std=target_state_std.astype(np.float64),
+        mean=state_mean.astype(np.float64),
+        std=state_std.astype(np.float64),
         zscore_eps=float(cfg.normalization.state.zscore_eps),
         log10_eps=float(cfg.normalization.state.log10_eps),
         signed_log1p_scale=float(cfg.normalization.state.signed_log1p_scale),
@@ -594,8 +569,7 @@ def _fit_stats_streaming(
         zscore_eps=float(cfg.normalization.params.eps),
     )
     return NormalizationStats(
-        input_state=input_state_stats,
-        target_state=target_state_stats,
+        state=state_stats,
         params=param_stats,
         transition_time=ParamNormalizationStats(
             param_names=(TRANSITION_TIME_NAME,),
@@ -603,7 +577,7 @@ def _fit_stats_streaming(
             std=transition_time_std.astype(np.float64),
             is_constant=np.asarray(transition_time_is_constant, dtype=bool),
             zscore_eps=float(cfg.normalization.params.eps),
-        ),
+        )
     )
 
 
@@ -616,35 +590,23 @@ def _write_processed_shard(
 ) -> Dict[str, Any]:
     """Normalize one raw trajectory file and write one shard file."""
     payload = _validated_raw_payload(src_file, cfg=cfg)
-    state_inputs_norm = normalize_state_tensor(
-        payload["state_inputs"],
-        stats.input_state,
-    ).astype(np.float32)
-    state_targets_norm = normalize_state_tensor(
-        payload["state_targets"],
-        stats.target_state,
+    states_norm = normalize_state_tensor(
+        payload["checkpoint_states"],
+        stats.state,
     ).astype(np.float32)
     params_norm = normalize_params(payload["params"][None, ...], stats.params)[0].astype(np.float32)
-    conditioning_norm = normalize_conditioning(
-        payload["params"],
-        payload["transition_days"],
-        param_stats=stats.params,
-        transition_time_stats=stats.transition_time,
-    ).astype(np.float32)
 
     shard_name = f"{src_file.stem}.npz"
     np.savez(
         dst_dir / shard_name,
-        state_inputs_norm=state_inputs_norm,
-        state_targets_norm=state_targets_norm,
+        states_norm=states_norm,
         params_norm=params_norm,
-        conditioning_norm=conditioning_norm,
-        transition_days=payload["transition_days"].astype(np.float64),
-        anchor_steps=payload["anchor_steps"].astype(np.int64),
+        checkpoint_days=payload["checkpoint_days"].astype(np.float64),
     )
     return {
         "file": str(Path(dst_dir.name) / shard_name),
-        "n_samples": int(payload["transition_days"].shape[0]),
+        "n_sequences": 1,
+        "sequence_length": int(payload["checkpoint_days"].shape[0]),
     }
 
 
@@ -685,7 +647,12 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
         val_fraction=float(cfg.training.val_fraction),
         test_fraction=float(cfg.training.test_fraction),
     )
-    stats = _fit_stats_streaming(train_files=train_files, cfg=cfg)
+    expected_schedule, live_catalog = _expected_checkpoint_schedule_and_catalog(cfg)
+    stats = _fit_stats_streaming(
+        train_files=train_files,
+        cfg=cfg,
+        live_catalog=live_catalog,
+    )
 
     train_dir = processed_dir / "train"
     val_dir = processed_dir / "val"
@@ -711,195 +678,328 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
         processed_dir / train_shards[0]["file"],
         allow_pickle=False,
     ) as first_train_payload:
-        sample_input = np.asarray(first_train_payload["state_inputs_norm"], dtype=np.float32)[0]
-        sample_target = np.asarray(first_train_payload["state_targets_norm"], dtype=np.float32)[0]
+        state_sequence = np.asarray(first_train_payload["states_norm"], dtype=np.float32)
+        checkpoint_days = np.asarray(first_train_payload["checkpoint_days"], dtype=np.float64)
+
+    sample_state = state_sequence[0]
+    geometry_meta = _expected_geometry(cfg, nlon=int(sample_state.shape[2]))
+    split_sequence_counts = {
+        "train": int(sum(entry["n_sequences"] for entry in train_shards)),
+        "val": int(sum(entry["n_sequences"] for entry in val_shards)),
+        "test": int(sum(entry["n_sequences"] for entry in test_shards)),
+    }
 
     meta: Dict[str, Any] = {
-        "task": "trajectory_transition",
-        "input_fields": list(stats.input_state.field_names),
-        "target_fields": list(stats.target_state.field_names),
+        "task": "checkpoint_sequence_transition",
+        "state_fields": list(stats.state.field_names),
         "param_names": list(stats.params.param_names),
         "conditioning_names": list(stats.params.param_names) + list(
             stats.transition_time.param_names
         ),
-        "input_shape": {
-            "C": int(sample_input.shape[0]),
-            "H": int(sample_input.shape[1]),
-            "W": int(sample_input.shape[2]),
+        "state_shape": {
+            "C": int(sample_state.shape[0]),
+            "H": int(sample_state.shape[1]),
+            "W": int(sample_state.shape[2]),
         },
-        "target_shape": {
-            "C": int(sample_target.shape[0]),
-            "H": int(sample_target.shape[1]),
-            "W": int(sample_target.shape[2]),
-        },
+        "sequence_length": int(state_sequence.shape[0]),
+        "checkpoint_days": checkpoint_days.astype(np.float64).tolist(),
+        "split_sequence_counts": split_sequence_counts,
         "splits": {"train": train_shards, "val": val_shards, "test": test_shards},
+        "live_transition_catalog": _live_transition_catalog_to_json(live_catalog),
         "normalization": stats_to_json(stats),
         "solver": asdict(cfg.solver),
         "sampling": asdict(cfg.sampling),
         "geometry": {
             **asdict(cfg.geometry),
-            "lat_order": "north_to_south",
-            "lon_origin": "0_to_2pi",
+            **geometry_meta,
         },
+        "saved_checkpoint_interval_days": float(expected_schedule.interval_days),
         "build_fingerprint": fingerprint,
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
 
 
-class TransitionShardDataset(Dataset):
-    """PyTorch dataset wrapper over processed NPZ shards."""
+@dataclass(frozen=True)
+class PreloadedSequenceSplit:
+    """One processed split materialized as GPU-resident sequence tensors."""
 
-    def __init__(
-        self,
-        *,
-        processed_dir: Path,
-        shard_entries: Sequence[Dict[str, Any]],
-    ) -> None:
-        """Index processed shard metadata and prepare a one-shard read cache."""
-        self.processed_dir = processed_dir
-        self.shard_entries = list(shard_entries)
-        if not self.shard_entries:
-            raise ValueError("TransitionShardDataset requires at least one shard entry")
+    states: torch.Tensor
+    params: torch.Tensor
 
-        self.cumulative_counts: List[int] = []
-        running = 0
-        for entry in self.shard_entries:
-            n_samples = int(entry["n_samples"])
-            if n_samples < 1:
-                raise ValueError("Shard n_samples must be >= 1")
-            running += n_samples
-            self.cumulative_counts.append(running)
+    @property
+    def n_sequences(self) -> int:
+        """Return the number of stored simulation sequences."""
+        return int(self.states.shape[0])
 
-        self._cached_path: Path | None = None
-        self._cached_arrays: Dict[str, np.ndarray] | None = None
+    @property
+    def sequence_length(self) -> int:
+        """Return the number of saved checkpoints per sequence."""
+        return int(self.states.shape[1])
 
-    def __len__(self) -> int:
-        """Return the total number of transition samples across all shards."""
-        return int(self.cumulative_counts[-1])
 
-    def _load_shard(self, shard_path: Path) -> Dict[str, np.ndarray]:
-        """Load one processed shard and reuse it while adjacent indices are read."""
-        if self._cached_path == shard_path and self._cached_arrays is not None:
-            return self._cached_arrays
-        # Each dataset instance keeps a single-shard cache because dataloaders
-        # tend to walk consecutive indices within the same simulation window.
-        with np.load(shard_path, allow_pickle=False) as npz:
-            arrays = {
-                "conditioning_norm": np.asarray(npz["conditioning_norm"], dtype=np.float32),
-                "state_inputs_norm": np.asarray(npz["state_inputs_norm"], dtype=np.float32),
-                "state_targets_norm": np.asarray(npz["state_targets_norm"], dtype=np.float32),
-            }
-        self._cached_path = shard_path
-        self._cached_arrays = arrays
-        return arrays
+@dataclass(frozen=True)
+class DeviceLiveTransitionCatalog:
+    """GPU-resident discrete jump catalog and normalized transition feature."""
 
-    def __getitem__(
-        self,
-        index: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return one normalized transition sample from the processed shards."""
-        if index < 0 or index >= len(self):
-            raise IndexError(index)
-        shard_index = bisect_right(self.cumulative_counts, int(index))
-        shard_start = 0 if shard_index == 0 else self.cumulative_counts[shard_index - 1]
-        local_index = int(index) - int(shard_start)
-        shard_path = self.processed_dir / str(self.shard_entries[shard_index]["file"])
-        arrays = self._load_shard(shard_path)
-        return (
-            torch.from_numpy(arrays["conditioning_norm"][local_index]),
-            torch.from_numpy(arrays["state_inputs_norm"][local_index]),
-            torch.from_numpy(arrays["state_targets_norm"][local_index]),
+    gap_offsets: torch.Tensor
+    transition_days: torch.Tensor
+    probabilities: torch.Tensor
+    transition_time_norm: torch.Tensor
+    burn_in_start_index: int
+
+
+@dataclass(frozen=True)
+class LivePairTable:
+    """GPU index table describing one epoch of live-sampled transition pairs."""
+
+    sequence_indices: torch.Tensor
+    anchor_indices: torch.Tensor
+    target_indices: torch.Tensor
+    transition_time_norm: torch.Tensor
+
+    @property
+    def n_pairs(self) -> int:
+        """Return the number of sampled live transition pairs."""
+        return int(self.sequence_indices.shape[0])
+
+
+def _normalize_transition_days_feature(
+    transition_days: np.ndarray,
+    stats: ParamNormalizationStats,
+) -> np.ndarray:
+    """Normalize physical transition days into the model's log-time feature."""
+    log10_transition_days = np.log10(np.maximum(transition_days.astype(np.float64), 1.0e-30))
+    return normalize_params(log10_transition_days.reshape(-1, 1), stats).astype(np.float32)
+
+
+def _catalog_to_device(
+    *,
+    catalog: LiveTransitionCatalog,
+    transition_time_stats: ParamNormalizationStats,
+    device: torch.device,
+) -> DeviceLiveTransitionCatalog:
+    """Move the discrete live jump catalog and normalized time feature to GPU."""
+    transition_time_norm = _normalize_transition_days_feature(
+        catalog.transition_days.astype(np.float64),
+        transition_time_stats,
+    )
+    return DeviceLiveTransitionCatalog(
+        gap_offsets=torch.from_numpy(catalog.gap_offsets.astype(np.int64)).to(device=device),
+        transition_days=torch.from_numpy(catalog.transition_days.astype(np.float32)).to(device=device),
+        probabilities=torch.from_numpy(catalog.probabilities.astype(np.float32)).to(device=device),
+        transition_time_norm=torch.from_numpy(transition_time_norm).to(device=device),
+        burn_in_start_index=int(catalog.burn_in_start_index),
+    )
+
+
+def _estimate_split_gpu_bytes(
+    *,
+    processed_meta: Dict[str, Any],
+    split_name: str,
+    live_pairs_per_sequence: int,
+) -> int:
+    """Estimate GPU bytes required for one active processed split plus its pair table."""
+    split_counts = dict(processed_meta["split_sequence_counts"])
+    n_sequences = int(split_counts[split_name])
+    sequence_length = int(processed_meta["sequence_length"])
+    state_shape = dict(processed_meta["state_shape"])
+    param_dim = int(len(processed_meta["param_names"]))
+    state_bytes = (
+        n_sequences
+        * sequence_length
+        * int(state_shape["C"])
+        * int(state_shape["H"])
+        * int(state_shape["W"])
+        * 4
+    )
+    params_bytes = n_sequences * param_dim * 4
+    pair_count = n_sequences * int(live_pairs_per_sequence)
+    pair_table_bytes = pair_count * (8 + 8 + 8 + 4)
+    return int(state_bytes + params_bytes + pair_table_bytes)
+
+
+def _assert_split_fits_gpu(
+    *,
+    processed_meta: Dict[str, Any],
+    split_name: str,
+    live_pairs_per_sequence: int,
+    device: torch.device,
+) -> None:
+    """Fail early when one active split plus fixed headroom cannot fit on the GPU."""
+    if device.type != "cuda":
+        raise RuntimeError("GPU split residency requires a CUDA device")
+    total_memory = int(torch.cuda.get_device_properties(device).total_memory)
+    estimated_bytes = _estimate_split_gpu_bytes(
+        processed_meta=processed_meta,
+        split_name=split_name,
+        live_pairs_per_sequence=live_pairs_per_sequence,
+    )
+    required_bytes = int(math.ceil(float(estimated_bytes) * VRAM_HEADROOM_FACTOR))
+    if required_bytes > total_memory:
+        gib = 1024.0 ** 3
+        raise RuntimeError(
+            f"Processed split `{split_name}` cannot fit on {device} with the required "
+            f"{VRAM_HEADROOM_FACTOR:.0%} VRAM headroom: estimated={estimated_bytes / gib:.2f} GiB, "
+            f"required_with_headroom={required_bytes / gib:.2f} GiB, "
+            f"device_total={total_memory / gib:.2f} GiB"
         )
 
 
-class PreloadedTransitionDataset(Dataset):
-    """Dataset backed by already-loaded transition tensors."""
-
-    def __init__(
-        self,
-        *,
-        conditioning: torch.Tensor,
-        state_inputs: torch.Tensor,
-        state_targets: torch.Tensor,
-    ) -> None:
-        """Validate and store already-loaded transition tensors."""
-        if conditioning.ndim != 2:
-            raise ValueError(f"conditioning must be [N,P], got {tuple(conditioning.shape)}")
-        if state_inputs.ndim != 4 or state_targets.ndim != 4:
-            raise ValueError("state_inputs/state_targets must be [N,C,H,W]")
-        n_samples = int(conditioning.shape[0])
-        if any(int(tensor.shape[0]) != n_samples for tensor in (state_inputs, state_targets)):
-            raise ValueError("Preloaded tensor batch sizes must match")
-        self.conditioning = conditioning
-        self.state_inputs = state_inputs
-        self.state_targets = state_targets
-
-    def __len__(self) -> int:
-        """Return the number of preloaded transition samples."""
-        return int(self.conditioning.shape[0])
-
-    def __getitem__(
-        self,
-        index: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return one preloaded transition sample."""
-        return (
-            self.conditioning[index],
-            self.state_inputs[index],
-            self.state_targets[index],
-        )
-
-
-def _preload_split_to_device(
+def _load_sequence_split_to_device(
     *,
     processed_dir: Path,
     shard_entries: Sequence[Dict[str, Any]],
     device: torch.device,
-) -> PreloadedTransitionDataset:
-    """Load one split into contiguous tensors and move them to ``device``."""
-    conditioning_rows: List[np.ndarray] = []
-    state_input_rows: List[np.ndarray] = []
-    state_target_rows: List[np.ndarray] = []
+) -> PreloadedSequenceSplit:
+    """Load one processed split into contiguous GPU tensors."""
+    state_rows: List[np.ndarray] = []
+    params_rows: List[np.ndarray] = []
 
     for entry in shard_entries:
-        with np.load(processed_dir / str(entry["file"]), allow_pickle=False) as npz:
-            conditioning = np.asarray(npz["conditioning_norm"], dtype=np.float32)
-            state_inputs = np.asarray(npz["state_inputs_norm"], dtype=np.float32)
-            state_targets = np.asarray(npz["state_targets_norm"], dtype=np.float32)
-            conditioning_rows.append(conditioning)
-            state_input_rows.append(state_inputs)
-            state_target_rows.append(state_targets)
+        shard_path = processed_dir / str(entry["file"])
+        with np.load(shard_path, allow_pickle=False) as npz:
+            states = np.asarray(npz["states_norm"], dtype=np.float32)
+            params_norm = np.asarray(npz["params_norm"], dtype=np.float32)
+        if states.ndim != 4:
+            raise ValueError(f"Processed shard {shard_path} must store rank-4 state sequences")
+        if params_norm.ndim != 1:
+            raise ValueError(f"Processed shard {shard_path} params_norm must be rank-1")
+        state_rows.append(states)
+        params_rows.append(params_norm)
 
-    conditioning = torch.from_numpy(np.concatenate(conditioning_rows, axis=0)).to(device=device)
-    state_inputs = torch.from_numpy(np.concatenate(state_input_rows, axis=0)).to(device=device)
-    state_targets = torch.from_numpy(np.concatenate(state_target_rows, axis=0)).to(device=device)
-    return PreloadedTransitionDataset(
-        conditioning=conditioning,
-        state_inputs=state_inputs,
-        state_targets=state_targets,
+    if not state_rows:
+        raise RuntimeError("Cannot preload an empty sequence split")
+
+    states_tensor = torch.from_numpy(np.stack(state_rows, axis=0)).to(device=device)
+    params_tensor = torch.from_numpy(np.stack(params_rows, axis=0)).to(device=device)
+    return PreloadedSequenceSplit(
+        states=states_tensor,
+        params=params_tensor,
     )
+
+
+def _release_preloaded_sequence_split(
+    split: PreloadedSequenceSplit | None,
+) -> PreloadedSequenceSplit | None:
+    """Drop one active split reference before another split is loaded onto the GPU."""
+    if split is None:
+        return None
+    del split
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return None
+
+
+def _sample_live_pair_table(
+    *,
+    split: PreloadedSequenceSplit,
+    catalog: DeviceLiveTransitionCatalog,
+    live_pairs_per_sequence: int,
+    seed: int,
+    shuffle_pairs: bool,
+) -> LivePairTable:
+    """Sample one deterministic GPU-resident live pair table for a split."""
+    if split.n_sequences < 1:
+        raise ValueError("Split must contain at least one sequence")
+    if live_pairs_per_sequence < 1:
+        raise ValueError("live_pairs_per_sequence must be >= 1")
+
+    device = split.states.device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+
+    sequence_indices = torch.arange(split.n_sequences, device=device, dtype=torch.long)
+    sequence_indices = sequence_indices.repeat_interleave(int(live_pairs_per_sequence))
+    n_pairs = int(sequence_indices.shape[0])
+
+    catalog_indices = torch.multinomial(
+        catalog.probabilities,
+        num_samples=n_pairs,
+        replacement=True,
+        generator=generator,
+    )
+    gap_offsets = torch.index_select(catalog.gap_offsets, 0, catalog_indices)
+    transition_time_norm = torch.index_select(
+        catalog.transition_time_norm,
+        0,
+        catalog_indices,
+    )
+
+    min_anchor = int(catalog.burn_in_start_index)
+    max_anchor = int(split.sequence_length) - 1 - gap_offsets
+    valid_anchor_counts = max_anchor - int(min_anchor) + 1
+    if torch.any(valid_anchor_counts <= 0):
+        raise RuntimeError("Live jump catalog produced an invalid anchor range")
+    anchor_uniform = torch.rand((n_pairs,), generator=generator, device=device)
+    anchor_indices = (
+        torch.floor(anchor_uniform * valid_anchor_counts.to(dtype=torch.float32)).to(torch.long)
+        + int(min_anchor)
+    )
+    target_indices = anchor_indices + gap_offsets
+
+    if shuffle_pairs:
+        permutation = torch.randperm(n_pairs, generator=generator, device=device)
+        sequence_indices = torch.index_select(sequence_indices, 0, permutation)
+        anchor_indices = torch.index_select(anchor_indices, 0, permutation)
+        target_indices = torch.index_select(target_indices, 0, permutation)
+        transition_time_norm = torch.index_select(transition_time_norm, 0, permutation)
+
+    return LivePairTable(
+        sequence_indices=sequence_indices,
+        anchor_indices=anchor_indices,
+        target_indices=target_indices,
+        transition_time_norm=transition_time_norm,
+    )
+
+
+def _iter_live_pair_batches(
+    *,
+    split: PreloadedSequenceSplit,
+    pair_table: LivePairTable,
+    batch_size: int,
+) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Yield GPU batches gathered directly from one sequence split and pair table."""
+    total_pairs = int(pair_table.n_pairs)
+    for start in range(0, total_pairs, int(batch_size)):
+        end = min(start + int(batch_size), total_pairs)
+        sequence_indices = pair_table.sequence_indices[start:end]
+        anchor_indices = pair_table.anchor_indices[start:end]
+        target_indices = pair_table.target_indices[start:end]
+        state_inputs = split.states[sequence_indices, anchor_indices]
+        state_targets = split.states[sequence_indices, target_indices]
+        params_norm = torch.index_select(split.params, 0, sequence_indices)  # shape: (B, P)
+        conditioning = torch.cat(
+            (params_norm, pair_table.transition_time_norm[start:end]),
+            dim=1,
+        )  # shape: (B, P + 1)
+        yield conditioning, state_inputs, state_targets
 
 
 def _collect_predictions(
     *,
     model: torch.nn.Module,
-    loader: DataLoader,
+    split: PreloadedSequenceSplit,
+    pair_table: LivePairTable,
+    batch_size: int,
     device: torch.device,
     amp_mode: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Run the transition model on a split loader and collect predictions/targets."""
+    """Run the transition model on one live-sampled split and collect predictions/targets."""
     predictions: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     model.eval()
     with torch.no_grad():
-        for conditioning_batch, state_input_batch, state_target_batch in loader:
-            conditioning_batch = conditioning_batch.to(device=device)
-            state_input_batch = state_input_batch.to(device=device)
+        for conditioning_batch, state_input_batch, state_target_batch in _iter_live_pair_batches(
+            split=split,
+            pair_table=pair_table,
+            batch_size=batch_size,
+        ):
             with autocast_context(device, amp_mode):
                 pred_batch = model(state_input_batch, conditioning_batch)
-            predictions.append(pred_batch.detach().cpu().numpy())
-            targets.append(state_target_batch.detach().cpu().numpy())
+            predictions.append(pred_batch.detach().float().cpu().numpy())
+            targets.append(state_target_batch.detach().float().cpu().numpy())
     return np.concatenate(predictions, axis=0), np.concatenate(targets, axis=0)
 
 
@@ -952,7 +1052,15 @@ def _compute_one_step_metrics(
     state_stats: StateNormalizationStats,
     grid: str,
 ) -> Dict[str, Any]:
-    """Compute normalized, physical, and spherical-spectrum single-call metrics."""
+    """Compute normalized, physical, and spherical-spectrum single-call metrics.
+
+    Args:
+        pred_norm:
+            Normalized predictions with shape ``[N, C, H, W]``.
+        target_norm:
+            Normalized targets with shape ``[N, C, H, W]`` for the same ``C``
+            prognostic channels.
+    """
     diff_norm = pred_norm - target_norm
     per_channel_rmse_norm = np.sqrt(np.mean(diff_norm**2, axis=(0, 2, 3)))
 
@@ -1177,6 +1285,17 @@ def _early_stopping_patience(*, scheduler_patience: int, warmup_epochs: int) -> 
     )
 
 
+def _plateau_reduce_threshold(*, scheduler_patience: int) -> int:
+    """Return the bad-epoch count required for one plateau LR reduction.
+
+    ``scheduler_patience=0`` is supported and means "reduce after the first
+    non-improving epoch", not "reduce immediately on an improving epoch."
+    """
+    if scheduler_patience < 0:
+        raise ValueError("scheduler_patience must be >= 0")
+    return max(1, int(scheduler_patience))
+
+
 def _set_determinism(*, seed: int, deterministic: bool) -> None:
     """Apply reproducible random seeds and optional deterministic-kernel settings."""
     np.random.seed(int(seed))
@@ -1194,6 +1313,15 @@ def _set_determinism(*, seed: int, deterministic: bool) -> None:
 
 def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
     """Train the transition emulator end-to-end and persist artifacts."""
+    device = choose_device(cfg.training.device)
+    preload_to_gpu = bool(cfg.training.preload_to_gpu)
+    if not preload_to_gpu:
+        raise RuntimeError(
+            "This training path requires training.preload_to_gpu=true so live pair sampling stays on GPU"
+        )
+    if device.type != "cuda":
+        raise RuntimeError("training.preload_to_gpu=true requires CUDA")
+
     ensure_torch_harmonics_importable()
     processed_meta = preprocess_dataset(cfg, config_path=config_path)
     processed_dir = resolve_path(config_path, cfg.paths.processed_dir)
@@ -1214,143 +1342,69 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     )
 
     stats = stats_from_json(processed_meta["normalization"])
-    input_field_names = list(processed_meta["input_fields"])
-    target_field_names = list(processed_meta["target_fields"])
-    device = choose_device(cfg.training.device)
-    preload_to_gpu = bool(cfg.training.preload_to_gpu)
-    if preload_to_gpu and device.type != "cuda":
-        raise RuntimeError("training.preload_to_gpu=true requires CUDA")
-
-    if preload_to_gpu:
-        train_dataset = _preload_split_to_device(
-            processed_dir=processed_dir,
-            shard_entries=processed_meta["splits"]["train"],
-            device=device,
-        )
-        val_dataset = _preload_split_to_device(
-            processed_dir=processed_dir,
-            shard_entries=processed_meta["splits"]["val"],
-            device=device,
-        )
-        test_dataset = _preload_split_to_device(
-            processed_dir=processed_dir,
-            shard_entries=processed_meta["splits"]["test"],
-            device=device,
-        )
-        LOGGER.info(
-            "Preloaded processed splits to %s | n_train=%d | n_val=%d | n_test=%d",
-            device,
-            len(train_dataset),
-            len(val_dataset),
-            len(test_dataset),
-        )
-    else:
-        train_dataset = TransitionShardDataset(
-            processed_dir=processed_dir,
-            shard_entries=processed_meta["splits"]["train"],
-        )
-        val_dataset = TransitionShardDataset(
-            processed_dir=processed_dir,
-            shard_entries=processed_meta["splits"]["val"],
-        )
-        test_dataset = TransitionShardDataset(
-            processed_dir=processed_dir,
-            shard_entries=processed_meta["splits"]["test"],
-        )
-
-    if len(train_dataset) < int(cfg.training.batch_size):
-        raise ValueError("Training split size is smaller than batch_size while drop_last=True")
+    state_field_names = list(processed_meta["state_fields"])
 
     _set_determinism(
         seed=int(cfg.training.seed),
         deterministic=bool(cfg.training.deterministic),
     )
-
-    if preload_to_gpu:
-        loader_common: Dict[str, Any] = {"num_workers": 0, "pin_memory": False}
-    else:
-        loader_common = {
-            "num_workers": int(cfg.training.num_workers),
-            "pin_memory": bool(cfg.training.pin_memory),
-        }
-        if int(cfg.training.num_workers) > 0:
-            loader_common["persistent_workers"] = True
-            loader_common["prefetch_factor"] = int(cfg.training.prefetch_factor)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=bool(cfg.training.shuffle),
-        drop_last=True,
-        **loader_common,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=False,
-        drop_last=False,
-        **loader_common,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=False,
-        drop_last=False,
-        **loader_common,
+    live_pairs_per_sequence = int(cfg.sampling.live_pairs_per_sequence)
+    batch_size = int(cfg.training.batch_size)
+    sequence_batch_size = batch_size // live_pairs_per_sequence
+    state_shape = dict(processed_meta["state_shape"])
+    state_chans = int(state_shape["C"])
+    nlat = int(state_shape["H"])
+    nlon = int(state_shape["W"])
+    conditioning_dim = int(len(processed_meta["conditioning_names"]))
+    residual_input_indices = list(range(state_chans))
+    live_catalog = _live_transition_catalog_from_json(processed_meta["live_transition_catalog"])
+    device_catalog = _catalog_to_device(
+        catalog=live_catalog,
+        transition_time_stats=stats.transition_time,
+        device=device,
     )
 
-    use_non_blocking = (
-        bool(cfg.training.pin_memory)
-        and device.type == "cuda"
-        and not preload_to_gpu
-    )
-    (
-        sample_conditioning,
-        sample_state_input,
-        sample_state_target,
-    ) = train_dataset[0]
-    input_state_chans = int(sample_state_input.shape[0])
-    target_state_chans = int(sample_state_target.shape[0])
-    nlat = int(sample_state_input.shape[1])
-    nlon = int(sample_state_input.shape[2])
-    conditioning_dim = int(sample_conditioning.shape[0])
-    residual_input_indices = [
-        input_field_names.index(field_name)
-        for field_name in target_field_names
-    ]
+    for split_name in ("train", "val", "test"):
+        _assert_split_fits_gpu(
+            processed_meta=processed_meta,
+            split_name=split_name,
+            live_pairs_per_sequence=live_pairs_per_sequence,
+            device=device,
+        )
 
     model = build_state_conditioned_transition_model(
         img_size=(nlat, nlon),
-        input_state_chans=input_state_chans,
-        target_state_chans=target_state_chans,
+        input_state_chans=state_chans,
+        target_state_chans=state_chans,
         param_dim=conditioning_dim,
         residual_input_indices=residual_input_indices,
         cfg_model=cfg.model,
-        lat_order=str(processed_meta["geometry"]["lat_order"]),
-        lon_origin=str(processed_meta["geometry"]["lon_origin"]),
     ).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    LOGGER.info(
+        "Model parameters | total=%s | trainable=%s",
+        f"{n_params:,}",
+        f"{n_trainable:,}",
+    )
     runtime_amp_mode = _resolve_runtime_amp_mode(
         requested_amp_mode=cfg.training.amp_mode,
         nlat=nlat,
         nlon=nlon,
     )
     LOGGER.info(
-        "Training runtime | device=%s | amp=%s | deterministic=%s | batch=%s | "
-        "workers=%s | prefetch=%s | pin_memory=%s | preload_to_gpu=%s",
+        "Training runtime | device=%s | amp=%s | deterministic=%s | pair_batch=%s | "
+        "sequence_batch=%s | preload_to_gpu=%s | split_sequence_counts=%s",
         device,
         runtime_amp_mode,
         str(bool(cfg.training.deterministic)).lower(),
-        _format_scientific(float(cfg.training.batch_size)),
-        _format_scientific(float(cfg.training.num_workers)),
-        (
-            _format_scientific(float(cfg.training.prefetch_factor))
-            if int(cfg.training.num_workers) > 0
-            else "n/a"
-        ),
-        str(bool(cfg.training.pin_memory)).lower(),
-        str(preload_to_gpu).lower(),
+        _format_scientific(float(batch_size)),
+        _format_scientific(float(sequence_batch_size)),
+        "true",
+        json.dumps(processed_meta["split_sequence_counts"], sort_keys=True),
     )
 
+    grad_clip_norm = float(cfg.training.grad_clip_norm)
     loss_fn = SphereLoss(nlat=nlat, nlon=nlon, grid=cfg.model.grid).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1363,6 +1417,9 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     scheduler_eps = float(cfg.training.scheduler.eps)
     scheduler_factor = float(cfg.training.scheduler.factor)
     warmup_epochs = int(cfg.training.scheduler.warmup_epochs)
+    plateau_reduce_threshold = _plateau_reduce_threshold(
+        scheduler_patience=scheduler_patience,
+    )
 
     scaler = None
     if runtime_amp_mode == "fp16" and device.type == "cuda":
@@ -1380,6 +1437,10 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         scheduler_patience=scheduler_patience,
         warmup_epochs=warmup_epochs,
     )
+    val_pair_seed = int(cfg.training.seed) + VAL_PAIR_SEED_OFFSET
+    test_pair_seed = int(cfg.training.seed) + TEST_PAIR_SEED_OFFSET
+    val_pair_table: LivePairTable | None = None
+    test_pair_table: LivePairTable | None = None
 
     # ------------------------------------------------------------------
     # Optimization loop
@@ -1407,17 +1468,29 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 ),
             )
 
+        train_split = _load_sequence_split_to_device(
+            processed_dir=processed_dir,
+            shard_entries=processed_meta["splits"]["train"],
+            device=device,
+        )
+        train_pair_table = _sample_live_pair_table(
+            split=train_split,
+            catalog=device_catalog,
+            live_pairs_per_sequence=live_pairs_per_sequence,
+            seed=int(cfg.training.seed) + int(epoch),
+            shuffle_pairs=bool(cfg.training.shuffle),
+        )
         model.train()
         train_loss_sum = 0.0
         train_count = 0
-        train_samples = 0
+        train_samples = int(train_pair_table.n_pairs)
         train_phase_start = time.perf_counter()
 
-        for conditioning_batch, state_input_batch, state_target_batch in train_loader:
-            conditioning_batch = conditioning_batch.to(device=device, non_blocking=use_non_blocking)
-            state_input_batch = state_input_batch.to(device=device, non_blocking=use_non_blocking)
-            state_target_batch = state_target_batch.to(device=device, non_blocking=use_non_blocking)
-
+        for conditioning_batch, state_input_batch, state_target_batch in _iter_live_pair_batches(
+            split=train_split,
+            pair_table=train_pair_table,
+            batch_size=batch_size,
+        ):
             _check_finite_tensor(conditioning_batch, name="train conditioning batch")
             _check_finite_tensor(state_input_batch, name="train state_input batch")
             _check_finite_tensor(state_target_batch, name="train target batch")
@@ -1432,37 +1505,45 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
 
             if scaler is not None:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
                 optimizer.step()
 
             train_loss_sum += float(loss.detach().item())
             train_count += 1
-            train_samples += int(state_input_batch.shape[0])
         train_seconds = time.perf_counter() - train_phase_start
+        del train_pair_table
+        train_split = _release_preloaded_sequence_split(train_split)
 
+        val_split = _load_sequence_split_to_device(
+            processed_dir=processed_dir,
+            shard_entries=processed_meta["splits"]["val"],
+            device=device,
+        )
+        if val_pair_table is None:
+            val_pair_table = _sample_live_pair_table(
+                split=val_split,
+                catalog=device_catalog,
+                live_pairs_per_sequence=live_pairs_per_sequence,
+                seed=val_pair_seed,
+                shuffle_pairs=False,
+            )
         model.eval()
         val_loss_sum = 0.0
         val_count = 0
-        val_samples = 0
+        val_samples = int(val_pair_table.n_pairs)
         val_phase_start = time.perf_counter()
         with torch.no_grad():
-            for conditioning_batch, state_input_batch, state_target_batch in val_loader:
-                conditioning_batch = conditioning_batch.to(
-                    device=device,
-                    non_blocking=use_non_blocking,
-                )
-                state_input_batch = state_input_batch.to(
-                    device=device,
-                    non_blocking=use_non_blocking,
-                )
-                state_target_batch = state_target_batch.to(
-                    device=device,
-                    non_blocking=use_non_blocking,
-                )
-
+            for conditioning_batch, state_input_batch, state_target_batch in _iter_live_pair_batches(
+                split=val_split,
+                pair_table=val_pair_table,
+                batch_size=batch_size,
+            ):
                 _check_finite_tensor(conditioning_batch, name="val conditioning batch")
                 _check_finite_tensor(state_input_batch, name="val state_input batch")
                 _check_finite_tensor(state_target_batch, name="val target batch")
@@ -1475,8 +1556,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                     raise RuntimeError("Validation loss became non-finite")
                 val_loss_sum += float(vloss.detach().item())
                 val_count += 1
-                val_samples += int(state_input_batch.shape[0])
         val_seconds = time.perf_counter() - val_phase_start
+        val_split = _release_preloaded_sequence_split(val_split)
 
         if train_count == 0 or val_count == 0:
             raise RuntimeError("No training or validation batches were produced")
@@ -1493,7 +1574,7 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 plateau_bad_epochs = 0
             else:
                 plateau_bad_epochs += 1
-            if epoch >= warmup_epochs and plateau_bad_epochs >= scheduler_patience:
+            if epoch >= warmup_epochs and plateau_bad_epochs >= plateau_reduce_threshold:
                 if _reduce_plateau_learning_rate(
                     optimizer,
                     factor=scheduler_factor,
@@ -1542,17 +1623,17 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         checkpoint = {
             "mode": "state_conditioned_prognostic_transition",
             "model_state": model.state_dict(),
-            "input_fields": input_field_names,
-            "target_fields": target_field_names,
+            "state_fields": state_field_names,
             "param_names": list(processed_meta["param_names"]),
             "conditioning_names": list(processed_meta["conditioning_names"]),
             "shape": {
-                "input_C": input_state_chans,
-                "target_C": target_state_chans,
+                "C": state_chans,
                 "H": nlat,
                 "W": nlon,
             },
             "geometry": dict(processed_meta["geometry"]),
+            "sequence_length": int(processed_meta["sequence_length"]),
+            "live_transition_catalog": dict(processed_meta["live_transition_catalog"]),
             "normalization": stats_to_json(stats),
             "solver": asdict(cfg.solver),
             "sampling": asdict(cfg.sampling),
@@ -1584,30 +1665,62 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
 
     best_checkpoint = torch.load(best_path, map_location=device)
     model.load_state_dict(best_checkpoint["model_state"], strict=True)
+    val_split = _load_sequence_split_to_device(
+        processed_dir=processed_dir,
+        shard_entries=processed_meta["splits"]["val"],
+        device=device,
+    )
+    if val_pair_table is None:
+        val_pair_table = _sample_live_pair_table(
+            split=val_split,
+            catalog=device_catalog,
+            live_pairs_per_sequence=live_pairs_per_sequence,
+            seed=val_pair_seed,
+            shuffle_pairs=False,
+        )
     val_pred, val_target = _collect_predictions(
         model=model,
-        loader=val_loader,
+        split=val_split,
+        pair_table=val_pair_table,
+        batch_size=batch_size,
         device=device,
         amp_mode=runtime_amp_mode,
     )
+    val_split = _release_preloaded_sequence_split(val_split)
+    test_split = _load_sequence_split_to_device(
+        processed_dir=processed_dir,
+        shard_entries=processed_meta["splits"]["test"],
+        device=device,
+    )
+    if test_pair_table is None:
+        test_pair_table = _sample_live_pair_table(
+            split=test_split,
+            catalog=device_catalog,
+            live_pairs_per_sequence=live_pairs_per_sequence,
+            seed=test_pair_seed,
+            shuffle_pairs=False,
+        )
     test_pred, test_target = _collect_predictions(
         model=model,
-        loader=test_loader,
+        split=test_split,
+        pair_table=test_pair_table,
+        batch_size=batch_size,
         device=device,
         amp_mode=runtime_amp_mode,
     )
+    test_split = _release_preloaded_sequence_split(test_split)
     val_metrics = _compute_one_step_metrics(
         pred_norm=val_pred,
         target_norm=val_target,
-        field_names=target_field_names,
-        state_stats=stats.target_state,
+        field_names=state_field_names,
+        state_stats=stats.state,
         grid=cfg.model.grid,
     )
     test_metrics = _compute_one_step_metrics(
         pred_norm=test_pred,
         target_norm=test_target,
-        field_names=target_field_names,
-        state_stats=stats.target_state,
+        field_names=state_field_names,
+        state_stats=stats.state,
         grid=cfg.model.grid,
     )
 

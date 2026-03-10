@@ -29,7 +29,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from config import TRANSITION_TIME_NAME
+from gcmulator.config import TRANSITION_TIME_NAME
 
 
 FIELD_MODE_NONE = 0
@@ -160,20 +160,18 @@ class SurrogateArtifactContract:
     forward_schema: str
     export_arg_count: int
     has_export_metadata: bool
-    input_shape: tuple[int, int, int]
-    output_shape: tuple[int, int, int]
+    state_shape: tuple[int, int, int]
     param_names: tuple[str, ...]
     conditioning_names: tuple[str, ...]
-    input_fields: tuple[str, ...]
-    output_fields: tuple[str, ...]
+    state_fields: tuple[str, ...]
     transition_days_conditioned: bool
     physical_io_forward: bool
     has_transition_time_stats: bool
     transition_time_name: Optional[str]
-    sampling_transition_days_min: Optional[float]
-    sampling_transition_days_max: Optional[float]
-    fixed_step_days: float
-    rollout_steps_for_model_days: int
+    sampling_saved_checkpoint_interval_days: Optional[float]
+    sampling_live_transition_days_min: Optional[float]
+    sampling_live_transition_days_max: Optional[float]
+    sampling_live_transition_tolerance_fraction: Optional[float]
     direct_jump_torch_runtime_ready: bool
     torch_runtime_blockers: tuple[str, ...]
     blockers: tuple[str, ...]
@@ -192,20 +190,20 @@ class SurrogateArtifactContract:
             "forward_schema": self.forward_schema,
             "export_arg_count": int(self.export_arg_count),
             "has_export_metadata": bool(self.has_export_metadata),
-            "input_shape": list(self.input_shape),
-            "output_shape": list(self.output_shape),
+            "state_shape": list(self.state_shape),
             "param_names": list(self.param_names),
             "conditioning_names": list(self.conditioning_names),
-            "input_fields": list(self.input_fields),
-            "output_fields": list(self.output_fields),
+            "state_fields": list(self.state_fields),
             "transition_days_conditioned": bool(self.transition_days_conditioned),
             "physical_io_forward": bool(self.physical_io_forward),
             "has_transition_time_stats": bool(self.has_transition_time_stats),
             "transition_time_name": self.transition_time_name,
-            "sampling_transition_days_min": self.sampling_transition_days_min,
-            "sampling_transition_days_max": self.sampling_transition_days_max,
-            "fixed_step_days": float(self.fixed_step_days),
-            "rollout_steps_for_model_days": int(self.rollout_steps_for_model_days),
+            "sampling_saved_checkpoint_interval_days": self.sampling_saved_checkpoint_interval_days,
+            "sampling_live_transition_days_min": self.sampling_live_transition_days_min,
+            "sampling_live_transition_days_max": self.sampling_live_transition_days_max,
+            "sampling_live_transition_tolerance_fraction": (
+                self.sampling_live_transition_tolerance_fraction
+            ),
             "direct_jump_torch_runtime_ready": bool(
                 self.direct_jump_torch_runtime_ready
             ),
@@ -267,12 +265,17 @@ def inspect_surrogate_artifact(
         str(value)
         for value in _require_meta_sequence(export_meta, key="conditioning_names")
     )
-    input_fields = tuple(
+    state_fields = tuple(
         str(value) for value in _require_meta_sequence(input_meta, key="fields")
     )
     output_fields = tuple(
         str(value) for value in _require_meta_sequence(output_meta, key="fields")
     )
+    if state_fields != output_fields:
+        raise ValueError(
+            "Export metadata input and output fields must be identical for the "
+            f"autoregressive contract: input={list(state_fields)}, output={list(output_fields)}"
+        )
     supported_devices = tuple(
         str(value).lower()
         for value in _require_meta_sequence(export_meta, key="supported_devices")
@@ -283,8 +286,7 @@ def inspect_surrogate_artifact(
         checkpoint_shape = dict(checkpoint["shape"])
         checkpoint_sampling = dict(checkpoint.get("sampling", {}))
         checkpoint_normalization = dict(checkpoint.get("normalization", {}))
-        checkpoint_input_fields = tuple(str(value) for value in checkpoint["input_fields"])
-        checkpoint_output_fields = tuple(str(value) for value in checkpoint["target_fields"])
+        checkpoint_state_fields = tuple(str(value) for value in checkpoint["state_fields"])
         checkpoint_param_names = tuple(str(value) for value in checkpoint["param_names"])
         checkpoint_conditioning_names = tuple(
             str(value) for value in checkpoint.get("conditioning_names", ())
@@ -299,10 +301,8 @@ def inspect_surrogate_artifact(
             raise ValueError(
                 "Export metadata normalization block does not match the checkpoint"
             )
-        if input_fields != checkpoint_input_fields:
-            raise ValueError("Export metadata input fields do not match the checkpoint")
-        if output_fields != checkpoint_output_fields:
-            raise ValueError("Export metadata output fields do not match the checkpoint")
+        if state_fields != checkpoint_state_fields:
+            raise ValueError("Export metadata state fields do not match the checkpoint")
         if param_names != checkpoint_param_names:
             raise ValueError("Export metadata param_names do not match the checkpoint")
         if conditioning_names != checkpoint_conditioning_names:
@@ -317,13 +317,15 @@ def inspect_surrogate_artifact(
         names = tuple(str(value) for value in transition_time.get("param_names", ()))
         transition_time_name = names[0] if names else None
 
-    sampling_transition_days_min = sampling.get("transition_jump_days_min")
-    sampling_transition_days_max = sampling.get("transition_jump_days_max")
+    sampling_saved_checkpoint_interval_days = sampling.get("saved_checkpoint_interval_days")
+    sampling_live_transition_days_min = sampling.get("live_transition_days_min")
+    sampling_live_transition_days_max = sampling.get("live_transition_days_max")
+    sampling_live_transition_tolerance_fraction = sampling.get(
+        "live_transition_tolerance_fraction"
+    )
 
     export_arg_count = len(export_model.forward.schema.arguments) - 1
     transition_days_conditioned = export_arg_count == 3
-    fixed_step_days = float(solver["dt_seconds"]) / 86400.0
-    rollout_steps = int(round(float(model_days) / fixed_step_days))
 
     expected_conditioning_names = param_names + (TRANSITION_TIME_NAME,)
     torch_runtime_blockers: List[str] = []
@@ -334,13 +336,9 @@ def inspect_surrogate_artifact(
     output_state_shape = tuple(output_meta.get("state1", ()))
     params_shape = tuple(input_meta.get("params", ()))
     transition_days_shape = tuple(input_meta.get("transition_days", ()))
-    normalization_input_fields = tuple(
+    normalization_state_fields = tuple(
         str(value)
-        for value in dict(normalization.get("input_state", {})).get("field_names", ())
-    )
-    normalization_target_fields = tuple(
-        str(value)
-        for value in dict(normalization.get("target_state", {})).get("field_names", ())
+        for value in dict(normalization.get("state", {})).get("field_names", ())
     )
     physical_io_forward = all(
         bool(physical_io.get(name, False))
@@ -394,7 +392,7 @@ def inspect_surrogate_artifact(
         )
     if input_state_shape != (
         "batch",
-        int(shape["input_C"]),
+        int(shape["C"]),
         int(shape["H"]),
         int(shape["W"]),
     ):
@@ -421,7 +419,7 @@ def inspect_surrogate_artifact(
         )
     if output_state_shape != (
         "batch",
-        int(shape["target_C"]),
+        int(shape["C"]),
         int(shape["H"]),
         int(shape["W"]),
     ):
@@ -432,18 +430,10 @@ def inspect_surrogate_artifact(
         recommendations.append(
             "Regenerate the export metadata from the same TorchScript artifact."
         )
-    if normalization_input_fields and input_fields != normalization_input_fields:
+    if normalization_state_fields and state_fields != normalization_state_fields:
         torch_runtime_blockers.append(
-            "The export metadata input field list does not match "
-            "`normalization.input_state.field_names`."
-        )
-        recommendations.append(
-            "Regenerate the export so the physical field ordering is self-consistent."
-        )
-    if normalization_target_fields and output_fields != normalization_target_fields:
-        torch_runtime_blockers.append(
-            "The export metadata output field list does not match "
-            "`normalization.target_state.field_names`."
+            "The export metadata state field list does not match "
+            "`normalization.state.field_names`."
         )
         recommendations.append(
             "Regenerate the export so the physical field ordering is self-consistent."
@@ -479,32 +469,30 @@ def inspect_surrogate_artifact(
 
     if not transition_days_conditioned:
         torch_runtime_blockers.append(
-            "The export forward signature is fixed-step: it does not accept `transition_days`, "
-            "so long horizons require recurrent rollout."
+            "The export forward signature does not accept `transition_days`, "
+            "so it does not satisfy the direct-jump runtime contract."
         )
         recommendations.append(
             "Train/export a direct-jump model with explicit `transition_days` conditioning."
         )
 
-    if (not transition_days_conditioned) and rollout_steps > 10_000:
+    if sampling_saved_checkpoint_interval_days is None:
         torch_runtime_blockers.append(
-            f"A {model_days:.1f}-day prediction would require about {rollout_steps:,} recurrent "
-            "surrogate steps with the current fixed-step artifact."
+            "The export sampling metadata does not record `saved_checkpoint_interval_days`, "
+            "so the checkpoint-sequence training cadence is unknown."
         )
         recommendations.append(
-            "Use log-spaced variable-jump training and export a long-horizon direct-jump artifact "
-            "before attempting long-horizon retrieval."
+            "Re-export the surrogate from a checkpoint produced by the sequence-based live-sampling "
+            "training pipeline."
         )
 
-    if sampling_transition_days_min is None or sampling_transition_days_max is None:
+    if sampling_live_transition_days_min is None or sampling_live_transition_days_max is None:
         torch_runtime_blockers.append(
-            "The export sampling metadata does not record a variable `transition_days` range, "
-            "so there is no evidence this artifact was trained for flexible jumps from initial "
-            "state toward equilibrium."
+            "The export sampling metadata does not record the live `transition_days` range, "
+            "so there is no evidence this artifact was trained for flexible direct-jump horizons."
         )
         recommendations.append(
-            "Train with explicit random forward-only jump sampling over a broad day range and "
-            "store that range in the export metadata."
+            "Train with live direct-jump sampling and store the live day range in the export metadata."
         )
 
     if transition_days_conditioned and "transition_days" not in input_meta:
@@ -527,24 +515,34 @@ def inspect_surrogate_artifact(
         forward_schema=str(export_model.forward.schema),
         export_arg_count=int(export_arg_count),
         has_export_metadata=bool(export_meta is not None),
-        input_shape=(int(shape["input_C"]), int(shape["H"]), int(shape["W"])),
-        output_shape=(int(shape["target_C"]), int(shape["H"]), int(shape["W"])),
+        state_shape=(int(shape["C"]), int(shape["H"]), int(shape["W"])),
         param_names=param_names,
         conditioning_names=conditioning_names,
-        input_fields=input_fields,
-        output_fields=output_fields,
+        state_fields=state_fields,
         transition_days_conditioned=bool(transition_days_conditioned),
         physical_io_forward=bool(physical_io_forward),
         has_transition_time_stats=bool(has_transition_time_stats),
         transition_time_name=transition_time_name,
-        sampling_transition_days_min=(
-            None if sampling_transition_days_min is None else float(sampling_transition_days_min)
+        sampling_saved_checkpoint_interval_days=(
+            None
+            if sampling_saved_checkpoint_interval_days is None
+            else float(sampling_saved_checkpoint_interval_days)
         ),
-        sampling_transition_days_max=(
-            None if sampling_transition_days_max is None else float(sampling_transition_days_max)
+        sampling_live_transition_days_min=(
+            None
+            if sampling_live_transition_days_min is None
+            else float(sampling_live_transition_days_min)
         ),
-        fixed_step_days=float(fixed_step_days),
-        rollout_steps_for_model_days=int(rollout_steps),
+        sampling_live_transition_days_max=(
+            None
+            if sampling_live_transition_days_max is None
+            else float(sampling_live_transition_days_max)
+        ),
+        sampling_live_transition_tolerance_fraction=(
+            None
+            if sampling_live_transition_tolerance_fraction is None
+            else float(sampling_live_transition_tolerance_fraction)
+        ),
         direct_jump_torch_runtime_ready=bool(direct_jump_torch_ready),
         torch_runtime_blockers=tuple(torch_runtime_blockers),
         blockers=tuple(torch_runtime_blockers),
@@ -611,7 +609,7 @@ class TorchSurrogateRuntime:
                 torch.backends.cudnn.benchmark = True
 
         shape = dict(self.export_meta["shape"])
-        self.input_shape = (int(shape["input_C"]), int(shape["H"]), int(shape["W"]))
+        self.input_shape = (int(shape["C"]), int(shape["H"]), int(shape["W"]))
         self.param_dim = int(len(self.export_meta["param_names"]))
 
         # Example tensors come from the export metadata rather than hard-coded
@@ -632,22 +630,22 @@ class TorchSurrogateRuntime:
     def _build_example_state(self) -> torch.Tensor:
         """Construct one valid physical-space state from normalization statistics."""
         normalization = dict(self.export_meta["normalization"])
-        input_state = dict(normalization["input_state"])
+        state = dict(normalization["state"])
         fields = list(self.export_meta["input"]["fields"])
         zero_norm = torch.zeros((1, *self.input_shape), dtype=torch.float32)
         return _denormalize_state_with_stats(
             zero_norm,
-            mean=torch.tensor(input_state["mean"], dtype=torch.float32),
-            std=torch.tensor(input_state["std"], dtype=torch.float32),
+            mean=torch.tensor(state["mean"], dtype=torch.float32),
+            std=torch.tensor(state["std"], dtype=torch.float32),
             mode_codes=torch.tensor(
                 _build_state_mode_codes(
                     fields=fields,
-                    field_transforms=dict(input_state.get("field_transforms", {})),
+                    field_transforms=dict(state.get("field_transforms", {})),
                 ),
                 dtype=torch.int64,
             ),
-            zscore_eps=float(input_state["zscore_eps"]),
-            signed_log1p_scale=float(input_state["signed_log1p_scale"]),
+            zscore_eps=float(state["zscore_eps"]),
+            signed_log1p_scale=float(state["signed_log1p_scale"]),
         )
 
     def example_inputs(
@@ -779,7 +777,10 @@ class TorchSurrogateRuntime:
                     self._move_batch(params_cpu[start:stop], is_state=False),
                     self._move_batch(transition_days_cpu[start:stop], is_state=False),
                 )
-                outputs.append(pred_batch.detach().cpu())
+                if return_numpy:
+                    outputs.append(pred_batch.detach().cpu())
+                else:
+                    outputs.append(pred_batch.detach())
 
         combined = torch.cat(outputs, dim=0)
         if return_numpy:

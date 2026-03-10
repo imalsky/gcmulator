@@ -6,14 +6,12 @@ import math
 import warnings
 from typing import Any, List, Sequence
 
-import numpy as np
 import torch
 import torch.nn as nn
 
-from config import TORCH_HARMONICS_REQUIRED_VERSION
+from .config import TORCH_HARMONICS_REQUIRED_VERSION
 
 
-TWO_PI = 2.0 * np.pi
 _TORCH_HARMONICS_VERSION_WARNED = False
 
 
@@ -232,40 +230,6 @@ class FiLMConditioner(nn.Module):
         return gamma, beta
 
 
-def build_coord_channels_legendre_gauss(
-    nlat: int,
-    nlon: int,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-    lat_order: str = "north_to_south",
-    lon_origin: str = "0_to_2pi",
-) -> torch.Tensor:
-    """Build fixed sin/cos latitude-longitude channels on a Legendre-Gauss grid."""
-    mu, _ = np.polynomial.legendre.leggauss(int(nlat))
-    if lat_order == "north_to_south":
-        mu = mu[::-1].copy()
-    elif lat_order != "south_to_north":
-        raise ValueError(f"Unsupported lat_order: {lat_order}")
-
-    lat = np.arcsin(mu).astype(np.float32)
-    if lon_origin == "0_to_2pi":
-        lon = np.arange(int(nlon), dtype=np.float32) * (TWO_PI / float(nlon))
-    elif lon_origin == "minus_pi_to_pi":
-        lon = np.linspace(-np.pi, np.pi, num=int(nlon), endpoint=False, dtype=np.float32)
-    else:
-        raise ValueError(f"Unsupported lon_origin: {lon_origin}")
-
-    lat2d = lat[:, None]
-    lon2d = lon[None, :]
-    sin_lat = np.broadcast_to(np.sin(lat2d), (int(nlat), int(nlon)))
-    cos_lat = np.broadcast_to(np.cos(lat2d), (int(nlat), int(nlon)))
-    sin_lon = np.broadcast_to(np.sin(lon2d), (int(nlat), int(nlon)))
-    cos_lon = np.broadcast_to(np.cos(lon2d), (int(nlat), int(nlon)))
-    stacked = np.stack([sin_lat, cos_lat, sin_lon, cos_lon], axis=0).astype(np.float32)
-    return torch.from_numpy(stacked).to(device=device, dtype=dtype)
-
-
 class StateConditionedTransitionModel(nn.Module):
     """Direct-jump transition model with FiLM-conditioned SFNO latent states."""
 
@@ -279,11 +243,8 @@ class StateConditionedTransitionModel(nn.Module):
         residual_input_indices: Sequence[int],
         nlat: int,
         nlon: int,
-        include_coord_channels: bool,
         residual_prediction: bool,
         residual_init_scale: float,
-        lat_order: str = "north_to_south",
-        lon_origin: str = "0_to_2pi",
     ) -> None:
         """Wrap the base SFNO with state/conditioning adapters and residual heads."""
         super().__init__()
@@ -293,7 +254,6 @@ class StateConditionedTransitionModel(nn.Module):
         self.target_state_chans = int(target_state_chans)
         self.nlat = int(nlat)
         self.nlon = int(nlon)
-        self.include_coord_channels = bool(include_coord_channels)
         self.residual_prediction = bool(residual_prediction)
         self.conditioner = FiLMConditioner(
             param_dim=self.param_dim,
@@ -306,21 +266,6 @@ class StateConditionedTransitionModel(nn.Module):
             persistent=False,
         )
 
-        # Coordinate channels are deterministic and reused across forward passes,
-        # so they live as a non-persistent buffer instead of being rebuilt.
-        if self.include_coord_channels:
-            channels = build_coord_channels_legendre_gauss(
-                nlat=nlat,
-                nlon=nlon,
-                dtype=torch.float32,
-                device=torch.device("cpu"),
-                lat_order=str(lat_order),
-                lon_origin=str(lon_origin),
-            )
-        else:
-            channels = torch.zeros((0, nlat, nlon), dtype=torch.float32)
-        self.register_buffer("coord_channels", channels, persistent=False)
-
         scale_init = torch.tensor(float(residual_init_scale), dtype=torch.float32)
         if self.residual_prediction:
             self.residual_scale = nn.Parameter(scale_init)
@@ -332,16 +277,20 @@ class StateConditionedTransitionModel(nn.Module):
         """Apply FiLM modulation to a latent feature map."""
         return x * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
 
-    def _build_features(self, state0: torch.Tensor) -> torch.Tensor:
-        """Concatenate static coordinate channels onto the visible input state."""
-        pieces = [state0]
-        coord = self.coord_channels.to(device=state0.device, dtype=state0.dtype)
-        if coord.numel():
-            pieces.append(coord.unsqueeze(0).expand(state0.shape[0], -1, -1, -1))
-        return torch.cat(pieces, dim=1)
-
     def forward(self, state0: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        """Predict the next prognostic state from the current visible state."""
+        """Predict the next prognostic state autoregressively.
+
+        Args:
+            state0:
+                Normalized prognostic state ``[B, C, H, W]`` where ``C`` is
+                the number of prognostic fields (Phi, eta, delta).
+            params:
+                Normalized conditioning ``[B, P]`` (physical parameters +
+                ``log10_transition_days``).
+
+        Returns:
+            Normalized prognostic state ``[B, C, H, W]``.
+        """
         if state0.ndim != 4:
             raise ValueError(f"state0 must be [B,C,H,W], got {tuple(state0.shape)}")
         if state0.shape[1] != self.input_state_chans:
@@ -351,8 +300,8 @@ class StateConditionedTransitionModel(nn.Module):
         if params.ndim != 2 or params.shape[0] != state0.shape[0]:
             raise ValueError("params must be [B,P] and batch-aligned with state0")
 
-        gamma, beta = self.conditioner(params)
-        x = self.base.encoder(self._build_features(state0))
+        gamma, beta = self.conditioner(params)  # shape: [B, num_sites, embed_dim]
+        x = self.base.encoder(state0)
         x = self._apply_film(x, gamma[:, 0], beta[:, 0])
         x = self.base.pos_embed(x)
         x = self.base.pos_drop(x)
@@ -379,13 +328,29 @@ def build_state_conditioned_transition_model(
     param_dim: int,
     residual_input_indices: Sequence[int],
     cfg_model,
-    lat_order: str = "north_to_south",
-    lon_origin: str = "0_to_2pi",
 ) -> StateConditionedTransitionModel:
-    """Construct the configurable FiLM-conditioned SFNO transition model."""
+    """Construct the configurable FiLM-conditioned SFNO transition model.
+
+    The autoregressive architecture uses the same ``C`` prognostic channels
+    (Phi, eta, delta) for both input and output.
+
+    Args:
+        img_size:
+            Spatial grid size ``(H, W)``.
+        input_state_chans:
+            Input channel count (``3`` for the autoregressive contract).
+        target_state_chans:
+            Output channel count (``3`` for the autoregressive contract).
+        param_dim:
+            Conditioning width ``P`` (physical parameters +
+            ``log10_transition_days``).
+
+    Returns:
+        A module implementing ``model(state0, conditioning) ->
+        [B, C, H, W]``.
+    """
     height, width = int(img_size[0]), int(img_size[1])
-    coord_chans = 4 if bool(cfg_model.include_coord_channels) else 0
-    in_chans = int(input_state_chans) + coord_chans
+    in_chans = int(input_state_chans)
 
     SphericalFNO = import_sfno()
     base = SphericalFNO(
@@ -425,9 +390,6 @@ def build_state_conditioned_transition_model(
         residual_input_indices=residual_input_indices,
         nlat=height,
         nlon=width,
-        include_coord_channels=bool(cfg_model.include_coord_channels),
         residual_prediction=bool(cfg_model.residual_prediction),
         residual_init_scale=float(cfg_model.residual_init_scale),
-        lat_order=str(lat_order),
-        lon_origin=str(lon_origin),
     )

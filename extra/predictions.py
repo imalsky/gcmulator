@@ -1,4 +1,4 @@
-"""Visualize one held-out multi-jump prognostic prediction from the test split."""
+"""Visualize one held-out direct-jump prognostic prediction from the test split."""
 
 from __future__ import annotations
 
@@ -31,26 +31,26 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from modeling import build_state_conditioned_transition_model, ensure_torch_harmonics_importable
-from config import resolve_path
-from my_swamp_backend import (
-    diagnose_winds,
-    ensure_my_swamp_importable,
-    params_to_conditioning_vector,
-    reconstruct_full_state_from_prognostics,
-    run_trajectory_window,
+from gcmulator.config import resolve_path
+from gcmulator.modeling import (
+    build_state_conditioned_transition_model,
+    ensure_torch_harmonics_importable,
 )
-from normalization import (
+from gcmulator.my_swamp_backend import (
+    diagnose_winds,
+    params_to_conditioning_vector,
+)
+from gcmulator.normalization import (
     denormalize_state_tensor,
     normalize_conditioning,
     normalize_state_tensor,
     stats_from_json,
 )
-from sampling import to_extended9
+from gcmulator.sampling import to_extended9
 
 
 FIGURE_DPI = 180
-DEFAULT_FIGURE_NAME = "test_rollout_true_vs_pred.png"
+DEFAULT_FIGURE_NAME = "test_direct_jump_true_vs_pred.png"
 STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
 PHI_CHANNEL_INDEX = 0
 FIELD_NAME = "Phi"
@@ -66,7 +66,6 @@ PROCESSED_DIR: Path | None = None
 TEST_SHARD_INDEX = 0
 INPUT_TIME_DAYS = 0.0
 TARGET_TIME_DAYS = 10.0
-NUM_JUMPS = 1
 DEVICE_MODE = "auto"
 FIGURE_PATH: Path | None = None
 
@@ -202,12 +201,12 @@ def _save_figure(
     true_winds: tuple[np.ndarray, np.ndarray],
     pred_winds: tuple[np.ndarray, np.ndarray],
     shard_name: str,
-    context_label: str,
     input_day: float,
     target_day: float,
+    transition_days: float,
     out_path: Path,
 ) -> None:
-    """Save a 1x2 Phi comparison figure."""
+    """Save a 1x2 Phi comparison figure for one direct-jump prediction."""
     fig, axes = plt.subplots(
         1,
         2,
@@ -248,8 +247,8 @@ def _save_figure(
 
     rmse = float(np.sqrt(np.mean((pred_field - true_field) ** 2)))
     fig.suptitle(
-        f"{shard_name} | {context_label} | input_day={input_day:.6f} | "
-        f"target_day={target_day:.6f} | {FIELD_NAME} RMSE={rmse:.3e}"
+        f"{shard_name} | input_day={input_day:.6f} | target_day={target_day:.6f} | "
+        f"transition_days={transition_days:.6f} | {FIELD_NAME} RMSE={rmse:.3e}"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -268,66 +267,71 @@ def _load_test_split_entries(processed_dir: Path) -> list[dict[str, Any]]:
     return split_entries
 
 
-def _resolve_time_steps(
+def _resolve_checkpoint_indices(
     *,
     input_time_days: float,
     target_time_days: float,
-    dt_seconds: float,
-    max_time_days: float,
+    checkpoint_days: np.ndarray,
 ) -> tuple[int, int, float, float]:
-    """Convert requested day-valued times to validated solver steps."""
+    """Map requested day-valued times onto saved checkpoint indices."""
+    checkpoint_days = np.asarray(checkpoint_days, dtype=np.float64)
     if input_time_days < 0.0:
         raise ValueError("INPUT_TIME_DAYS must be >= 0")
     if target_time_days <= input_time_days:
         raise ValueError("TARGET_TIME_DAYS must be > INPUT_TIME_DAYS")
-    if target_time_days > max_time_days:
+    if target_time_days > float(checkpoint_days[-1]):
         raise ValueError(
-            "TARGET_TIME_DAYS exceeds the simulated horizon from the checkpoint: "
-            f"{target_time_days} > {max_time_days}"
+            "TARGET_TIME_DAYS exceeds the saved checkpoint horizon: "
+            f"{target_time_days} > {float(checkpoint_days[-1])}"
         )
 
-    input_step = int(round(float(input_time_days) * 86400.0 / float(dt_seconds)))
-    target_step = int(round(float(target_time_days) * 86400.0 / float(dt_seconds)))
-    if target_step <= input_step:
-        raise ValueError("Resolved target step must be greater than the input step")
-
-    actual_input_day = float(input_step) * float(dt_seconds) / 86400.0
-    actual_target_day = float(target_step) * float(dt_seconds) / 86400.0
-    return input_step, target_step, actual_input_day, actual_target_day
-
-
-def _build_jump_schedule(*, input_step: int, target_step: int, num_jumps: int) -> np.ndarray:
-    """Split one solver-step interval into ``num_jumps`` positive integer jumps."""
-    if num_jumps < 1:
-        raise ValueError("NUM_JUMPS must be >= 1")
-    total_steps = int(target_step) - int(input_step)
-    if total_steps < 1:
-        raise ValueError("target_step must be greater than input_step")
-    if int(num_jumps) > total_steps:
+    interval_days = float(np.min(np.diff(checkpoint_days))) if checkpoint_days.size > 1 else 0.0
+    tolerance_days = max(1.0e-12, 0.5 * interval_days)
+    input_index = int(np.argmin(np.abs(checkpoint_days - float(input_time_days))))
+    target_index = int(np.argmin(np.abs(checkpoint_days - float(target_time_days))))
+    actual_input_day = float(checkpoint_days[input_index])
+    actual_target_day = float(checkpoint_days[target_index])
+    if abs(actual_input_day - float(input_time_days)) > tolerance_days:
         raise ValueError(
-            "NUM_JUMPS cannot exceed the number of solver steps between input and target"
+            "INPUT_TIME_DAYS must align with a saved checkpoint within half the checkpoint cadence: "
+            f"requested={float(input_time_days):.6f}, realized={actual_input_day:.6f}"
         )
+    if abs(actual_target_day - float(target_time_days)) > tolerance_days:
+        raise ValueError(
+            "TARGET_TIME_DAYS must align with a saved checkpoint within half the checkpoint cadence: "
+            f"requested={float(target_time_days):.6f}, realized={actual_target_day:.6f}"
+        )
+    if target_index <= input_index:
+        raise ValueError("Resolved target checkpoint must be later than the input checkpoint")
+    return input_index, target_index, actual_input_day, actual_target_day
 
-    base = total_steps // int(num_jumps)
-    remainder = total_steps % int(num_jumps)
-    jump_steps = np.full((int(num_jumps),), base, dtype=np.int64)
-    jump_steps[:remainder] += 1
-    if np.any(jump_steps < 1):
-        raise RuntimeError("Jump schedule construction produced a non-positive jump")
-    return jump_steps
 
-
-def _load_test_rollout_case(
+def _load_test_direct_jump_case(
     *,
     processed_dir: Path,
-    ckpt: Dict[str, Any],
     stats: Any,
     test_shard_index: int,
     input_time_days: float,
     target_time_days: float,
-    num_jumps: int,
-) -> tuple[Any, np.ndarray, np.ndarray, str, float, float, np.ndarray]:
-    """Load one held-out test simulation and construct one rollout case."""
+) -> tuple[Any, np.ndarray, np.ndarray, str, float, float, float]:
+    """Load one held-out direct-jump case.
+
+    Returns:
+        params:
+            Physical conditioning parameters as ``Extended9Params``.
+        initial_state_phys:
+            Physical prognostic state with shape ``[3, H, W]``.
+        true_target_phys:
+            Physical prognostic target with shape ``[3, H, W]``.
+        shard_name:
+            Test-shard filename from ``processed_meta.json``.
+        actual_input_day:
+            Physical day represented by the resolved input step.
+        actual_target_day:
+            Physical day represented by the resolved target step.
+        transition_days:
+            Direct-jump horizon in physical days.
+    """
     test_entries = _load_test_split_entries(processed_dir)
     if test_shard_index < 0 or test_shard_index >= len(test_entries):
         raise IndexError(
@@ -341,89 +345,80 @@ def _load_test_rollout_case(
         raise FileNotFoundError(f"Processed shard not found: {shard_path}")
 
     with np.load(shard_path, allow_pickle=False) as npz:
+        states_norm = np.asarray(npz["states_norm"], dtype=np.float32)
         params_norm = np.asarray(npz["params_norm"], dtype=np.float32)
+        checkpoint_days = np.asarray(npz["checkpoint_days"], dtype=np.float64)
 
     params = to_extended9(_denormalize_params(params_norm, stats.params))
-    solver_cfg = dict(ckpt["solver"])
-    input_step, target_step, actual_input_day, actual_target_day = _resolve_time_steps(
+    input_index, target_index, actual_input_day, actual_target_day = _resolve_checkpoint_indices(
         input_time_days=float(input_time_days),
         target_time_days=float(target_time_days),
-        dt_seconds=float(solver_cfg["dt_seconds"]),
-        max_time_days=float(solver_cfg["default_time_days"]),
+        checkpoint_days=checkpoint_days,
     )
-    jump_schedule = _build_jump_schedule(
-        input_step=input_step,
-        target_step=target_step,
-        num_jumps=int(num_jumps),
-    )
-
-    state_inputs_phys, state_targets_phys = run_trajectory_window(
-        params,
-        M=int(solver_cfg["M"]),
-        dt_seconds=float(solver_cfg["dt_seconds"]),
-        time_days=float(solver_cfg["default_time_days"]),
-        starttime_index=int(solver_cfg["starttime_index"]),
-        anchor_steps=np.asarray([input_step], dtype=np.int64),
-        target_steps=np.asarray([target_step], dtype=np.int64),
-    )
+    transition_days = float(actual_target_day - actual_input_day)
+    initial_state_phys = denormalize_state_tensor(
+        states_norm[input_index][None, ...],
+        stats.state,
+    )[0]
+    true_target_phys = denormalize_state_tensor(
+        states_norm[target_index][None, ...],
+        stats.state,
+    )[0]
     return (
         params,
-        np.asarray(state_inputs_phys[0], dtype=np.float32),
-        np.asarray(state_targets_phys[0], dtype=np.float32),
+        np.asarray(initial_state_phys, dtype=np.float32),
+        np.asarray(true_target_phys, dtype=np.float32),
         shard_name,
         actual_input_day,
         actual_target_day,
-        jump_schedule,
+        transition_days,
     )
 
 
-def _predict_multi_jump(
+def _predict_direct_jump(
     *,
     model: torch.nn.Module,
     stats: Any,
     params: Any,
     initial_state_phys: np.ndarray,
-    jump_schedule: Sequence[int],
-    solver_cfg: Dict[str, Any],
+    transition_days: float,
     device: torch.device,
 ) -> np.ndarray:
-    """Run one recursive multi-jump rollout and return the final prognostic target."""
-    current_state_phys = np.asarray(initial_state_phys, dtype=np.float32)
+    """Run one direct-jump model call and return a physical prognostic target.
+
+    Args:
+        initial_state_phys:
+            Physical prognostic state with shape ``[3, H, W]``.
+        transition_days:
+            Requested direct-jump horizon in physical days.
+
+    Returns:
+        Physical prognostic prediction with shape ``[3, H, W]``.
+    """
     params_vector = params_to_conditioning_vector(params)
+    input_state_norm = normalize_state_tensor(
+        initial_state_phys[None, ...],
+        stats.state,
+    ).astype(np.float32)
+    conditioning_norm = normalize_conditioning(
+        params_vector,
+        np.asarray([transition_days], dtype=np.float64),
+        param_stats=stats.params,
+        transition_time_stats=stats.transition_time,
+    ).astype(np.float32)
 
-    for jump_index, jump_steps in enumerate(jump_schedule):
-        jump_days = float(jump_steps) * float(solver_cfg["dt_seconds"]) / 86400.0
-        current_state_norm = normalize_state_tensor(
-            current_state_phys[None, ...],
-            stats.input_state,
-        ).astype(np.float32)
-        conditioning_norm = normalize_conditioning(
-            params_vector,
-            np.asarray([jump_days], dtype=np.float64),
-            param_stats=stats.params,
-            transition_time_stats=stats.transition_time,
-        ).astype(np.float32)
-
-        with torch.inference_mode():
-            pred_norm = model(
-                torch.from_numpy(current_state_norm).to(device=device),
-                torch.from_numpy(conditioning_norm).to(device=device),
-            )
-        pred_phys = denormalize_state_tensor(
+    with torch.inference_mode():
+        pred_norm = model(
+            torch.from_numpy(input_state_norm).to(device=device),
+            torch.from_numpy(conditioning_norm).to(device=device),
+        )
+    return np.asarray(
+        denormalize_state_tensor(
             pred_norm.detach().cpu().numpy(),
-            stats.target_state,
-        )[0]
-        if jump_index == (len(jump_schedule) - 1):
-            return np.asarray(pred_phys, dtype=np.float32)
-
-        current_state_phys = reconstruct_full_state_from_prognostics(
-            np.asarray(pred_phys, dtype=np.float64),
-            params=params,
-            M=int(solver_cfg["M"]),
-            dt_seconds=float(solver_cfg["dt_seconds"]),
-        ).astype(np.float32)
-
-    raise RuntimeError("Multi-jump rollout did not produce a final prediction")
+            stats.state,
+        )[0],
+        dtype=np.float32,
+    )
 
 
 def _diagnose_target_winds(
@@ -445,7 +440,7 @@ def _diagnose_target_winds(
 
 
 def main() -> None:
-    """Load one held-out test case, run a recursive rollout, and save a prognostic plot."""
+    """Load one held-out direct-jump case, run the model, and save a plot."""
     _apply_plot_style()
     ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
@@ -457,7 +452,6 @@ def main() -> None:
 
     device = _resolve_device(DEVICE_MODE)
     ensure_torch_harmonics_importable()
-    ensure_my_swamp_importable()
     ckpt: Dict[str, Any] = torch.load(ckpt_path, map_location=device)
     stats = stats_from_json(ckpt["normalization"])
     processed_dir = _resolve_processed_dir(ckpt)
@@ -468,72 +462,66 @@ def main() -> None:
         shard_name,
         actual_input_day,
         actual_target_day,
-        jump_schedule,
-    ) = _load_test_rollout_case(
+        transition_days,
+    ) = _load_test_direct_jump_case(
         processed_dir=processed_dir,
-        ckpt=ckpt,
         stats=stats,
         test_shard_index=int(TEST_SHARD_INDEX),
         input_time_days=float(INPUT_TIME_DAYS),
         target_time_days=float(TARGET_TIME_DAYS),
-        num_jumps=int(NUM_JUMPS),
     )
 
     model_cfg = _dict_to_namespace(ckpt["model_config"])
     shape = dict(ckpt["shape"])
-    input_fields = list(ckpt["input_fields"])
-    target_fields = list(ckpt["target_fields"])
-    residual_input_indices = [input_fields.index(field_name) for field_name in target_fields]
+    geometry = dict(ckpt.get("geometry", {}))
+    state_fields = list(ckpt["state_fields"])
+    residual_input_indices = list(range(len(state_fields)))
     model = build_state_conditioned_transition_model(
         img_size=(int(shape["H"]), int(shape["W"])),
-        input_state_chans=int(shape["input_C"]),
-        target_state_chans=int(shape["target_C"]),
+        input_state_chans=int(shape["C"]),
+        target_state_chans=int(shape["C"]),
         param_dim=int(len(ckpt["conditioning_names"])),
         residual_input_indices=residual_input_indices,
         cfg_model=model_cfg,
-        lat_order="north_to_south",
-        lon_origin="0_to_2pi",
+        lat_order=str(geometry.get("lat_order", "north_to_south")),
+        lon_origin=str(geometry.get("lon_origin", "0_to_2pi")),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device=device).eval()
 
-    pred_target_phys = _predict_multi_jump(
+    pred_target_phys = _predict_direct_jump(
         model=model,
         stats=stats,
         params=params,
         initial_state_phys=initial_state_phys,
-        jump_schedule=jump_schedule,
-        solver_cfg=dict(ckpt["solver"]),
+        transition_days=transition_days,
         device=device,
     )
+    solver_cfg = dict(ckpt["solver"])
     true_winds = _diagnose_target_winds(
         true_target_phys,
-        target_field_names=stats.target_state.field_names,
+        target_field_names=stats.state.field_names,
         params=params,
-        solver_cfg=dict(ckpt["solver"]),
+        solver_cfg=solver_cfg,
     )
     pred_winds = _diagnose_target_winds(
         pred_target_phys,
-        target_field_names=stats.target_state.field_names,
+        target_field_names=stats.state.field_names,
         params=params,
-        solver_cfg=dict(ckpt["solver"]),
+        solver_cfg=solver_cfg,
     )
-
-    mean_jump_days = float(np.mean(np.asarray(jump_schedule, dtype=np.float64))) * float(
-        ckpt["solver"]["dt_seconds"]
-    ) / 86400.0
     _save_figure(
         true_state=true_target_phys,
         pred_state=pred_target_phys,
         true_winds=true_winds,
         pred_winds=pred_winds,
         shard_name=shard_name,
-        context_label=f"test_shard={TEST_SHARD_INDEX} | jumps={len(jump_schedule)} | mean_jump_days={mean_jump_days:.6f}",
         input_day=actual_input_day,
         target_day=actual_target_day,
+        transition_days=transition_days,
         out_path=figure_path,
     )
-    print(f"Saved prognostic prediction figure: {figure_path}")
+    print(f"Saved direct-jump prediction figure: {figure_path}")
 
 
 if __name__ == "__main__":

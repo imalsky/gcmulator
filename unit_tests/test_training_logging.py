@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from training import _format_scientific, _write_training_history_csv
+from gcmulator.training import _format_scientific, _write_training_history_csv
 
 
 def test_format_scientific_uses_fixed_scientific_notation() -> None:

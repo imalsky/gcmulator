@@ -5,10 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from training import (
+from gcmulator.training import (
     _early_stopping_patience,
     _linear_warmup_lr,
     _loss_improved,
+    _plateau_reduce_threshold,
     _reduce_plateau_learning_rate,
     _update_loss_tracking,
 )
@@ -54,6 +55,40 @@ def test_plateau_lr_counts_warmup_bad_epochs() -> None:
                 bad_epochs = 0
 
     assert optimizer.param_groups[0]["lr"] == pytest.approx(5.0e-4)
+
+
+def test_plateau_patience_zero_waits_for_first_bad_epoch() -> None:
+    """Patience zero should reduce after the first bad epoch, not on improvements."""
+    param = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.AdamW([param], lr=1.0e-3)
+    threshold = _plateau_reduce_threshold(scheduler_patience=0)
+    best = float("inf")
+    bad_epochs = 0
+    learning_rates: list[float] = []
+
+    for val_loss in (1.0, 0.5, 0.6):
+        best, _, improved = _update_loss_tracking(
+            current=val_loss,
+            best=best,
+            bad_epochs=0,
+            min_delta=1.0e-10,
+        )
+        if improved:
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+        if bad_epochs >= threshold:
+            if _reduce_plateau_learning_rate(
+                optimizer,
+                factor=0.5,
+                min_lr=1.0e-5,
+                eps=1.0e-10,
+            ):
+                bad_epochs = 0
+        learning_rates.append(float(optimizer.param_groups[0]["lr"]))
+
+    assert learning_rates[1] == pytest.approx(1.0e-3)
+    assert learning_rates[2] == pytest.approx(5.0e-4)
 
 
 def test_early_stopping_patience_allows_multiple_lr_reductions() -> None:

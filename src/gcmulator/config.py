@@ -25,8 +25,7 @@ DEFAULT_SCHEDULER_EPS = 1.0e-10
 
 TransformName = Literal["none", "log10", "signed_log1p"]
 
-PHYSICAL_STATE_FIELDS = ("Phi", "U", "V", "eta", "delta")
-PROGNOSTIC_TARGET_FIELDS = ("Phi", "eta", "delta")
+PHYSICAL_STATE_FIELDS = ("Phi", "eta", "delta")
 CONDITIONING_PARAM_NAMES = (
     "a_m",
     "omega_rad_s",
@@ -141,17 +140,15 @@ class ParameterSpec:
 
 @dataclass(frozen=True)
 class SamplingConfig:
-    """Sampling strategy for raw simulation generation.
+    """Sampling strategy for raw simulation generation and live jump sampling.
 
     ``generation_workers`` is a trajectory batch size for vectorized JAX
     generation, not an OS worker pool.  ``0`` selects the backend-aware auto
     policy used by the generation entrypoint.
 
-    Transition pairs are sampled with log-uniform time jumps between
-    ``transition_jump_days_min`` and ``transition_jump_days_max``.  Each
-    transition within a single simulation may use a different jump duration,
-    enabling the model to learn dynamics at all timescales — from fast
-    transients to slow relaxation toward equilibrium.
+    Raw generation stores one uniformly spaced checkpoint sequence per
+    simulation. Training then samples variable-``dt`` direct-jump pairs live
+    from those saved checkpoints on GPU.
 
     Setting ``burn_in_days`` to 0 allows anchor times at the very start of
     the simulation (right after the numerical warm-up controlled by
@@ -163,22 +160,24 @@ class SamplingConfig:
     n_sims: int = 500
     generation_workers: int = 0
     burn_in_days: float = 0.0
-    transitions_per_simulation: int = 128
-    transition_jump_days_min: float = 0.1
-    transition_jump_days_max: float = 100.0
+    saved_checkpoint_interval_days: float = 1.0
+    live_pairs_per_sequence: int = 10
+    live_transition_days_min: float = 0.1
+    live_transition_days_max: float = 100.0
+    live_transition_tolerance_fraction: float = 0.1
     parameters: List[ParameterSpec] = field(default_factory=list)
 
-    def min_transition_jump_days(self) -> float:
-        """Return the minimum sampled transition jump in physical days."""
-        return float(self.transition_jump_days_min)
+    def min_live_transition_days(self) -> float:
+        """Return the minimum live-sampled transition duration in physical days."""
+        return float(self.live_transition_days_min)
 
-    def max_transition_jump_days(self) -> float:
-        """Return the maximum sampled transition jump in physical days."""
-        return float(self.transition_jump_days_max)
+    def max_live_transition_days(self) -> float:
+        """Return the maximum live-sampled transition duration in physical days."""
+        return float(self.live_transition_days_max)
 
-    def uses_variable_transition_jump(self) -> bool:
-        """Return True when jump duration is sampled from a non-degenerate range."""
-        return self.max_transition_jump_days() > self.min_transition_jump_days()
+    def uses_variable_live_transition(self) -> bool:
+        """Return True when live transition duration is sampled from a non-degenerate range."""
+        return self.max_live_transition_days() > self.min_live_transition_days()
 
 
 @dataclass(frozen=True)
@@ -218,7 +217,6 @@ class ModelConfig:
     residual_init_scale: float = 1.0e-2
     pos_embed: str = "spectral"
     bias: bool = False
-    include_coord_channels: bool = True
 
 
 @dataclass(frozen=True)
@@ -245,12 +243,11 @@ class TrainingConfig:
     epochs: int = 50
     batch_size: int = 8
     num_workers: int = 0
-    prefetch_factor: int = 4
     shuffle: bool = True
-    pin_memory: bool = False
     preload_to_gpu: bool = True
     learning_rate: float = 3e-4
     weight_decay: float = 0.0
+    grad_clip_norm: float = 1.0
     val_fraction: float = 0.1
     test_fraction: float = 0.1
     split_seed: int = 0
@@ -287,9 +284,11 @@ SAMPLING_KEYS = {
     "n_sims",
     "generation_workers",
     "burn_in_days",
-    "transitions_per_simulation",
-    "transition_jump_days_min",
-    "transition_jump_days_max",
+    "saved_checkpoint_interval_days",
+    "live_pairs_per_sequence",
+    "live_transition_days_min",
+    "live_transition_days_max",
+    "live_transition_tolerance_fraction",
     "parameters",
 }
 PARAM_SPEC_KEYS = {"name", "dist", "min", "max", "value", "p_off", "off_value", "on_min", "on_max"}
@@ -314,7 +313,6 @@ MODEL_KEYS = {
     "residual_init_scale",
     "pos_embed",
     "bias",
-    "include_coord_channels",
 }
 TRAINING_KEYS = {
     "seed",
@@ -325,12 +323,11 @@ TRAINING_KEYS = {
     "epochs",
     "batch_size",
     "num_workers",
-    "prefetch_factor",
     "shuffle",
-    "pin_memory",
     "preload_to_gpu",
     "learning_rate",
     "weight_decay",
+    "grad_clip_norm",
     "val_fraction",
     "test_fraction",
     "split_seed",
@@ -436,9 +433,13 @@ def _parse_sampling(d: Dict[str, Any]) -> SamplingConfig:
         n_sims=int(d.get("n_sims", 500)),
         generation_workers=int(d.get("generation_workers", 0)),
         burn_in_days=float(d.get("burn_in_days", 0.0)),
-        transitions_per_simulation=int(d.get("transitions_per_simulation", 128)),
-        transition_jump_days_min=float(d.get("transition_jump_days_min", 0.1)),
-        transition_jump_days_max=float(d.get("transition_jump_days_max", 100.0)),
+        saved_checkpoint_interval_days=float(d.get("saved_checkpoint_interval_days", 1.0)),
+        live_pairs_per_sequence=int(d.get("live_pairs_per_sequence", 10)),
+        live_transition_days_min=float(d.get("live_transition_days_min", 0.1)),
+        live_transition_days_max=float(d.get("live_transition_days_max", 100.0)),
+        live_transition_tolerance_fraction=float(
+            d.get("live_transition_tolerance_fraction", 0.1)
+        ),
         parameters=[_parse_parameter_spec(item) for item in params_raw],
     )
 
@@ -497,10 +498,6 @@ def _parse_model(d: Dict[str, Any]) -> ModelConfig:
         residual_init_scale=float(d.get("residual_init_scale", 1.0e-2)),
         pos_embed=str(d.get("pos_embed", "spectral")),
         bias=_parse_bool(d.get("bias", False), field_name="model.bias"),
-        include_coord_channels=_parse_bool(
-            d.get("include_coord_channels", True),
-            field_name="model.include_coord_channels",
-        ),
     )
 
 
@@ -557,15 +554,14 @@ def _parse_training(
         epochs=int(d.get("epochs", 50)),
         batch_size=int(d.get("batch_size", 8)),
         num_workers=int(d.get("num_workers", 0)),
-        prefetch_factor=int(d.get("prefetch_factor", 4)),
         shuffle=_parse_bool(d.get("shuffle", True), field_name="training.shuffle"),
-        pin_memory=_parse_bool(d.get("pin_memory", False), field_name="training.pin_memory"),
         preload_to_gpu=_parse_bool(
             d.get("preload_to_gpu", True),
             field_name="training.preload_to_gpu",
         ),
         learning_rate=learning_rate,
         weight_decay=float(d.get("weight_decay", 0.0)),
+        grad_clip_norm=float(d.get("grad_clip_norm", 1.0)),
         val_fraction=float(d.get("val_fraction", 0.1)),
         test_fraction=float(d.get("test_fraction", 0.1)),
         split_seed=int(d.get("split_seed", 0)),
@@ -623,27 +619,35 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("sampling.generation_workers must be >= 0")
     if cfg.sampling.burn_in_days < 0:
         raise ValueError("sampling.burn_in_days must be >= 0")
-    if cfg.sampling.transitions_per_simulation < MIN_TRANSITIONS:
-        raise ValueError(f"sampling.transitions_per_simulation must be >= {MIN_TRANSITIONS}")
-    if cfg.sampling.transition_jump_days_min <= 0:
-        raise ValueError("sampling.transition_jump_days_min must be > 0")
-    if cfg.sampling.transition_jump_days_max <= 0:
-        raise ValueError("sampling.transition_jump_days_max must be > 0")
-    if cfg.sampling.transition_jump_days_min > cfg.sampling.transition_jump_days_max:
+    if cfg.sampling.saved_checkpoint_interval_days <= 0:
+        raise ValueError("sampling.saved_checkpoint_interval_days must be > 0")
+    if cfg.sampling.live_pairs_per_sequence < MIN_TRANSITIONS:
+        raise ValueError(f"sampling.live_pairs_per_sequence must be >= {MIN_TRANSITIONS}")
+    if cfg.sampling.live_transition_days_min <= 0:
+        raise ValueError("sampling.live_transition_days_min must be > 0")
+    if cfg.sampling.live_transition_days_max <= 0:
+        raise ValueError("sampling.live_transition_days_max must be > 0")
+    if cfg.sampling.live_transition_days_min > cfg.sampling.live_transition_days_max:
         raise ValueError(
-            "sampling.transition_jump_days_min must be <= "
-            "sampling.transition_jump_days_max"
+            "sampling.live_transition_days_min must be <= "
+            "sampling.live_transition_days_max"
         )
+    if not (0.0 <= cfg.sampling.live_transition_tolerance_fraction <= 1.0):
+        raise ValueError("sampling.live_transition_tolerance_fraction must be in [0,1]")
     _validate_parameter_specs(cfg.sampling.parameters)
 
     burn_in_days = float(cfg.sampling.burn_in_days)
-    min_jump_days = float(cfg.sampling.transition_jump_days_min)
+    min_jump_days = float(cfg.sampling.live_transition_days_min)
     available_days = float(cfg.solver.default_time_days) - burn_in_days
     if available_days < min_jump_days:
         raise ValueError(
             "No valid post-burn-in transition window exists: "
             f"available_days={available_days:.2f}, "
             f"min_jump_days={min_jump_days:.2f}"
+        )
+    if cfg.sampling.saved_checkpoint_interval_days > float(cfg.solver.default_time_days):
+        raise ValueError(
+            "sampling.saved_checkpoint_interval_days must be <= solver.default_time_days"
         )
 
     if cfg.normalization.state.zscore_eps <= 0:
@@ -683,8 +687,13 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("training.batch_size must be >= 1")
     if cfg.training.num_workers < 0:
         raise ValueError("training.num_workers must be >= 0")
-    if cfg.training.prefetch_factor < 1:
-        raise ValueError("training.prefetch_factor must be >= 1")
+    if not cfg.training.preload_to_gpu:
+        raise ValueError("training.preload_to_gpu must be true for live GPU sampling")
+    if int(cfg.training.batch_size) % int(cfg.sampling.live_pairs_per_sequence) != 0:
+        raise ValueError(
+            "training.batch_size must be divisible by "
+            "sampling.live_pairs_per_sequence"
+        )
     if cfg.training.preload_to_gpu and cfg.training.num_workers != 0:
         raise ValueError("training.num_workers must be 0 when training.preload_to_gpu=true")
     if cfg.training.learning_rate <= 0:

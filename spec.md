@@ -7,11 +7,10 @@ produced by `MY_SWAMP`.
 The canonical task is:
 1. Sample physical parameters.
 2. Run `MY_SWAMP` on a Legendre-Gauss spherical grid.
-3. Extract a post-burn-in window of direct-jump transitions.
+3. Save uniformly spaced checkpoint sequences from each simulated trajectory.
 4. Train a state-conditioned SFNO surrogate on
    `(state_t, params, transition_days) -> target_{t+Δ}`.
-5. Evaluate single-call direct-jump accuracy, spherical spectra, and free-run
-   rollout behavior.
+5. Evaluate single-call direct-jump accuracy and spherical spectra.
 6. Export and inspect trained checkpoints with the utilities in `extra/`.
 
 This repository does not emulate the exact internal two-level solver carry. It
@@ -29,17 +28,19 @@ Default operator routine:
    `conda activate swamp_compare`
 2. Work from the repository root:
    `cd /Users/imalsky/Desktop/SWAMPE_Project/gcmulator`
-3. Confirm the required imports before debugging repository code:
+3. Install the local package into the active environment:
+   `python -m pip install -e . --no-build-isolation`
+4. Confirm the required imports before debugging repository code:
    `python -c "import torch, torch_harmonics, my_swamp; print(torch.__version__, getattr(torch_harmonics, '__version__', 'unknown'))"`
-4. Run the minimum integrity checks:
+5. Run the minimum integrity checks:
    `python -m pytest unit_tests`
    `python -m compileall src extra unit_tests`
-5. Run developer cleanliness checks when available:
+6. Run developer cleanliness checks when available:
    `ruff check src extra unit_tests`
    `vulture src extra unit_tests --min-confidence 80`
-6. Use the main entrypoints from the same environment:
-   `python src/main.py --gen --config config.json`
-   `python src/main.py --train --config config.json`
+7. Use the main entrypoints from the same environment:
+   `python -m gcmulator --gen --config config.json`
+   `python -m gcmulator --train --config config.json`
 
 Important dependency naming:
 1. the install package is `torch-harmonics==0.8.1`
@@ -69,9 +70,8 @@ Boundary checks are appropriate at:
 4. model input shape validation
 5. export/checkpoint loading
 
-Current code still contains a few transitional compatibility shims, such as
-`python src/main.py` bootstrap logic and the `torch_harmonics` import shim in
-`src/modeling.py`. These should be treated as technical debt, not as a pattern
+Current code still contains a compatibility shim for the `torch_harmonics`
+import in `src/gcmulator/modeling.py`. This should not be treated as a pattern
 to extend.
 
 ### 2.2 No Fallback Contract
@@ -118,49 +118,28 @@ Key preserved numerical ideas:
 That means the checked-in surrogate is aligned to the modified-Euler,
 diffusion-enabled, forced MY_SWAMP path, not to every possible solver mode.
 
-### 3.2 Physical State Variables
-The visible physical state has five channels in this exact order:
+### 3.2 Prognostic State Variables
+The emulator operates autoregressively on three prognostic channels in this
+exact order:
 1. `Phi`
-2. `U`
-3. `V`
-4. `eta`
-5. `delta`
+2. `eta`
+3. `delta`
 
 Definitions:
 1. `Phi`
    Perturbation geopotential-like field. In MY_SWAMP, the total geopotential-like
    quantity is `Phi + Phibar`.
-2. `U`
-   Physical-space wind component carried by MY_SWAMP and exposed in the visible
-   state. It is a real physical variable, not an artificial helper.
-3. `V`
-   The second physical-space wind component carried by MY_SWAMP and exposed in
-   the visible state.
-4. `eta`
+2. `eta`
    The vorticity-like prognostic channel named `eta`. The MY_SWAMP README
    describes this as absolute vorticity.
-5. `delta`
+3. `delta`
    Horizontal divergence.
 
-Important wording:
-`U` and `V` are physical wind variables. In this repository they are called
-"diagnosed" only in the narrower ML sense that the emulator reconstructs them
-from predicted prognostics rather than learning them as direct targets.
-
-### 3.3 Learned Target Variables
-The active target is the prognostic subset:
-1. `Phi`
-2. `eta`
-3. `delta`
-
-Current target ordering is fixed as:
-`("Phi", "eta", "delta")`
-
-This is an intentional scientific simplification:
-1. the emulator sees the full visible state
-2. the emulator predicts only the prognostic subset
-3. `U` and `V` are reconstructed deterministically from `eta` and `delta`
-   during rollout evaluation or full-state reconstruction
+`U` and `V` (physical-space wind components) are deterministic functions of
+`eta` and `delta` via MY_SWAMP's spectral `invrsUV` transform. They are not
+part of the emulator's state space. When full five-field states are needed
+(e.g. for visualization), `U` and `V` are reconstructed via
+`my_swamp_backend.diagnose_winds()`.
 
 ### 3.4 Conditioning Parameters
 The physical conditioning vector is fixed and ordered as:
@@ -227,7 +206,8 @@ The repository reconstructs winds using MY_SWAMP spectral transforms:
 2. apply inverse wind reconstruction with `invrsUV`
 3. return real-valued physical-space `U,V`
 
-That diagnosis is implemented in `src/my_swamp_backend.py::diagnose_winds`.
+That diagnosis is implemented in
+`src/gcmulator/my_swamp_backend.py::diagnose_winds`.
 
 ### 3.7 Time Variables
 Definitions:
@@ -236,16 +216,15 @@ Definitions:
 2. `default_time_days`
    Physical integration horizon for one raw simulation.
 3. `burn_in_days`
-   Initial simulated duration discarded before transition sampling.
-4. `transition_jump_days_min`
-   Minimum requested physical direct-jump horizon in days.
-5. `transition_jump_days_max`
-   Maximum requested physical direct-jump horizon in days.
-6. `transition_days`
-   Physical duration of one sampled jump stored per transition.
-7. `anchor_steps`
-   Integer solver step index of each input state inside a sampled trajectory window.
-   Anchors are sorted for deterministic storage, but their spacing may vary.
+   Initial simulated duration excluded from live anchor sampling.
+4. `saved_checkpoint_interval_days`
+   Physical spacing between stored solver checkpoints in one raw sequence.
+5. `live_transition_days_min`
+   Minimum requested physical direct-jump horizon in days during live sampling.
+6. `live_transition_days_max`
+   Maximum requested physical direct-jump horizon in days during live sampling.
+7. `transition_days`
+   Physical duration of one live-sampled jump derived from saved checkpoint gaps.
 8. `starttime_index`
    MY_SWAMP initial time index. The active config requires `>= 2`, matching the
    two-level solver initialization constraints enforced by the code.
@@ -257,21 +236,20 @@ behavior is the direct-jump horizon `transition_days`.
 
 ### 3.8 Flexible Jump Requirement
 The active contract supports both:
-1. fixed-jump training via `transition_jump_days_min == transition_jump_days_max`
+1. fixed-jump training via `live_transition_days_min == live_transition_days_max`
 2. variable-jump training via the inclusive day-valued range
-   `[transition_jump_days_min, transition_jump_days_max]`
+   `[live_transition_days_min, live_transition_days_max]`
 
 Required semantics:
-1. raw files store per-sample `transition_days`
-2. preprocessing normalizes `log10(transition_days)` explicitly
-3. model conditioning appends normalized `log10_transition_days`
+1. raw files store uniformly spaced checkpoint sequences, not precomputed pairs
+2. preprocessing normalizes saved checkpoint states and stores one sequence per shard
+3. training samples direct-jump pairs live and appends normalized `log10_transition_days`
 4. no stage silently collapses variable-jump data into a fixed-jump assumption
-5. rollout windows may use per-sample variable jump durations while preserving
-   the exact sampled `(anchor_step, target_step)` pairing
+5. live sampling preserves exact discrete `(anchor_checkpoint, target_checkpoint)` pairing
 
 ## 4. End-To-End Pipeline
 ### 4.1 CLI
-`src/main.py` exposes two stages:
+The package entrypoint `python -m gcmulator` exposes two stages:
 1. `--gen`
 2. `--train`
 
@@ -279,67 +257,79 @@ Generation writes raw files and a descriptive manifest.
 Training performs preprocessing internally before optimization.
 
 ### 4.2 Generation
-`src/data_generation.py`:
+`src/gcmulator/data_generation.py`:
 1. validates importability of `my_swamp`
 2. samples parameter sets
-3. samples valid post-burn-in `(anchor_step, target_step)` pairs per simulation
+3. builds a uniform saved-checkpoint schedule for every simulation
 4. runs serial extraction for single-item batches and vmapped JAX trajectory
    extraction for larger generation batches
 5. writes `sim_XXXXXX.npy` raw files
 6. writes `manifest.json`
 
 ### 4.3 Preprocessing
-`src/training.py::preprocess_dataset`:
+`src/gcmulator/training.py::preprocess_dataset`:
 1. loads and validates every raw file against the active config
-2. splits at the simulation-file level, never at the transition level
-3. fits normalization on train files only, with `input_state` stats from
-   training inputs and `target_state` stats from training targets
-4. writes one processed shard per raw simulation file
-5. writes `processed_meta.json`
-6. reuses cached processed data only when the preprocessing fingerprint matches
+2. splits at the simulation-file level, never at the live-pair level
+3. fits a single `state` normalization on train files from all saved
+   prognostic checkpoints (the autoregressive model uses the same stats
+   for both input normalization and target denormalization)
+4. fits transition-time normalization from the realized discrete live-jump catalog,
+   not from stored raw pairs
+5. writes one processed shard per raw simulation file
+6. writes `processed_meta.json`
+7. reuses cached processed data only when the preprocessing fingerprint matches
 
 ### 4.4 Training
-`src/training.py::train_emulator`:
+`src/gcmulator/training.py::train_emulator`:
 1. loads processed metadata
-2. builds the SFNO-based transition model
-3. trains with sphere-weighted loss
-4. saves `last.pt` and `best.pt`
-5. computes single-call direct-jump metrics and rollout metrics
-6. writes summary JSON/CSV artifacts
+2. builds a discrete live-jump catalog from the saved checkpoint cadence
+3. preloads only one active split to GPU at a time and hard-fails if the split
+   cannot fit with 20% VRAM headroom
+4. builds the SFNO-based transition model
+5. trains with sphere-weighted loss on GPU-only live-sampled direct-jump pairs
+6. resamples training pairs every epoch with deterministic seeds and reuses
+   fixed validation/test live-pair tables
+7. saves `last.pt` and `best.pt`
+8. computes single-call direct-jump metrics for the validation and test splits
+9. writes `training_history.json`, `training_history.csv`,
+   `val_metrics.json`, and `test_metrics.json`
+10. does not implement emulator rollout evaluation or rollout artifacts
 
 ### 4.5 Export And Utilities
 The `extra/` scripts provide:
-1. held-out test-split multi-jump qualitative prediction plots
+1. held-out test-split direct-jump qualitative prediction plots
 2. TorchScript export with baked normalization
 3. training-curve plots
-4. batch-size timing benchmarks for held-out multi-jump rollout inference
+4. batch-size timing benchmarks for held-out direct-jump inference
 5. SWAMPE vs MY_SWAMP parity diagnostics
 
 ### 4.6 How To Run
-All commands assume the working directory is the repository root (`gcmulator/`).
+All commands assume the working directory is the repository root (`gcmulator/`)
+and that the package has been installed once with
+`python -m pip install -e . --no-build-isolation`.
 
 **Generate raw training data:**
 ```bash
-python src/main.py --gen --config config.json
+python -m gcmulator --gen --config config.json
 ```
 
 **Train the emulator** (includes preprocessing):
 ```bash
-python src/main.py --train --config config.json
+python -m gcmulator --train --config config.json
 ```
 
 **Both stages in sequence** (equivalent to `run.sh`):
 ```bash
-python src/main.py --gen --config config.json
-python src/main.py --train --config config.json
+python -m gcmulator --gen --config config.json
+python -m gcmulator --train --config config.json
 ```
 
 **Utility scripts** (run from the repository root after training):
 ```bash
-python extra/predictions.py        # held-out test multi-jump prediction plot
+python extra/predictions.py        # held-out test direct-jump prediction plot
 python extra/pytorch_export.py     # TorchScript export
 python extra/training_log.py       # training loss curves
-python extra/batch_size_benchmark.py  # held-out test rollout latency benchmark
+python extra/batch_size_benchmark.py  # held-out test direct-jump latency benchmark
 ```
 
 Each utility script has user-editable constants at the top (e.g. `RUN_NAME`,
@@ -360,7 +350,7 @@ Preferred baseline version:
 `torch_harmonics`
 
 ### 5.2 How GCMulator Wraps SFNO
-`src/modeling.py` does not use bare SFNO directly. It wraps it as:
+`src/gcmulator/modeling.py` does not use bare SFNO directly. It wraps it as:
 1. visible state input
 2. optional deterministic coordinate channels
 3. SFNO encoder
@@ -382,8 +372,8 @@ The active structure is:
 4. the spatial latent maps are modulated via broadcasting
 
 ### 5.4 Encoder Depth Patch
-`src/modeling.py` patches `torch_harmonics` encoder depth because some 0.8.1
-builds ignore `encoder_layers`.
+`src/gcmulator/modeling.py` patches `torch_harmonics` encoder depth because
+some 0.8.1 builds ignore `encoder_layers`.
 
 This is a repository-specific compatibility fix, not a scientific feature.
 
@@ -406,32 +396,34 @@ No planar FFT surrogate is part of the contract for spherical spectral metrics.
    Convenience PBS entrypoint for HPC runs.
 
 ### 6.2 Source Files
-1. `src/main.py`
-   CLI entrypoint for generation and training.
-2. `src/config.py`
+1. `src/gcmulator/__main__.py`
+   Module entrypoint for `python -m gcmulator`.
+3. `src/gcmulator/main.py`
+   CLI implementation for generation and training.
+4. `src/gcmulator/config.py`
    Config dataclasses, parsing, validation, constants, and path resolution.
-3. `src/sampling.py`
-   Parameter sampling and conversion into canonical conditioning vectors.
-4. `src/geometry.py`
+5. `src/gcmulator/sampling.py`
+   Parameter sampling, checkpoint-schedule construction, and live-jump catalog construction.
+6. `src/gcmulator/geometry.py`
    Canonical latitude/longitude orientation helpers.
-5. `src/data_generation.py`
+7. `src/gcmulator/data_generation.py`
    Raw simulation generation and raw-file writing.
-6. `src/my_swamp_backend.py`
-   MY_SWAMP interface layer: initialization, rollout extraction, batched JAX
-   window extraction, wind diagnosis, and full-state reconstruction.
-7. `src/normalization.py`
+8. `src/gcmulator/my_swamp_backend.py`
+   MY_SWAMP interface layer: initialization, checkpoint extraction, batched JAX
+   checkpoint extraction, wind diagnosis, and full-state reconstruction.
+9. `src/gcmulator/normalization.py`
    State/parameter normalization, inverse normalization, and JSON metadata
    serialization helpers.
-8. `src/modeling.py`
+10. `src/gcmulator/modeling.py`
    Device helpers, AMP helpers, sphere loss, coordinate channels, SFNO import,
    FiLM conditioning, and model construction.
-9. `src/training.py`
-   Raw validation, preprocessing, shard datasets, training loop, metrics,
-   checkpoint writing, and final run summary.
+11. `src/gcmulator/training.py`
+   Raw validation, preprocessing, GPU live pair sampling, training loop,
+   metrics, checkpoint writing, and split-level metric export.
 
 ### 6.3 Extra Utilities
 1. `extra/predictions.py`
-   Plot one held-out test-split multi-jump prognostic prediction against truth
+   Plot one held-out test-split direct-jump prognostic prediction against truth
    from a checkpoint.
 2. `extra/pytorch_export.py`
    Export a trained checkpoint as a physical-space TorchScript module and write
@@ -439,7 +431,8 @@ No planar FFT surrogate is part of the contract for spherical spectral metrics.
 3. `extra/training_log.py`
    Plot train-vs-val loss curves from `training_history.csv`.
 4. `extra/batch_size_benchmark.py`
-   Benchmark held-out test-split multi-jump rollout latency across batch sizes.
+   Benchmark held-out test-split direct-jump inference latency across batch
+   sizes.
 5. `extra/swampe_parity_compare.py`
    Compare SWAMPE and MY_SWAMP outputs for parity/debugging.
 6. `extra/science.mplstyle`
@@ -520,16 +513,20 @@ Internal MY_SWAMP geometry terms derived from `M`:
    Number of raw simulation files to generate.
 3. `generation_workers`
    Vectorized JAX trajectory batch size during generation. `0` delegates to the
-   backend-aware auto policy used by `src/data_generation.py`.
+   backend-aware auto policy used by `src/gcmulator/data_generation.py`.
 4. `burn_in_days`
-   Discarded initial spin-up duration before the sampled window starts.
-5. `transitions_per_simulation`
-   Number of transition pairs extracted from one simulation window.
-6. `transition_jump_days_min`
-   Minimum or fixed physical jump duration in days.
-7. `transition_jump_days_max`
+   Initial saved-checkpoint duration excluded from live anchor sampling.
+5. `saved_checkpoint_interval_days`
+   Physical cadence used when storing solver checkpoints.
+6. `live_pairs_per_sequence`
+   Number of live-sampled training pairs emitted per stored sequence per epoch.
+7. `live_transition_days_min`
+   Minimum or fixed physical jump duration in days for live sampling.
+8. `live_transition_days_max`
    Optional maximum physical jump duration in days for variable-jump training.
-8. `parameters`
+9. `live_transition_tolerance_fraction`
+   Relative tolerance used when a requested fixed jump must be matched to the nearest feasible saved gap.
+10. `parameters`
    List of per-parameter sampling rules.
 
 Config examples:
@@ -537,23 +534,29 @@ Config examples:
 Fixed direct-jump training:
 ```json
 "sampling": {
-  "transition_jump_days_min": 0.25,
-  "transition_jump_days_max": 0.25
+  "saved_checkpoint_interval_days": 0.25,
+  "live_pairs_per_sequence": 8,
+  "live_transition_days_min": 0.25,
+  "live_transition_days_max": 0.25,
+  "live_transition_tolerance_fraction": 0.1
 }
 ```
 
 Variable direct-jump training:
 ```json
 "sampling": {
-  "transition_jump_days_min": 0.1,
-  "transition_jump_days_max": 8.0
+  "saved_checkpoint_interval_days": 0.25,
+  "live_pairs_per_sequence": 8,
+  "live_transition_days_min": 0.1,
+  "live_transition_days_max": 8.0,
+  "live_transition_tolerance_fraction": 0.1
 }
 ```
 
 Interpretation:
 1. `dt_seconds` remains the fixed MY_SWAMP solver step
 2. the sampled direct-jump horizon varies over the inclusive physical-day range
-   `[transition_jump_days_min, transition_jump_days_max]`
+   `[live_transition_days_min, live_transition_days_max]`
 3. the learned conditioning feature is the corresponding normalized
    `log10_transition_days`
 
@@ -615,8 +618,6 @@ Parameter normalization keys:
     Positional embedding mode used by SFNO.
 17. `bias`
     Whether pointwise layers use bias.
-18. `include_coord_channels`
-    Whether deterministic latitude/longitude sin/cos channels are concatenated.
 
 ### 7.7 `training`
 1. `seed`
@@ -633,23 +634,20 @@ Parameter normalization keys:
 6. `epochs`
    Number of training epochs.
 7. `batch_size`
-   Batch size for processed samples.
+   Effective live-pair batch size per optimizer step.
 8. `num_workers`
-   Dataloader worker count.
-9. `prefetch_factor`
-   Dataloader prefetch depth, used only when `num_workers > 0`.
-10. `shuffle`
-   Whether to shuffle the training dataset.
-11. `pin_memory`
-   Dataloader pinned-memory toggle.
-12. `preload_to_gpu`
-   Whether the processed splits are fully moved to GPU before training. The
-   active default is `true`.
+   Must be `0` in the active live-sampling path.
+9. `shuffle`
+   Whether to shuffle the epoch-level live pair table for the training split.
+10. `preload_to_gpu`
+   Must be `true`; the active path requires GPU-resident sequence splits.
 13. `learning_rate`
    Base optimizer learning rate.
 14. `weight_decay`
    AdamW weight decay.
-15. `val_fraction`
+15. `grad_clip_norm`
+   Maximum gradient norm for gradient clipping. Default is `1.0`.
+16. `val_fraction`
    File-level validation split fraction.
 16. `test_fraction`
    File-level test split fraction.
@@ -682,19 +680,23 @@ Active default scheduler behavior:
 
 Active runtime behavior:
 1. `preload_to_gpu=true` requires CUDA and forces `num_workers=0`
-2. the active default is `deterministic=false`, favoring throughput
-3. `deterministic=true` enables deterministic algorithms and disables cuDNN
+2. `batch_size` must be divisible by `sampling.live_pairs_per_sequence`
+3. `sequence_batch_size = batch_size / live_pairs_per_sequence`
+4. the active default is `deterministic=false`, favoring throughput
+5. `deterministic=true` enables deterministic algorithms and disables cuDNN
    benchmark mode, favoring reproducibility over throughput
-4. the first-line GPU-throughput knobs are `batch_size`, `num_workers`,
-   `prefetch_factor`, `pin_memory`, `preload_to_gpu`, `amp_mode`, and
-   `deterministic=false`
+6. the active path does not use PyTorch dataloaders; it gathers live-sampled
+   pairs directly from GPU-resident sequence tensors
+7. the first-line throughput knobs are `batch_size`,
+   `sampling.live_pairs_per_sequence`, `saved_checkpoint_interval_days`,
+   `preload_to_gpu`, `amp_mode`, and `deterministic=false`
 
 ### 7.8 Common Artifact Variable Names
 These names recur across raw files, processed metadata, checkpoints, and code:
 1. `B`
-   Batch size.
-2. `T`
-   Number of sampled transitions in one raw simulation window or processed shard.
+   Live pair batch size.
+2. `S`
+   Number of saved checkpoints in one stored sequence.
 3. `C`
    Channel count.
 4. `H`
@@ -705,10 +707,9 @@ These names recur across raw files, processed metadata, checkpoints, and code:
    Latitude grid size. Numerically equal to `H` for stored arrays.
 7. `nlon`
    Longitude grid size. Numerically equal to `W` for stored arrays.
-8. `input_fields`
-   Ordered list of visible state channel names stored with a raw file or checkpoint.
-9. `target_fields`
-   Ordered list of target channel names stored with a raw file or checkpoint.
+8. `state_fields`
+   Ordered list of prognostic state channel names. Used in raw files, processed
+   metadata, and checkpoints.
 10. `param_names`
     Ordered list of canonical physical conditioning parameter names.
 11. `conditioning_names`
@@ -736,45 +737,38 @@ The saved payload is a Python dict serialized by:
 `np.save(..., allow_pickle=True)`
 
 Exact required keys:
-1. `state_inputs`
-2. `state_targets`
-3. `transition_days`
-4. `anchor_steps`
-5. `input_fields`
-6. `target_fields`
-7. `params`
-8. `param_names`
-9. `default_time_days`
-10. `burn_in_days`
-11. `dt_seconds`
-12. `starttime_index`
-13. `transition_jump_days_min`
-14. `transition_jump_days_max`
-15. `n_transitions`
-16. `M`
-17. `nlat`
-18. `nlon`
-19. `lat_order`
-20. `lon_origin`
-21. `lon_shift`
+1. `checkpoint_states`
+2. `checkpoint_steps`
+3. `checkpoint_days`
+4. `state_fields`
+5. `params`
+6. `param_names`
+7. `default_time_days`
+8. `burn_in_days`
+9. `dt_seconds`
+10. `starttime_index`
+11. `saved_checkpoint_interval_days`
+12. `n_saved_checkpoints`
+13. `M`
+14. `nlat`
+15. `nlon`
+16. `lat_order`
+17. `lon_origin`
+18. `lon_shift`
 
 Shapes and dtypes as written by generation:
-1. `state_inputs`: `[T, 5, H, W]`, stored as `float64`
-2. `state_targets`: `[T, 3, H, W]`, stored as `float64`
-3. `transition_days`: `[T]`, stored as `float64`
-4. `anchor_steps`: `[T]`, stored as `int64`
-5. `input_fields`: `[5]`, object/string array
-6. `target_fields`: `[3]`, object/string array
-7. `params`: `[7]`, stored as `float64`
-8. `param_names`: `[7]`, object/string array
-9. scalar metadata values are stored as zero-dimensional NumPy scalars
+1. `checkpoint_states`: `[S, 3, H, W]`, stored as `float64`
+2. `checkpoint_steps`: `[S]`, stored as `int64`
+3. `checkpoint_days`: `[S]`, stored as `float64`
+4. `state_fields`: `[3]`, object/string array
+5. `params`: `[7]`, stored as `float64`
+6. `param_names`: `[7]`, object/string array
+7. scalar metadata values are stored as zero-dimensional NumPy scalars
 
 Semantic contract:
-1. `state_inputs[t]` is the visible physical state at the anchor step
-2. `state_targets[t]` is the prognostic target after the stored physical jump
-   `transition_days[t]`
-3. the integer solver-step jump is recovered as
-   `round(transition_days[t] * 86400 / dt_seconds)`
+1. `checkpoint_states[s]` is the visible physical state at saved checkpoint `s`
+2. `checkpoint_steps` and `checkpoint_days` define the uniform saved sequence
+3. training-time jump pairs are derived live from these saved checkpoints
 4. all channels are already canonicalized into the configured geometry
 5. field ordering must exactly match the configured constants
 
@@ -786,39 +780,36 @@ Top-level keys:
 1. `created_unix`
 2. `n_sims_requested`
 3. `n_sims_written`
-4. `input_fields`
-5. `target_fields`
-6. `param_names`
-7. `dataset_dir`
-8. `solver`
-9. `sampling`
-10. `geometry`
-11. `items`
+4. `state_fields`
+5. `param_names`
+6. `dataset_dir`
+7. `solver`
+8. `sampling`
+9. `geometry`
+10. `n_saved_checkpoints`
+11. `checkpoint_days`
+12. `items`
 
 Each `items[]` entry includes:
 1. `sim_idx`
 2. `file`
-3. `input_fields`
-4. `target_fields`
-5. `param_names`
-6. `params`
-7. `default_time_days`
-8. `burn_in_days`
-9. `dt_seconds`
-10. `starttime_index`
-11. `transition_jump_days_min`
-12. `transition_jump_days_max`
-13. `n_transitions`
-14. `anchor_step_start`
-15. `anchor_step_end`
-16. `transition_days_min`
-17. `transition_days_max`
-18. `M`
-19. `nlat`
-20. `nlon`
-21. `lat_order`
-22. `lon_origin`
-23. `lon_shift`
+3. `state_fields`
+4. `param_names`
+5. `params`
+6. `default_time_days`
+7. `burn_in_days`
+8. `dt_seconds`
+9. `starttime_index`
+10. `saved_checkpoint_interval_days`
+11. `n_saved_checkpoints`
+12. `checkpoint_day_start`
+13. `checkpoint_day_end`
+14. `M`
+15. `nlat`
+16. `nlon`
+17. `lat_order`
+18. `lon_origin`
+19. `lon_shift`
 
 The manifest is descriptive only. Training reads raw `.npy` files directly.
 
@@ -826,60 +817,57 @@ The manifest is descriptive only. Training reads raw `.npy` files directly.
 Processed data is written as one `.npz` shard per raw simulation file.
 
 Each shard stores:
-1. `state_inputs_norm`
-2. `state_targets_norm`
-3. `params_norm`
-4. `conditioning_norm`
-5. `transition_days`
-6. `anchor_steps`
+1. `states_norm`
+2. `params_norm`
+3. `checkpoint_days`
 
 Shapes and dtypes:
-1. `state_inputs_norm`: `[T, 5, H, W]`, `float32`
-2. `state_targets_norm`: `[T, 3, H, W]`, `float32`
-3. `params_norm`: `[7]`, `float32`
-4. `conditioning_norm`: `[T, 8]`, `float32`
-5. `transition_days`: `[T]`, `float64`
-6. `anchor_steps`: `[T]`, `int64`
+1. `states_norm`: `[S, 3, H, W]`, `float32`
+2. `params_norm`: `[7]`, `float32`
+3. `checkpoint_days`: `[S]`, `float64`
 
 Semantic notes:
-1. `conditioning_norm[t]` is the normalized concatenation of physical params
-   and `log10_transition_days[t]`
-2. `params_norm` is retained separately for tooling that needs only the physical
+1. processed shards store normalized sequences, not precomputed live pairs
+2. `states_norm` contains the single prognostic state used for both model
+   input and target in the autoregressive architecture
+3. `params_norm` is retained separately for tooling that needs only the physical
    parameter vector
-3. current training loaders do not consume `anchor_steps`; it is retained for
-   traceability and future tooling
-4. splitting is by raw simulation file, not by transition, to prevent leakage
+4. `checkpoint_days` keeps the saved cadence explicit for tooling and validation
+5. splitting is by raw simulation file, not by live pair, to prevent leakage
 
 ### 8.4 Processed Metadata Contract
 `processed_meta.json` stores:
 1. `task`
-2. `input_fields`
-3. `target_fields`
-4. `param_names`
-5. `conditioning_names`
-6. `input_shape`
-7. `target_shape`
-8. `splits`
-9. `normalization`
-10. `solver`
-11. `sampling`
-12. `geometry`
-13. `build_fingerprint`
+2. `state_fields`
+3. `param_names`
+4. `conditioning_names`
+5. `state_shape`
+6. `sequence_length`
+9. `checkpoint_days`
+10. `split_sequence_counts`
+11. `splits`
+12. `live_transition_catalog`
+13. `normalization`
+14. `solver`
+15. `sampling`
+16. `geometry`
+17. `saved_checkpoint_interval_days`
+18. `build_fingerprint`
 
 Important exact semantics:
-1. `task` must be `trajectory_transition`
+1. `task` must be `checkpoint_sequence_transition`
 2. `conditioning_names` must equal `param_names + ['log10_transition_days']`
-3. `build_fingerprint` is the cache-reuse contract for processed data
-4. `geometry` currently stores:
+3. `live_transition_catalog` defines the discrete feasible jump set used for live sampling
+4. `build_fingerprint` is the cache-reuse contract for processed data
+5. `geometry` currently stores:
    `flip_latitude_to_north_south`, `roll_longitude_to_0_2pi`, `lat_order`,
    and `lon_origin`
 
 ### 8.5 Normalization Metadata Contract
 Normalization JSON includes:
-1. `input_state`
-2. `target_state`
-3. `params`
-4. `transition_time`
+1. `state`
+2. `params`
+3. `transition_time`
 
 Each state block contains:
 1. `field_names`
@@ -904,25 +892,26 @@ The transition-time block contains the same fields, with
 `best.pt` and `last.pt` store:
 1. `mode`
 2. `model_state`
-3. `input_fields`
-4. `target_fields`
-5. `param_names`
+3. `state_fields`
+4. `param_names`
 6. `conditioning_names`
 7. `shape`
 8. `geometry`
-9. `normalization`
-10. `solver`
-11. `sampling`
-12. `model_config`
-13. `training_config`
-14. `runtime_amp_mode`
-15. `resolved_config`
-16. `source_config_path`
-17. `epoch`
-18. `train_loss`
-19. `val_loss`
-20. `learning_rate`
-21. `epoch_seconds`
+9. `sequence_length`
+10. `live_transition_catalog`
+11. `normalization`
+12. `solver`
+13. `sampling`
+14. `model_config`
+15. `training_config`
+16. `runtime_amp_mode`
+17. `resolved_config`
+18. `source_config_path`
+19. `epoch`
+20. `train_loss`
+21. `val_loss`
+22. `learning_rate`
+23. `epoch_seconds`
 
 These fields are part of the practical artifact contract because downstream
 tools in `extra/` read them directly.
@@ -985,37 +974,36 @@ Active exact semantics:
    and `physical_io.state1` must all be `true`
 4. `runtime_hints.transition_time_feature` must be
    `log10_transition_days`
-5. `input.state0` must be `['batch', input_C, H, W]`
+5. `input.state0` must be `['batch', C, H, W]`
 6. `input.params` must be `['batch', len(param_names)]`
 7. `input.transition_days` must be `['batch']`
-8. `output.state1` must be `['batch', target_C, H, W]`
+8. `output.state1` must be `['batch', C, H, W]`
 9. `conditioning_names` must equal
    `param_names + ['log10_transition_days']`
-10. `normalization` must include the same `input_state`, `target_state`,
-    `params`, and `transition_time` statistics used during training
+10. `normalization` must include the same `state`, `params`, and
+    `transition_time` statistics used during training
 11. the TorchScript module itself embeds those normalization transforms so the
     export accepts physical inputs and returns physical outputs directly
 
 ## 9. Model And Evaluation Contract
 ### 9.1 Model Input And Output
-The active model call is:
+The autoregressive model call is:
 `model(state0, conditioning)`
 
 Shapes:
-1. `state0`: `[B, 5, H, W]`
+1. `state0`: `[B, 3, H, W]` (Phi, eta, delta)
 2. `conditioning`: `[B, 8]`
-3. output: `[B, 3, H, W]`
+3. output: `[B, 3, H, W]` (Phi, eta, delta)
 
 The physical-space export wrapper takes:
 `export_model(state0, params, transition_days)`
 
-Residual prediction uses the aligned input channels corresponding to the target
-fields:
-`Phi`, `eta`, `delta`
+Residual prediction uses all input channels directly since input and output
+share the same three prognostic fields.
 
 ### 9.2 One-Step Metrics
-Required single-call metrics, stored under the historical artifact key
-`one_step`:
+Required single-call metrics, written to `val_metrics.json` and
+`test_metrics.json`:
 1. normalized-space global RMSE
 2. normalized-space per-channel RMSE
 3. physical-space global RMSE
@@ -1024,16 +1012,9 @@ Required single-call metrics, stored under the historical artifact key
 6. spherical power-spectrum mismatch using `RealSHT`
 
 ### 9.3 Rollout Metrics
-Rollout evaluation:
-1. feeds predicted full visible states back into the next step
-2. reconstructs `U,V` from predicted prognostics at every step
-3. compares both prognostic targets and full visible states
-4. is valid because generation stores anchor chains with stride equal to the
-   modeled jump duration
-
-Reported rollout groups:
-1. `prognostic_physical`
-2. `full_state_physical`
+The current repository does not implement emulator rollout evaluation or
+rollout metrics. Multi-step analysis is out of scope for the checked-in
+training pipeline.
 
 ## 10. Style, Vectorization, And Documentation Preferences
 ### 10.1 Numerical Style
@@ -1098,9 +1079,9 @@ exact discrete solver carry.
 
 That means:
 1. no learned previous-step carry in the network state
-2. prognostic-only direct targets in the current baseline
-3. deterministic reconstruction of wind channels when a full five-field state
-   is needed
+2. autoregressive prognostic-only architecture (3-channel in, 3-channel out)
+3. deterministic reconstruction of wind channels (`U`, `V`) from prognostics
+   (`eta`, `delta`) when a full five-field state is needed
 4. approximate surrogate behavior rather than solver identity
 
 The emulator should be evaluated as a physically informed surrogate, not as an
