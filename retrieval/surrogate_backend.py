@@ -159,7 +159,6 @@ class SurrogateArtifactContract:
     supported_devices: tuple[str, ...]
     forward_schema: str
     export_arg_count: int
-    has_export_metadata: bool
     state_shape: tuple[int, int, int]
     param_names: tuple[str, ...]
     conditioning_names: tuple[str, ...]
@@ -189,7 +188,6 @@ class SurrogateArtifactContract:
             "supported_devices": list(self.supported_devices),
             "forward_schema": self.forward_schema,
             "export_arg_count": int(self.export_arg_count),
-            "has_export_metadata": bool(self.has_export_metadata),
             "state_shape": list(self.state_shape),
             "param_names": list(self.param_names),
             "conditioning_names": list(self.conditioning_names),
@@ -514,7 +512,6 @@ def inspect_surrogate_artifact(
         supported_devices=supported_devices,
         forward_schema=str(export_model.forward.schema),
         export_arg_count=int(export_arg_count),
-        has_export_metadata=bool(export_meta is not None),
         state_shape=(int(shape["C"]), int(shape["H"]), int(shape["W"])),
         param_names=param_names,
         conditioning_names=conditioning_names,

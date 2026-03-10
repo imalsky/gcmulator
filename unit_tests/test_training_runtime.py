@@ -79,7 +79,6 @@ def _config_dict(*, device: str) -> dict[str, object]:
             "seed": 0,
             "device": device,
             "amp_mode": "none",
-            "optimizer": "adamw",
             "epochs": 1,
             "batch_size": 4,
             "num_workers": 0,

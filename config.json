@@ -75,7 +75,6 @@
     "device": "auto",
     "amp_mode": "none",
     "deterministic": false,
-    "optimizer": "adamw",
     "epochs": 100,
     "batch_size": 40,
     "num_workers": 0,

@@ -85,7 +85,6 @@ def _minimal_config_dict() -> dict[str, object]:
             "device": "cpu",
             "amp_mode": "none",
             "deterministic": True,
-            "optimizer": "adamw",
             "epochs": 1,
             "batch_size": 4,
             "num_workers": 0,

@@ -17,15 +17,22 @@ This repository does not emulate the exact internal two-level solver carry. It
 learns a surrogate of the visible flow map seen through the physical state.
 
 ### 1.1 Working Environment And First Checks
-Use the local `swamp_compare` conda environment for generation, training,
+Use the local `nn` conda environment by default for generation, training,
 export, and repository checks.
 
-For the GH200 PBS entrypoint in `run.pbs`, the default cluster environment is
-`pyt2_8_gh`, overridden via `CONDA_ENV` when needed.
+Launcher mapping:
+1. `run.sh` is the Slurm entrypoint used on JPL `gattaca2`
+2. `run.pbs` is the PBS entrypoint used in a NASA NAS environment
+3. Both scripts may override `CONDA_ENV` when a different prepared environment
+   is required
+4. These launcher scripts are intentionally host-specific operator wrappers.
+   Some paths, modules, queues, and environment defaults are necessarily
+   hardcoded for their target systems and are not fully repository-verifiable
+   from generic local integrity checks.
 
 Default operator routine:
 1. Activate the environment:
-   `conda activate swamp_compare`
+   `conda activate nn`
 2. Work from the repository root:
    `cd /Users/imalsky/Desktop/SWAMPE_Project/gcmulator`
 3. Install the local package into the active environment:
@@ -46,7 +53,7 @@ Important dependency naming:
 1. the install package is `torch-harmonics==0.8.1`
 2. the Python import name is `torch_harmonics`
 
-If `python -c "import torch_harmonics"` fails inside `swamp_compare`, fix the
+If `python -c "import torch_harmonics"` fails inside `nn`, fix the
 environment before changing repository code.
 
 ## 2. Engineering Principles
@@ -318,11 +325,15 @@ python -m gcmulator --gen --config config.json
 python -m gcmulator --train --config config.json
 ```
 
-**Both stages in sequence** (equivalent to `run.sh`):
+**Both stages in sequence** (manual equivalent once the environment is active):
 ```bash
 python -m gcmulator --gen --config config.json
 python -m gcmulator --train --config config.json
 ```
+
+On JPL `gattaca2`, `run.sh` wraps the same generation/training flow for Slurm.
+In a NASA NAS environment, `run.pbs` is the PBS entrypoint for the same
+workflow.
 
 **Utility scripts** (run from the repository root after training):
 ```bash
@@ -346,18 +357,16 @@ The active code depends on these `torch_harmonics` APIs:
 3. `torch_harmonics.RealSHT`
 
 Preferred baseline version:
-`torch-harmonics==0.8.1` installed into `swamp_compare`, imported in Python as
-`torch_harmonics`
+`torch-harmonics==0.8.1`, imported in Python as `torch_harmonics`
 
 ### 5.2 How GCMulator Wraps SFNO
 `src/gcmulator/modeling.py` does not use bare SFNO directly. It wraps it as:
 1. visible state input
-2. optional deterministic coordinate channels
-3. SFNO encoder
-4. FiLM modulation from parameter conditioning
-5. SFNO positional embedding and block stack
-6. SFNO decoder
-7. optional residual prognostic head
+2. SFNO encoder
+3. FiLM modulation from parameter conditioning
+4. SFNO positional embedding and block stack
+5. SFNO decoder
+6. optional residual prognostic head
 
 The active wrapper class is:
 `StateConditionedTransitionModel`
@@ -391,9 +400,9 @@ No planar FFT surrogate is part of the contract for spherical spectral metrics.
 2. `spec.md`
    This repository contract.
 3. `run.sh`
-   Convenience shell entrypoint for local/Slurm-style GPU runs.
+   Slurm entrypoint for JPL `gattaca2`.
 4. `run.pbs`
-   Convenience PBS entrypoint for HPC runs.
+   PBS entrypoint for a NASA NAS environment.
 
 ### 6.2 Source Files
 1. `src/gcmulator/__main__.py`
@@ -415,8 +424,8 @@ No planar FFT surrogate is part of the contract for spherical spectral metrics.
    State/parameter normalization, inverse normalization, and JSON metadata
    serialization helpers.
 10. `src/gcmulator/modeling.py`
-   Device helpers, AMP helpers, sphere loss, coordinate channels, SFNO import,
-   FiLM conditioning, and model construction.
+   Device helpers, AMP helpers, sphere loss, SFNO import, FiLM conditioning,
+   and model construction.
 11. `src/gcmulator/training.py`
    Raw validation, preprocessing, GPU live pair sampling, training loop,
    metrics, checkpoint writing, and split-level metric export.
@@ -629,31 +638,29 @@ Parameter normalization keys:
 4. `deterministic`
    Whether training forces deterministic kernels and disables cuDNN autotuning.
    The active default is `false`.
-5. `optimizer`
-   Active code uses `adamw`.
-6. `epochs`
+5. `epochs`
    Number of training epochs.
-7. `batch_size`
+6. `batch_size`
    Effective live-pair batch size per optimizer step.
-8. `num_workers`
+7. `num_workers`
    Must be `0` in the active live-sampling path.
-9. `shuffle`
+8. `shuffle`
    Whether to shuffle the epoch-level live pair table for the training split.
-10. `preload_to_gpu`
+9. `preload_to_gpu`
    Must be `true`; the active path requires GPU-resident sequence splits.
-13. `learning_rate`
+10. `learning_rate`
    Base optimizer learning rate.
-14. `weight_decay`
+11. `weight_decay`
    AdamW weight decay.
-15. `grad_clip_norm`
+12. `grad_clip_norm`
    Maximum gradient norm for gradient clipping. Default is `1.0`.
-16. `val_fraction`
+13. `val_fraction`
    File-level validation split fraction.
-16. `test_fraction`
+14. `test_fraction`
    File-level test split fraction.
-17. `split_seed`
+15. `split_seed`
    Train/val/test split seed.
-18. `scheduler`
+16. `scheduler`
    Scheduler configuration block.
 
 Scheduler keys:
@@ -1040,7 +1047,7 @@ Required hygiene:
 
 ## 11. Local Integrity Checks
 Run all commands in this section from the repository root inside
-`swamp_compare`.
+`nn`.
 
 The minimum local integrity pass for this repository is:
 1. `python -m pytest unit_tests`
@@ -1050,7 +1057,7 @@ For code cleanliness, run these developer checks when the tools are available:
 1. `ruff check src extra unit_tests`
 2. `vulture src extra unit_tests --min-confidence 80`
 
-In the standard local `swamp_compare` conda environment, both `ruff` and
+In the standard local `nn` conda environment, both `ruff` and
 `vulture` are installed. `ruff` must be invoked with a subcommand such as
 `check`, and `vulture` must be invoked with one or more paths.
 
@@ -1071,7 +1078,7 @@ Optional plotting dependency:
 1. `matplotlib`
 
 The contract assumes these packages are importable in the active
-`swamp_compare` environment.
+`nn` environment.
 
 ## 13. Exactness Statement
 This repository intentionally models the visible MY_SWAMP flow map, not the

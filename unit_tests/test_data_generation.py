@@ -146,7 +146,6 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "seed": 0,
             "device": "cpu",
             "amp_mode": "none",
-            "optimizer": "adamw",
             "epochs": 1,
             "batch_size": 4,
             "num_workers": 0,

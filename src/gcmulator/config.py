@@ -239,7 +239,6 @@ class TrainingConfig:
     device: str = "auto"
     amp_mode: str = "none"
     deterministic: bool = False
-    optimizer: str = "adamw"
     epochs: int = 50
     batch_size: int = 8
     num_workers: int = 0
@@ -319,7 +318,6 @@ TRAINING_KEYS = {
     "device",
     "amp_mode",
     "deterministic",
-    "optimizer",
     "epochs",
     "batch_size",
     "num_workers",
@@ -550,7 +548,6 @@ def _parse_training(
             d.get("deterministic", False),
             field_name="training.deterministic",
         ),
-        optimizer=str(d.get("optimizer", "adamw")),
         epochs=int(d.get("epochs", 50)),
         batch_size=int(d.get("batch_size", 8)),
         num_workers=int(d.get("num_workers", 0)),
@@ -679,8 +676,6 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("training.device must be one of ['auto','cpu','cuda']")
     if cfg.training.amp_mode not in {"none", "bf16", "fp16"}:
         raise ValueError("training.amp_mode must be one of ['none','bf16','fp16']")
-    if cfg.training.optimizer != "adamw":
-        raise ValueError("training.optimizer must be 'adamw'")
     if cfg.training.epochs < 1:
         raise ValueError("training.epochs must be >= 1")
     if cfg.training.batch_size < 1:

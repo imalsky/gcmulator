@@ -229,7 +229,6 @@ def test_inspect_surrogate_artifact_accepts_direct_jump_torch_contract(
 
     assert contract.direct_jump_torch_runtime_ready is True
     assert contract.checkpoint_path is None
-    assert contract.has_export_metadata is True
     assert contract.supported_devices == ("cpu", "gpu")
     assert contract.transition_days_conditioned is True
     assert contract.physical_io_forward is True
