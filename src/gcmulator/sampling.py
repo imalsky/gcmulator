@@ -52,6 +52,17 @@ class LiveTransitionCatalog:
     burn_in_start_index: int
 
 
+def checkpoint_schedule_kwargs(
+    *,
+    saved_checkpoint_interval_days: float,
+    saved_snapshots_per_sim: int | None,
+) -> Dict[str, int | float]:
+    """Return exactly one schedule keyword for the active cadence contract."""
+    if saved_snapshots_per_sim is not None:
+        return {"saved_snapshots_per_sim": int(saved_snapshots_per_sim)}
+    return {"saved_checkpoint_interval_days": float(saved_checkpoint_interval_days)}
+
+
 def _sample_one(rng: np.random.Generator, spec: ParameterSpec) -> float:
     """Draw one scalar sample according to one ``ParameterSpec`` distribution."""
     if spec.dist == "uniform":

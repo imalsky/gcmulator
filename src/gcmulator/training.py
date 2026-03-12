@@ -56,6 +56,7 @@ from .sampling import (
     LiveTransitionCatalog,
     build_live_transition_catalog,
     build_uniform_checkpoint_schedule,
+    checkpoint_schedule_kwargs,
     valid_anchor_counts_for_catalog,
     weighted_log10_transition_stats,
 )
@@ -242,8 +243,10 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
     expected_schedule = build_uniform_checkpoint_schedule(
         time_days=float(cfg.solver.default_time_days),
         dt_seconds=float(cfg.solver.dt_seconds),
-        saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
-        saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
+        **checkpoint_schedule_kwargs(
+            saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+            saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
+        ),
     )
     if not math.isclose(
         saved_checkpoint_interval_days,
@@ -402,8 +405,10 @@ def _expected_checkpoint_schedule_and_catalog(
     schedule = build_uniform_checkpoint_schedule(
         time_days=float(cfg.solver.default_time_days),
         dt_seconds=float(cfg.solver.dt_seconds),
-        saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
-        saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
+        **checkpoint_schedule_kwargs(
+            saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+            saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
+        ),
     )
     catalog = build_live_transition_catalog(
         checkpoint_days=schedule.checkpoint_days,

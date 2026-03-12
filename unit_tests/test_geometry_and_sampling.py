@@ -9,6 +9,7 @@ from gcmulator.geometry import apply_geometry_state, geometry_shift_for_nlon
 from gcmulator.sampling import (
     build_live_transition_catalog,
     build_uniform_checkpoint_schedule,
+    checkpoint_schedule_kwargs,
     sample_parameter_dict,
     to_extended9,
     valid_anchor_counts_for_catalog,
@@ -88,6 +89,23 @@ def test_uniform_checkpoint_schedule_supports_snapshot_count() -> None:
     assert schedule.checkpoint_days.shape == (1001,)
     assert schedule.checkpoint_days[0] == np.float64(0.0)
     assert schedule.checkpoint_days[-1] == np.float64(100.0)
+
+
+def test_checkpoint_schedule_kwargs_prefer_snapshot_count_when_present() -> None:
+    """Parsed configs with derived intervals should still pass one schedule knob."""
+    kwargs = checkpoint_schedule_kwargs(
+        saved_checkpoint_interval_days=0.1,
+        saved_snapshots_per_sim=1000,
+    )
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=100.0,
+        dt_seconds=120.0,
+        **kwargs,
+    )
+
+    assert kwargs == {"saved_snapshots_per_sim": 1000}
+    assert schedule.interval_days == np.float64(0.1)
+    assert schedule.checkpoint_days.shape == (1001,)
 
 
 def test_fixed_live_transition_catalog_picks_exact_gap() -> None:

@@ -24,6 +24,7 @@ from .my_swamp_backend import (
 )
 from .sampling import (
     build_uniform_checkpoint_schedule,
+    checkpoint_schedule_kwargs,
     sample_parameter_dict,
     to_extended9,
 )
@@ -226,8 +227,10 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
     checkpoint_schedule = build_uniform_checkpoint_schedule(
         time_days=float(cfg.solver.default_time_days),
         dt_seconds=float(cfg.solver.dt_seconds),
-        saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
-        saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
+        **checkpoint_schedule_kwargs(
+            saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+            saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
+        ),
     )
 
     jax_backend = detect_jax_backend()
