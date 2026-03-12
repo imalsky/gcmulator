@@ -75,7 +75,7 @@ EXPFLAG = False
 TEST_CASE = None
 JIT_SCAN = True
 
-OUT_DIR = (PROJECT_ROOT / "extra" / "parity_outputs").resolve()
+OUT_DIR = Path("extra") / "parity_outputs"
 _time_tag = f"{TIME_DAYS:.3f}".rstrip("0").rstrip(".").replace(".", "p")
 FIGURE_NAME = f"phi_swampe_vs_my_swamp_{_time_tag}d.png"
 REPORT_NAME = f"swampe_vs_my_swamp_{_time_tag}d_metrics.json"
@@ -100,50 +100,17 @@ PHI_SYMLOG_LIN_FRAC = 0.02
 COLORBAR_WIDTH_RATIO = 0.07
 
 
-def _ensure_lpmn_compat() -> None:
-    """Provide SciPy ``lpmn`` compatibility shim when missing."""
-    if hasattr(sp, "lpmn"):
-        return
+def _resolve_repo_path(path: Path) -> Path:
+    """Resolve repository-relative paths from the project root."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (PROJECT_ROOT / candidate).resolve()
 
-    def _lpmn_compat(
-        m_max: int,
-        n_max: int,
-        x: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Compute associated Legendre values/derivatives with SciPy-compatible layout."""
-        m_max = int(m_max)
-        n_max = int(n_max)
-        p = np.zeros((m_max + 1, n_max + 1), dtype=np.float64)
-        dp = np.zeros((m_max + 1, n_max + 1), dtype=np.float64)
-        p[0, 0] = 1.0
 
-        s = math.sqrt(max(0.0, 1.0 - x * x))
-        for m_i in range(1, m_max + 1):
-            if m_i <= n_max:
-                p[m_i, m_i] = -(2 * m_i - 1) * s * p[m_i - 1, m_i - 1]
-
-        for m_i in range(0, min(m_max, n_max - 1) + 1):
-            p[m_i, m_i + 1] = (2 * m_i + 1) * x * p[m_i, m_i]
-
-        for m_i in range(0, m_max + 1):
-            for n_i in range(m_i + 2, n_max + 1):
-                p[m_i, n_i] = (
-                    (2 * n_i - 1) * x * p[m_i, n_i - 1]
-                    - (n_i + m_i - 1) * p[m_i, n_i - 2]
-                ) / (n_i - m_i)
-
-        denom = x * x - 1.0
-        if denom == 0.0:
-            denom = np.finfo(np.float64).eps
-
-        for m_i in range(0, m_max + 1):
-            if m_i <= n_max:
-                dp[m_i, m_i] = 0.0 if m_i == 0 else (m_i * x * p[m_i, m_i]) / denom
-            for n_i in range(m_i + 1, n_max + 1):
-                dp[m_i, n_i] = (n_i * x * p[m_i, n_i] - (n_i + m_i) * p[m_i, n_i - 1]) / denom
-        return p, dp
-
-    sp.lpmn = _lpmn_compat
+def _display_repo_path(path: Path) -> str:
+    """Return a repository-relative path string for messages and metadata."""
+    return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
 
 
 def _ensure_swampe_importable() -> None:
@@ -178,7 +145,7 @@ def _ensure_swampe_importable() -> None:
 def _apply_plot_style() -> None:
     """Load shared plotting style for parity figures."""
     if not STYLE_PATH.is_file():
-        raise FileNotFoundError(f"science.mplstyle not found: {STYLE_PATH}")
+        raise FileNotFoundError(f"science.mplstyle not found: {_display_repo_path(STYLE_PATH)}")
     plt.style.use(str(STYLE_PATH))
     plt.rcParams["savefig.dpi"] = int(FIGURE_DPI)
 
@@ -287,7 +254,6 @@ def _last_saved_timestamp_seconds(path: Path) -> int:
 
 def _run_swampe(*, tmax: int) -> Dict[str, object]:
     """Run SWAMPE and return terminal fields plus progression metadata."""
-    _ensure_lpmn_compat()
     _ensure_swampe_importable()
     import SWAMPE.continuation as swampe_cont
     import SWAMPE.model as swampe_model
@@ -451,7 +417,8 @@ def _current_jax_backend() -> str:
 def main() -> None:
     """Execute terminal-state parity run and emit report + figure artifacts."""
     _apply_plot_style()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = _resolve_repo_path(OUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     if TIME_DAYS <= 0:
         raise ValueError("TIME_DAYS must be > 0")
@@ -496,7 +463,7 @@ def main() -> None:
         if not bool(m["allclose_rtol0"]):
             failed.append(field)
 
-    fig_path = (OUT_DIR / FIGURE_NAME).resolve()
+    fig_path = (out_dir / FIGURE_NAME).resolve()
     _save_phi_figure(
         swampe_phi=swampe["Phi"],
         my_swamp_phi=my_swamp["Phi"],
@@ -544,14 +511,14 @@ def main() -> None:
         "metrics": metrics,
         "all_fields_allclose": len(failed) == 0,
         "failed_fields": failed,
-        "figure_path": str(fig_path),
+        "figure_path": _display_repo_path(fig_path),
     }
 
-    report_path = (OUT_DIR / REPORT_NAME).resolve()
+    report_path = (out_dir / REPORT_NAME).resolve()
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    print(f"Saved figure: {fig_path}")
-    print(f"Saved metrics: {report_path}")
+    print(f"Saved figure: {_display_repo_path(fig_path)}")
+    print(f"Saved metrics: {_display_repo_path(report_path)}")
     print(f"Compared horizon: {compared_time_days:.6f} days ({compared_steps} steps)")
     if not bool(swampe_run["reached_target_step"]):
         print(
@@ -566,7 +533,10 @@ def main() -> None:
         )
 
     if failed and FAIL_ON_TOLERANCE:
-        raise RuntimeError(f"Parity check failed for field(s): {failed}. See {report_path}")
+        raise RuntimeError(
+            f"Parity check failed for field(s): {failed}. "
+            f"See {_display_repo_path(report_path)}"
+        )
 
 
 if __name__ == "__main__":

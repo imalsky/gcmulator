@@ -1,4 +1,4 @@
-"""Visualize one held-out direct-jump prognostic prediction from the test split."""
+"""Visualize one held-out prognostic prediction from the test split."""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from gcmulator.config import resolve_path
 from gcmulator.modeling import (
     build_state_conditioned_transition_model,
     ensure_torch_harmonics_importable,
@@ -59,13 +58,14 @@ QUIVER_STRIDE = 8
 QUIVER_COLOR = "#08306b"
 
 # User-editable run settings
-RUN_NAME = "v1"
-RUN_DIR: Path | None = (PROJECT_ROOT / "models" / RUN_NAME).resolve()
+RUN_NAME = "v2"
+RUN_DIR: Path | None = Path("models") / RUN_NAME
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 TEST_SHARD_INDEX = 0
 INPUT_TIME_DAYS = 0.0
-TARGET_TIME_DAYS = 10.0
+TARGET_TIME_DAYS = 20.0
+ROLLOUT_STEP_DAYS: float | None = 10.0
 DEVICE_MODE = "auto"
 FIGURE_PATH: Path | None = None
 
@@ -79,18 +79,32 @@ def _dict_to_namespace(obj: Any) -> Any:
     return obj
 
 
+def _resolve_repo_path(path: Path) -> Path:
+    """Resolve repository-relative paths from the project root."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (PROJECT_ROOT / candidate).resolve()
+
+
+def _display_repo_path(path: Path) -> str:
+    """Return a repository-relative path string for messages and metadata."""
+    return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
+
+
 def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -> Path:
     """Resolve checkpoint path from top-level run settings."""
     if checkpoint is not None:
-        resolved = checkpoint.resolve()
+        resolved = _resolve_repo_path(checkpoint)
         if not resolved.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {resolved}")
+            raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(checkpoint)}")
         return resolved
     if run_dir is None:
         raise ValueError("Set RUN_DIR or CHECKPOINT_PATH at the top of this file")
-    ckpt_path = (run_dir.resolve() / "best.pt").resolve()
+    ckpt_rel_path = Path(run_dir) / "best.pt"
+    ckpt_path = _resolve_repo_path(ckpt_rel_path)
     if not ckpt_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(ckpt_rel_path)}")
     return ckpt_path
 
 
@@ -113,13 +127,12 @@ def _resolve_device(mode: str) -> torch.device:
 def _resolve_processed_dir(ckpt: Dict[str, Any]) -> Path:
     """Resolve the processed directory, defaulting to the checkpoint's dataset."""
     if PROCESSED_DIR is not None:
-        resolved = PROCESSED_DIR.resolve()
+        processed_dir_path = Path(PROCESSED_DIR)
     else:
-        source_config_path = ckpt.get("source_config_path")
         resolved_config = ckpt.get("resolved_config")
-        if not isinstance(source_config_path, str) or not isinstance(resolved_config, dict):
+        if not isinstance(resolved_config, dict):
             raise ValueError(
-                "Checkpoint is missing source config metadata; set PROCESSED_DIR explicitly"
+                "Checkpoint is missing resolved config metadata; set PROCESSED_DIR explicitly"
             )
         paths_cfg = resolved_config.get("paths")
         if not isinstance(paths_cfg, dict):
@@ -131,9 +144,12 @@ def _resolve_processed_dir(ckpt: Dict[str, Any]) -> Path:
             raise ValueError(
                 "Checkpoint is missing paths.processed_dir; set PROCESSED_DIR explicitly"
             )
-        resolved = resolve_path(Path(source_config_path), processed_dir_value)
+        processed_dir_path = Path(processed_dir_value)
+    resolved = _resolve_repo_path(processed_dir_path)
     if not resolved.is_dir():
-        raise FileNotFoundError(f"Processed directory not found: {resolved}")
+        raise FileNotFoundError(
+            f"Processed directory not found: {_display_repo_path(processed_dir_path)}"
+        )
     return resolved
 
 
@@ -153,7 +169,7 @@ def _denormalize_params(params_norm: np.ndarray, stats: Any) -> Dict[str, float]
 def _apply_plot_style() -> None:
     """Load the shared plotting style."""
     if not STYLE_PATH.is_file():
-        raise FileNotFoundError(f"Plot style not found: {STYLE_PATH}")
+        raise FileNotFoundError(f"Plot style not found: {_display_repo_path(STYLE_PATH)}")
     plt.style.use(str(STYLE_PATH))
     plt.rcParams["savefig.dpi"] = int(FIGURE_DPI)
 
@@ -204,9 +220,11 @@ def _save_figure(
     input_day: float,
     target_day: float,
     transition_days: float,
+    rollout_step_days: float | None,
+    n_rollout_steps: int,
     out_path: Path,
 ) -> None:
-    """Save a 1x2 Phi comparison figure for one direct-jump prediction."""
+    """Save a 1x2 Phi comparison figure for one prediction."""
     fig, axes = plt.subplots(
         1,
         2,
@@ -246,9 +264,16 @@ def _save_figure(
     fig.colorbar(im_true, ax=axes, shrink=0.9)
 
     rmse = float(np.sqrt(np.mean((pred_field - true_field) ** 2)))
+    rollout_suffix = ""
+    if rollout_step_days is not None:
+        rollout_suffix = (
+            f" | rollout_step_days={float(rollout_step_days):.6f}"
+            f" | rollout_steps={int(n_rollout_steps)}"
+        )
     fig.suptitle(
         f"{shard_name} | input_day={input_day:.6f} | target_day={target_day:.6f} | "
-        f"transition_days={transition_days:.6f} | {FIELD_NAME} RMSE={rmse:.3e}"
+        f"transition_days={transition_days:.6f}{rollout_suffix} | "
+        f"{FIELD_NAME} RMSE={rmse:.3e}"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -259,7 +284,7 @@ def _load_test_split_entries(processed_dir: Path) -> list[dict[str, Any]]:
     """Return held-out processed shard entries from the test split."""
     meta_path = (processed_dir / "processed_meta.json").resolve()
     if not meta_path.is_file():
-        raise FileNotFoundError(f"Processed metadata not found: {meta_path}")
+        raise FileNotFoundError(f"Processed metadata not found: {_display_repo_path(meta_path)}")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     split_entries = list(meta["splits"]["test"])
     if not split_entries:
@@ -342,7 +367,7 @@ def _load_test_direct_jump_case(
     shard_name = str(shard_entry["file"])
     shard_path = (processed_dir / shard_name).resolve()
     if not shard_path.is_file():
-        raise FileNotFoundError(f"Processed shard not found: {shard_path}")
+        raise FileNotFoundError(f"Processed shard not found: {_display_repo_path(shard_path)}")
 
     with np.load(shard_path, allow_pickle=False) as npz:
         states_norm = np.asarray(npz["states_norm"], dtype=np.float32)
@@ -421,6 +446,68 @@ def _predict_direct_jump(
     )
 
 
+def _build_rollout_schedule(
+    *,
+    transition_days: float,
+    rollout_step_days: float | None,
+) -> list[float]:
+    """Return the sequence of jump durations used for prediction."""
+    total_days = float(transition_days)
+    if total_days <= 0.0:
+        raise ValueError("transition_days must be > 0")
+    if rollout_step_days is None:
+        return [total_days]
+
+    step_days = float(rollout_step_days)
+    if step_days <= 0.0:
+        raise ValueError("ROLLOUT_STEP_DAYS must be > 0 when set")
+    if step_days > total_days:
+        raise ValueError(
+            "ROLLOUT_STEP_DAYS cannot exceed the requested transition horizon: "
+            f"{step_days:.6f} > {total_days:.6f}"
+        )
+
+    n_rollout_steps = int(round(total_days / step_days))
+    realized_days = float(n_rollout_steps) * step_days
+    tolerance_days = max(1.0e-12, 1.0e-9 * max(abs(total_days), abs(step_days)))
+    if n_rollout_steps < 1 or abs(realized_days - total_days) > tolerance_days:
+        raise ValueError(
+            "The requested target horizon must be an integer multiple of "
+            "ROLLOUT_STEP_DAYS for fixed-step autoregressive rollout: "
+            f"transition_days={total_days:.6f}, "
+            f"rollout_step_days={step_days:.6f}"
+        )
+    return [step_days] * n_rollout_steps
+
+
+def _predict_autoregressive_rollout(
+    *,
+    model: torch.nn.Module,
+    stats: Any,
+    params: Any,
+    initial_state_phys: np.ndarray,
+    transition_days: float,
+    rollout_step_days: float | None,
+    device: torch.device,
+) -> tuple[np.ndarray, int]:
+    """Run repeated fixed-step predictions and return the final physical state."""
+    rollout_schedule = _build_rollout_schedule(
+        transition_days=float(transition_days),
+        rollout_step_days=rollout_step_days,
+    )
+    current_state_phys = np.asarray(initial_state_phys, dtype=np.float32)
+    for step_days in rollout_schedule:
+        current_state_phys = _predict_direct_jump(
+            model=model,
+            stats=stats,
+            params=params,
+            initial_state_phys=current_state_phys,
+            transition_days=float(step_days),
+            device=device,
+        )
+    return np.asarray(current_state_phys, dtype=np.float32), int(len(rollout_schedule))
+
+
 def _diagnose_target_winds(
     target_state: np.ndarray,
     *,
@@ -440,12 +527,12 @@ def _diagnose_target_winds(
 
 
 def main() -> None:
-    """Load one held-out direct-jump case, run the model, and save a plot."""
+    """Load one held-out case, run the model, and save a plot."""
     _apply_plot_style()
     ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
     figure_path = (
-        FIGURE_PATH.resolve()
+        _resolve_repo_path(FIGURE_PATH)
         if FIGURE_PATH is not None
         else (run_dir / "plots" / DEFAULT_FIGURE_NAME).resolve()
     )
@@ -473,28 +560,23 @@ def main() -> None:
 
     model_cfg = _dict_to_namespace(ckpt["model_config"])
     shape = dict(ckpt["shape"])
-    geometry = dict(ckpt.get("geometry", {}))
-    state_fields = list(ckpt["state_fields"])
-    residual_input_indices = list(range(len(state_fields)))
     model = build_state_conditioned_transition_model(
         img_size=(int(shape["H"]), int(shape["W"])),
         input_state_chans=int(shape["C"]),
         target_state_chans=int(shape["C"]),
         param_dim=int(len(ckpt["conditioning_names"])),
-        residual_input_indices=residual_input_indices,
         cfg_model=model_cfg,
-        lat_order=str(geometry.get("lat_order", "north_to_south")),
-        lon_origin=str(geometry.get("lon_origin", "0_to_2pi")),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device=device).eval()
 
-    pred_target_phys = _predict_direct_jump(
+    pred_target_phys, n_rollout_steps = _predict_autoregressive_rollout(
         model=model,
         stats=stats,
         params=params,
         initial_state_phys=initial_state_phys,
         transition_days=transition_days,
+        rollout_step_days=ROLLOUT_STEP_DAYS,
         device=device,
     )
     solver_cfg = dict(ckpt["solver"])
@@ -519,9 +601,14 @@ def main() -> None:
         input_day=actual_input_day,
         target_day=actual_target_day,
         transition_days=transition_days,
+        rollout_step_days=ROLLOUT_STEP_DAYS,
+        n_rollout_steps=n_rollout_steps,
         out_path=figure_path,
     )
-    print(f"Saved direct-jump prediction figure: {figure_path}")
+    if ROLLOUT_STEP_DAYS is None:
+        print(f"Saved direct-jump prediction figure: {_display_repo_path(figure_path)}")
+    else:
+        print(f"Saved autoregressive rollout prediction figure: {_display_repo_path(figure_path)}")
 
 
 if __name__ == "__main__":

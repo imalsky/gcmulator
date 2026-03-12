@@ -28,14 +28,27 @@ STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
 
 # User-editable run settings
 RUN_NAME = "v1"
-RUN_DIR: Path | None = (PROJECT_ROOT / "models" / RUN_NAME).resolve()
+RUN_DIR: Path | None = Path("models") / RUN_NAME
 FIGURE_PATH: Path | None = None
+
+
+def _resolve_repo_path(path: Path) -> Path:
+    """Resolve repository-relative paths from the project root."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (PROJECT_ROOT / candidate).resolve()
+
+
+def _display_repo_path(path: Path) -> str:
+    """Return a repository-relative path string for messages."""
+    return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
 
 
 def _apply_plot_style() -> None:
     """Load shared matplotlib styling."""
     if not STYLE_PATH.is_file():
-        raise FileNotFoundError(f"Plot style not found: {STYLE_PATH}")
+        raise FileNotFoundError(f"Plot style not found: {_display_repo_path(STYLE_PATH)}")
     plt.style.use(str(STYLE_PATH))
     plt.rcParams["savefig.dpi"] = int(FIGURE_DPI)
 
@@ -59,7 +72,7 @@ def _read_history_csv(csv_path: Path) -> tuple[list[int], list[float], list[floa
             val_losses.append(float(row["val_loss"]))
 
     if not epochs:
-        raise ValueError(f"No rows found in {csv_path}")
+        raise ValueError(f"No rows found in {_display_repo_path(csv_path)}")
     return epochs, train_losses, val_losses
 
 
@@ -113,13 +126,15 @@ def main() -> None:
     _apply_plot_style()
     if RUN_DIR is None:
         raise ValueError("Set RUN_DIR at the top of this file")
-    run_dir = RUN_DIR.resolve()
+    run_dir = _resolve_repo_path(RUN_DIR)
     history_csv_path = (run_dir / HISTORY_CSV_NAME).resolve()
     if not history_csv_path.is_file():
-        raise FileNotFoundError(f"Training history CSV not found: {history_csv_path}")
+        raise FileNotFoundError(
+            f"Training history CSV not found: {_display_repo_path(history_csv_path)}"
+        )
 
     figure_path = (
-        FIGURE_PATH.resolve()
+        _resolve_repo_path(FIGURE_PATH)
         if FIGURE_PATH is not None
         else (run_dir / PLOTS_DIR_NAME / FIGURE_NAME).resolve()
     )
@@ -130,7 +145,7 @@ def main() -> None:
         val_losses=val_losses,
         out_path=figure_path,
     )
-    print(f"Saved training history figure: {figure_path}")
+    print(f"Saved training history figure: {_display_repo_path(figure_path)}")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import csv
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import shutil
 import time
@@ -55,11 +56,13 @@ from .sampling import (
     LiveTransitionCatalog,
     build_live_transition_catalog,
     build_uniform_checkpoint_schedule,
+    valid_anchor_counts_for_catalog,
     weighted_log10_transition_stats,
 )
 
 
 LOGGER = logging.getLogger("train")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 PREPROCESS_FINGERPRINT_VERSION = 16
 RAW_REQUIRED_KEYS = (
@@ -91,6 +94,11 @@ TEST_PAIR_SEED_OFFSET = 200_000
 # in GPU VRAM.  The 20% margin covers model parameters, optimizer state, and
 # temporary activations that live alongside the preloaded data.
 VRAM_HEADROOM_FACTOR = 1.2
+
+
+def _display_repo_path(path: Path) -> str:
+    """Return a repository-relative path string for stored metadata."""
+    return str(Path(os.path.relpath(Path(path).resolve(), start=PROJECT_ROOT)))
 
 
 def _load_npy_payload_dict(file_path: Path) -> Dict[str, Any]:
@@ -235,6 +243,7 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
         time_days=float(cfg.solver.default_time_days),
         dt_seconds=float(cfg.solver.dt_seconds),
         saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+        saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
     )
     if not math.isclose(
         saved_checkpoint_interval_days,
@@ -394,6 +403,7 @@ def _expected_checkpoint_schedule_and_catalog(
         time_days=float(cfg.solver.default_time_days),
         dt_seconds=float(cfg.solver.dt_seconds),
         saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+        saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
     )
     catalog = build_live_transition_catalog(
         checkpoint_days=schedule.checkpoint_days,
@@ -401,6 +411,7 @@ def _expected_checkpoint_schedule_and_catalog(
         transition_days_min=float(cfg.sampling.live_transition_days_min),
         transition_days_max=float(cfg.sampling.live_transition_days_max),
         tolerance_fraction=float(cfg.sampling.live_transition_tolerance_fraction),
+        pair_sampling_policy=str(cfg.sampling.pair_sampling_policy),
     )
     return schedule, catalog
 
@@ -627,7 +638,10 @@ def preprocess_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, 
                 fingerprint=fingerprint,
                 processed_dir=processed_dir,
             ):
-                LOGGER.info("Reusing cached processed dataset at %s", processed_dir)
+                LOGGER.info(
+                    "Reusing cached processed dataset at %s",
+                    _display_repo_path(processed_dir),
+                )
                 return cached
         except Exception:
             pass
@@ -764,6 +778,34 @@ class LivePairTable:
         return int(self.sequence_indices.shape[0])
 
 
+@dataclass(frozen=True)
+class SequencePairSelection:
+    """One sampled set of pair indices for a single stored sequence shard."""
+
+    anchor_indices: np.ndarray
+    target_indices: np.ndarray
+    transition_days: np.ndarray
+    transition_time_norm: np.ndarray
+
+    @property
+    def n_pairs(self) -> int:
+        """Return the number of sampled pairs."""
+        return int(self.anchor_indices.shape[0])
+
+
+@dataclass(frozen=True)
+class ResampledSplitPlan:
+    """Per-split shard order and sampled pair selections for CPU-side iteration."""
+
+    sequence_order: np.ndarray
+    selections: tuple[SequencePairSelection, ...]
+
+    @property
+    def n_pairs(self) -> int:
+        """Return the number of pairs across all sequences in the split."""
+        return int(sum(selection.n_pairs for selection in self.selections))
+
+
 def _normalize_transition_days_feature(
     transition_days: np.ndarray,
     stats: ParamNormalizationStats,
@@ -771,6 +813,133 @@ def _normalize_transition_days_feature(
     """Normalize physical transition days into the model's log-time feature."""
     log10_transition_days = np.log10(np.maximum(transition_days.astype(np.float64), 1.0e-30))
     return normalize_params(log10_transition_days.reshape(-1, 1), stats).astype(np.float32)
+
+
+def _candidate_pair_weights(
+    *,
+    counts: np.ndarray,
+    catalog: LiveTransitionCatalog,
+    pair_sampling_policy: str,
+) -> np.ndarray:
+    """Return per-candidate probabilities for weighted no-replacement sampling."""
+    if pair_sampling_policy == "uniform_pairs":
+        return np.ones((int(np.sum(counts)),), dtype=np.float64)
+
+    if pair_sampling_policy == "uniform_gaps":
+        gap_weights = np.ones_like(catalog.transition_days, dtype=np.float64)
+    elif pair_sampling_policy == "inverse_time":
+        gap_weights = catalog.probabilities.astype(np.float64, copy=False)
+    else:
+        raise ValueError(f"Unsupported pair_sampling_policy: {pair_sampling_policy}")
+
+    weights = np.concatenate(
+        [
+            np.full(int(count), float(gap_weight) / float(count), dtype=np.float64)
+            for count, gap_weight in zip(counts.tolist(), gap_weights.tolist(), strict=True)
+        ],
+        axis=0,
+    )
+    weights /= np.sum(weights)
+    return weights
+
+
+def _sample_sequence_pair_selection(
+    *,
+    sequence_length: int,
+    catalog: LiveTransitionCatalog,
+    pairs_per_sim: int,
+    pair_sampling_policy: str,
+    transition_time_stats: ParamNormalizationStats,
+    seed: int,
+) -> SequencePairSelection:
+    """Sample one per-sequence pair set from the valid candidate pair space."""
+    counts = valid_anchor_counts_for_catalog(
+        sequence_length=int(sequence_length),
+        catalog=catalog,
+    )
+    total_candidates = int(np.sum(counts))
+    if pairs_per_sim > total_candidates:
+        raise ValueError(
+            "pairs_per_sim exceeds the number of valid candidate pairs for one sequence: "
+            f"pairs_per_sim={pairs_per_sim}, total_candidates={total_candidates}"
+        )
+
+    rng = np.random.default_rng(int(seed))
+    cumulative_counts = np.cumsum(counts, dtype=np.int64)
+    if pair_sampling_policy == "uniform_pairs":
+        sampled_ids = np.asarray(
+            rng.choice(total_candidates, size=int(pairs_per_sim), replace=False),
+            dtype=np.int64,
+        )
+    else:
+        weights = _candidate_pair_weights(
+            counts=counts,
+            catalog=catalog,
+            pair_sampling_policy=str(pair_sampling_policy),
+        )
+        sampled_ids = np.asarray(
+            rng.choice(
+                total_candidates,
+                size=int(pairs_per_sim),
+                replace=False,
+                p=weights,
+            ),
+            dtype=np.int64,
+        )
+
+    gap_indices = np.searchsorted(cumulative_counts, sampled_ids, side="right").astype(np.int64)
+    prior_counts = np.zeros_like(sampled_ids, dtype=np.int64)
+    nonzero_mask = gap_indices > 0
+    if np.any(nonzero_mask):
+        prior_counts[nonzero_mask] = cumulative_counts[gap_indices[nonzero_mask] - 1]
+    anchor_offsets = sampled_ids - prior_counts
+    anchor_indices = anchor_offsets + int(catalog.burn_in_start_index)
+    target_indices = anchor_indices + catalog.gap_offsets[gap_indices].astype(np.int64)
+    transition_days = catalog.transition_days[gap_indices].astype(np.float64)
+    transition_time_norm = _normalize_transition_days_feature(
+        transition_days.astype(np.float64, copy=False),
+        transition_time_stats,
+    )
+    return SequencePairSelection(
+        anchor_indices=anchor_indices.astype(np.int64),
+        target_indices=target_indices.astype(np.int64),
+        transition_days=transition_days.astype(np.float64),
+        transition_time_norm=transition_time_norm.astype(np.float32),
+    )
+
+
+def _build_resampled_split_plan(
+    *,
+    n_sequences: int,
+    sequence_length: int,
+    catalog: LiveTransitionCatalog,
+    pairs_per_sim: int,
+    pair_sampling_policy: str,
+    transition_time_stats: ParamNormalizationStats,
+    seed: int,
+    shuffle_sequences: bool,
+) -> ResampledSplitPlan:
+    """Build one split plan by resampling a fixed number of pairs per sequence."""
+    sequence_order = np.arange(int(n_sequences), dtype=np.int64)
+    rng = np.random.default_rng(int(seed))
+    if shuffle_sequences:
+        rng.shuffle(sequence_order)
+
+    selections = tuple(
+        _sample_sequence_pair_selection(
+            sequence_length=int(sequence_length),
+            catalog=catalog,
+            pairs_per_sim=int(pairs_per_sim),
+            pair_sampling_policy=str(pair_sampling_policy),
+            transition_time_stats=transition_time_stats,
+            seed=int(seed) + 1_000_003 * int(sequence_index),
+        )
+        for sequence_index in range(int(n_sequences))
+    )
+    return ResampledSplitPlan(
+        sequence_order=sequence_order,
+        selections=selections,
+    )
 
 
 def _catalog_to_device(
@@ -797,9 +966,9 @@ def _estimate_split_gpu_bytes(
     *,
     processed_meta: Dict[str, Any],
     split_name: str,
-    live_pairs_per_sequence: int,
+    resident_pairs_per_sequence: int,
 ) -> int:
-    """Estimate GPU bytes required for one active processed split plus its pair table."""
+    """Estimate GPU bytes required for one active processed split and optional pair table."""
     split_counts = dict(processed_meta["split_sequence_counts"])
     n_sequences = int(split_counts[split_name])
     sequence_length = int(processed_meta["sequence_length"])
@@ -814,7 +983,7 @@ def _estimate_split_gpu_bytes(
         * 4
     )
     params_bytes = n_sequences * param_dim * 4
-    pair_count = n_sequences * int(live_pairs_per_sequence)
+    pair_count = n_sequences * int(resident_pairs_per_sequence)
     pair_table_bytes = pair_count * (8 + 8 + 8 + 4)
     return int(state_bytes + params_bytes + pair_table_bytes)
 
@@ -823,7 +992,7 @@ def _assert_split_fits_gpu(
     *,
     processed_meta: Dict[str, Any],
     split_name: str,
-    live_pairs_per_sequence: int,
+    resident_pairs_per_sequence: int,
     device: torch.device,
 ) -> None:
     """Fail early when one active split plus fixed headroom cannot fit on the GPU."""
@@ -833,7 +1002,7 @@ def _assert_split_fits_gpu(
     estimated_bytes = _estimate_split_gpu_bytes(
         processed_meta=processed_meta,
         split_name=split_name,
-        live_pairs_per_sequence=live_pairs_per_sequence,
+        resident_pairs_per_sequence=resident_pairs_per_sequence,
     )
     required_bytes = int(math.ceil(float(estimated_bytes) * VRAM_HEADROOM_FACTOR))
     if required_bytes > total_memory:
@@ -977,6 +1146,75 @@ def _iter_live_pair_batches(
         yield conditioning, state_inputs, state_targets
 
 
+def _iter_resampled_pair_batches(
+    *,
+    processed_dir: Path,
+    shard_entries: Sequence[Dict[str, Any]],
+    plan: ResampledSplitPlan,
+    batch_size: int,
+    device: torch.device,
+) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Yield GPU batches by resampling CPU-side pairs from stored sequence shards."""
+    if len(shard_entries) != len(plan.selections):
+        raise ValueError("shard_entries and plan.selections must have the same length")
+
+    for sequence_index in plan.sequence_order.tolist():
+        shard_path = processed_dir / str(shard_entries[int(sequence_index)]["file"])
+        selection = plan.selections[int(sequence_index)]
+        with np.load(shard_path, allow_pickle=False) as npz:
+            states = np.asarray(npz["states_norm"], dtype=np.float32)
+            params_norm = np.asarray(npz["params_norm"], dtype=np.float32)
+
+        state_inputs = states[selection.anchor_indices]
+        state_targets = states[selection.target_indices]
+        params_batch = np.repeat(params_norm[None, :], int(selection.n_pairs), axis=0)
+        conditioning = np.concatenate(
+            [params_batch, selection.transition_time_norm.astype(np.float32, copy=False)],
+            axis=1,
+        ).astype(np.float32, copy=False)
+
+        for start in range(0, int(selection.n_pairs), int(batch_size)):
+            end = min(start + int(batch_size), int(selection.n_pairs))
+            conditioning_batch = torch.from_numpy(conditioning[start:end]).to(device=device)
+            state_input_batch = torch.from_numpy(state_inputs[start:end]).to(device=device)
+            state_target_batch = torch.from_numpy(state_targets[start:end]).to(device=device)
+            yield conditioning_batch, state_input_batch, state_target_batch
+
+
+def _iter_resampled_pair_batches_preloaded(
+    *,
+    split: PreloadedSequenceSplit,
+    plan: ResampledSplitPlan,
+    batch_size: int,
+) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Yield resampled pair batches directly from one GPU-resident sequence split."""
+    if int(split.n_sequences) != len(plan.selections):
+        raise ValueError("split.n_sequences and plan.selections must have the same length")
+
+    device = split.states.device
+    for sequence_index in plan.sequence_order.tolist():
+        selection = plan.selections[int(sequence_index)]
+        anchor_indices = torch.from_numpy(selection.anchor_indices).to(device=device, dtype=torch.long)
+        target_indices = torch.from_numpy(selection.target_indices).to(device=device, dtype=torch.long)
+        transition_time_norm = torch.from_numpy(
+            selection.transition_time_norm.astype(np.float32, copy=False)
+        ).to(device=device)
+        params_norm = split.params[int(sequence_index)].unsqueeze(0)
+
+        for start in range(0, int(selection.n_pairs), int(batch_size)):
+            end = min(start + int(batch_size), int(selection.n_pairs))
+            anchor_batch = anchor_indices[start:end]
+            target_batch = target_indices[start:end]
+            state_input_batch = split.states[int(sequence_index), anchor_batch]
+            state_target_batch = split.states[int(sequence_index), target_batch]
+            params_batch = params_norm.expand(end - start, -1)
+            conditioning_batch = torch.cat(
+                (params_batch, transition_time_norm[start:end]),
+                dim=1,
+            )
+            yield conditioning_batch, state_input_batch, state_target_batch
+
+
 def _collect_predictions(
     *,
     model: torch.nn.Module,
@@ -1003,9 +1241,78 @@ def _collect_predictions(
     return np.concatenate(predictions, axis=0), np.concatenate(targets, axis=0)
 
 
+def _collect_predictions_resampled(
+    *,
+    model: torch.nn.Module,
+    processed_dir: Path,
+    shard_entries: Sequence[Dict[str, Any]],
+    plan: ResampledSplitPlan,
+    batch_size: int,
+    device: torch.device,
+    amp_mode: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Run the transition model on one CPU-side resampled split and collect outputs."""
+    predictions: List[np.ndarray] = []
+    targets: List[np.ndarray] = []
+    model.eval()
+    with torch.no_grad():
+        for conditioning_batch, state_input_batch, state_target_batch in _iter_resampled_pair_batches(
+            processed_dir=processed_dir,
+            shard_entries=shard_entries,
+            plan=plan,
+            batch_size=batch_size,
+            device=device,
+        ):
+            with autocast_context(device, amp_mode):
+                pred_batch = model(state_input_batch, conditioning_batch)
+            predictions.append(pred_batch.detach().float().cpu().numpy())
+            targets.append(state_target_batch.detach().float().cpu().numpy())
+    return np.concatenate(predictions, axis=0), np.concatenate(targets, axis=0)
+
+
+def _collect_predictions_resampled_preloaded(
+    *,
+    model: torch.nn.Module,
+    split: PreloadedSequenceSplit,
+    plan: ResampledSplitPlan,
+    batch_size: int,
+    device: torch.device,
+    amp_mode: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Run the transition model on one GPU-preloaded resampled split and collect outputs."""
+    predictions: List[np.ndarray] = []
+    targets: List[np.ndarray] = []
+    model.eval()
+    with torch.no_grad():
+        for conditioning_batch, state_input_batch, state_target_batch in _iter_resampled_pair_batches_preloaded(
+            split=split,
+            plan=plan,
+            batch_size=batch_size,
+        ):
+            with autocast_context(device, amp_mode):
+                pred_batch = model(state_input_batch, conditioning_batch)
+            predictions.append(pred_batch.detach().float().cpu().numpy())
+            targets.append(state_target_batch.detach().float().cpu().numpy())
+    return np.concatenate(predictions, axis=0), np.concatenate(targets, axis=0)
+
+
 def _named_scalar_map(values: np.ndarray, field_names: Sequence[str]) -> Dict[str, float]:
     """Map channel-aligned scalars to ``{field_name: value}``."""
     return {str(field_names[index]): float(values[index]) for index in range(len(field_names))}
+
+
+def _ordered_channel_loss_weights(
+    *,
+    field_names: Sequence[str],
+    configured_weights: Dict[str, float] | None,
+) -> np.ndarray:
+    """Return channel loss weights in the model's stable field order."""
+    if configured_weights is None:
+        return np.ones((len(field_names),), dtype=np.float32)
+    return np.asarray(
+        [float(configured_weights[str(field_name)]) for field_name in field_names],
+        dtype=np.float32,
+    )
 
 
 def _compute_spherical_power_spectrum_metrics(
@@ -1097,42 +1404,26 @@ def _compute_one_step_metrics(
 
 def _write_training_history_csv(*, history: Sequence[Dict[str, float]], csv_path: Path) -> None:
     """Write per-epoch training history rows to CSV."""
-    field_names = [
-        "epoch",
-        "train_loss",
-        "val_loss",
-        "lr",
-        "train_seconds",
-        "val_seconds",
-        "epoch_seconds",
-        "train_samples",
-        "val_samples",
-        "train_samples_per_second",
-        "val_samples_per_second",
-    ]
+    if not history:
+        raise ValueError("history must contain at least one row")
+
+    field_names: list[str] = []
+    for row in history:
+        for key in row:
+            if key not in field_names:
+                field_names.append(str(key))
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=field_names)
         writer.writeheader()
         for row in history:
-            writer.writerow(
-                {
-                    "epoch": int(round(float(row["epoch"]))),
-                    "train_loss": _format_scientific(float(row["train_loss"])),
-                    "val_loss": _format_scientific(float(row["val_loss"])),
-                    "lr": _format_scientific(float(row["lr"])),
-                    "train_seconds": _format_scientific(float(row["train_seconds"])),
-                    "val_seconds": _format_scientific(float(row["val_seconds"])),
-                    "epoch_seconds": _format_scientific(float(row["epoch_seconds"])),
-                    "train_samples": _format_scientific(float(row["train_samples"])),
-                    "val_samples": _format_scientific(float(row["val_samples"])),
-                    "train_samples_per_second": _format_scientific(
-                        float(row["train_samples_per_second"])
-                    ),
-                    "val_samples_per_second": _format_scientific(
-                        float(row["val_samples_per_second"])
-                    ),
-                }
-            )
+            formatted_row: Dict[str, str] = {}
+            for key in field_names:
+                value = row[key]
+                if key == "epoch":
+                    formatted_row[key] = str(int(round(float(value))))
+                else:
+                    formatted_row[key] = _format_scientific(float(value))
+            writer.writerow(formatted_row)
 
 
 def _format_scientific(value: float, *, digits: int = 4) -> str:
@@ -1314,13 +1605,14 @@ def _set_determinism(*, seed: int, deterministic: bool) -> None:
 def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
     """Train the transition emulator end-to-end and persist artifacts."""
     device = choose_device(cfg.training.device)
+    pair_iteration_mode = str(cfg.training.pair_iteration_mode)
     preload_to_gpu = bool(cfg.training.preload_to_gpu)
-    if not preload_to_gpu:
+    if pair_iteration_mode == "live_sampled_gpu" and not preload_to_gpu:
         raise RuntimeError(
             "This training path requires training.preload_to_gpu=true so live pair sampling stays on GPU"
         )
     if device.type != "cuda":
-        raise RuntimeError("training.preload_to_gpu=true requires CUDA")
+        raise RuntimeError("training requires CUDA")
 
     ensure_torch_harmonics_importable()
     processed_meta = preprocess_dataset(cfg, config_path=config_path)
@@ -1348,36 +1640,49 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         seed=int(cfg.training.seed),
         deterministic=bool(cfg.training.deterministic),
     )
-    live_pairs_per_sequence = int(cfg.sampling.live_pairs_per_sequence)
     batch_size = int(cfg.training.batch_size)
-    sequence_batch_size = batch_size // live_pairs_per_sequence
     state_shape = dict(processed_meta["state_shape"])
     state_chans = int(state_shape["C"])
     nlat = int(state_shape["H"])
     nlon = int(state_shape["W"])
     conditioning_dim = int(len(processed_meta["conditioning_names"]))
-    residual_input_indices = list(range(state_chans))
-    live_catalog = _live_transition_catalog_from_json(processed_meta["live_transition_catalog"])
-    device_catalog = _catalog_to_device(
-        catalog=live_catalog,
-        transition_time_stats=stats.transition_time,
-        device=device,
+    channel_loss_weights = _ordered_channel_loss_weights(
+        field_names=state_field_names,
+        configured_weights=cfg.training.channel_loss_weights,
     )
-
-    for split_name in ("train", "val", "test"):
-        _assert_split_fits_gpu(
-            processed_meta=processed_meta,
-            split_name=split_name,
-            live_pairs_per_sequence=live_pairs_per_sequence,
+    live_catalog = _live_transition_catalog_from_json(processed_meta["live_transition_catalog"])
+    live_pairs_per_sequence = int(cfg.sampling.live_pairs_per_sequence)
+    pairs_per_sim = int(cfg.sampling.pairs_per_sim)
+    pair_sampling_policy = str(cfg.sampling.pair_sampling_policy)
+    sequence_batch_size = (
+        batch_size // live_pairs_per_sequence
+        if pair_iteration_mode == "live_sampled_gpu"
+        else None
+    )
+    device_catalog = None
+    if pair_iteration_mode == "live_sampled_gpu":
+        device_catalog = _catalog_to_device(
+            catalog=live_catalog,
+            transition_time_stats=stats.transition_time,
             device=device,
         )
+    if preload_to_gpu:
+        resident_pairs_per_sequence = (
+            live_pairs_per_sequence if pair_iteration_mode == "live_sampled_gpu" else 0
+        )
+        for split_name in ("train", "val", "test"):
+            _assert_split_fits_gpu(
+                processed_meta=processed_meta,
+                split_name=split_name,
+                resident_pairs_per_sequence=resident_pairs_per_sequence,
+                device=device,
+            )
 
     model = build_state_conditioned_transition_model(
         img_size=(nlat, nlon),
         input_state_chans=state_chans,
         target_state_chans=state_chans,
         param_dim=conditioning_dim,
-        residual_input_indices=residual_input_indices,
         cfg_model=cfg.model,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -1392,20 +1697,42 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         nlat=nlat,
         nlon=nlon,
     )
-    LOGGER.info(
-        "Training runtime | device=%s | amp=%s | deterministic=%s | pair_batch=%s | "
-        "sequence_batch=%s | preload_to_gpu=%s | split_sequence_counts=%s",
-        device,
-        runtime_amp_mode,
-        str(bool(cfg.training.deterministic)).lower(),
-        _format_scientific(float(batch_size)),
-        _format_scientific(float(sequence_batch_size)),
-        "true",
-        json.dumps(processed_meta["split_sequence_counts"], sort_keys=True),
-    )
+    if pair_iteration_mode == "live_sampled_gpu":
+        LOGGER.info(
+            "Training runtime | mode=%s | device=%s | amp=%s | deterministic=%s | "
+            "pair_batch=%s | sequence_batch=%s | preload_to_gpu=%s | split_sequence_counts=%s",
+            pair_iteration_mode,
+            device,
+            runtime_amp_mode,
+            str(bool(cfg.training.deterministic)).lower(),
+            _format_scientific(float(batch_size)),
+            _format_scientific(float(sequence_batch_size if sequence_batch_size is not None else 0)),
+            "true",
+            json.dumps(processed_meta["split_sequence_counts"], sort_keys=True),
+        )
+    else:
+        LOGGER.info(
+            "Training runtime | mode=%s | device=%s | amp=%s | deterministic=%s | "
+            "pair_batch=%s | pairs_per_sim=%s | pair_sampling_policy=%s | preload_to_gpu=%s | "
+            "split_sequence_counts=%s",
+            pair_iteration_mode,
+            device,
+            runtime_amp_mode,
+            str(bool(cfg.training.deterministic)).lower(),
+            _format_scientific(float(batch_size)),
+            _format_scientific(float(pairs_per_sim)),
+            pair_sampling_policy,
+            str(bool(preload_to_gpu)).lower(),
+            json.dumps(processed_meta["split_sequence_counts"], sort_keys=True),
+        )
 
     grad_clip_norm = float(cfg.training.grad_clip_norm)
-    loss_fn = SphereLoss(nlat=nlat, nlon=nlon, grid=cfg.model.grid).to(device)
+    loss_fn = SphereLoss(
+        nlat=nlat,
+        nlon=nlon,
+        grid=cfg.model.grid,
+        channel_weights=channel_loss_weights,
+    ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(cfg.training.learning_rate),
@@ -1441,6 +1768,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     test_pair_seed = int(cfg.training.seed) + TEST_PAIR_SEED_OFFSET
     val_pair_table: LivePairTable | None = None
     test_pair_table: LivePairTable | None = None
+    val_resampled_plan: ResampledSplitPlan | None = None
+    test_resampled_plan: ResampledSplitPlan | None = None
 
     # ------------------------------------------------------------------
     # Optimization loop
@@ -1468,29 +1797,68 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 ),
             )
 
-        train_split = _load_sequence_split_to_device(
-            processed_dir=processed_dir,
-            shard_entries=processed_meta["splits"]["train"],
-            device=device,
-        )
-        train_pair_table = _sample_live_pair_table(
-            split=train_split,
-            catalog=device_catalog,
-            live_pairs_per_sequence=live_pairs_per_sequence,
-            seed=int(cfg.training.seed) + int(epoch),
-            shuffle_pairs=bool(cfg.training.shuffle),
-        )
         model.train()
         train_loss_sum = 0.0
+        train_channel_loss_sum = np.zeros((state_chans,), dtype=np.float64)
         train_count = 0
-        train_samples = int(train_pair_table.n_pairs)
         train_phase_start = time.perf_counter()
+        if pair_iteration_mode == "live_sampled_gpu":
+            train_split = _load_sequence_split_to_device(
+                processed_dir=processed_dir,
+                shard_entries=processed_meta["splits"]["train"],
+                device=device,
+            )
+            train_pair_table = _sample_live_pair_table(
+                split=train_split,
+                catalog=device_catalog,
+                live_pairs_per_sequence=live_pairs_per_sequence,
+                seed=int(cfg.training.seed) + int(epoch),
+                shuffle_pairs=bool(cfg.training.shuffle),
+            )
+            train_samples = int(train_pair_table.n_pairs)
+            train_batches = _iter_live_pair_batches(
+                split=train_split,
+                pair_table=train_pair_table,
+                batch_size=batch_size,
+            )
+        else:
+            train_split = (
+                _load_sequence_split_to_device(
+                    processed_dir=processed_dir,
+                    shard_entries=processed_meta["splits"]["train"],
+                    device=device,
+                )
+                if preload_to_gpu
+                else None
+            )
+            train_pair_table = None
+            train_plan = _build_resampled_split_plan(
+                n_sequences=int(processed_meta["split_sequence_counts"]["train"]),
+                sequence_length=int(processed_meta["sequence_length"]),
+                catalog=live_catalog,
+                pairs_per_sim=pairs_per_sim,
+                pair_sampling_policy=pair_sampling_policy,
+                transition_time_stats=stats.transition_time,
+                seed=int(cfg.training.seed) + int(epoch),
+                shuffle_sequences=bool(cfg.training.shuffle),
+            )
+            train_samples = int(train_plan.n_pairs)
+            if preload_to_gpu and train_split is not None:
+                train_batches = _iter_resampled_pair_batches_preloaded(
+                    split=train_split,
+                    plan=train_plan,
+                    batch_size=batch_size,
+                )
+            else:
+                train_batches = _iter_resampled_pair_batches(
+                    processed_dir=processed_dir,
+                    shard_entries=processed_meta["splits"]["train"],
+                    plan=train_plan,
+                    batch_size=batch_size,
+                    device=device,
+                )
 
-        for conditioning_batch, state_input_batch, state_target_batch in _iter_live_pair_batches(
-            split=train_split,
-            pair_table=train_pair_table,
-            batch_size=batch_size,
-        ):
+        for conditioning_batch, state_input_batch, state_target_batch in train_batches:
             _check_finite_tensor(conditioning_batch, name="train conditioning batch")
             _check_finite_tensor(state_input_batch, name="train state_input batch")
             _check_finite_tensor(state_target_batch, name="train target batch")
@@ -1499,7 +1867,10 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             with autocast_context(device, runtime_amp_mode):
                 prediction = model(state_input_batch, conditioning_batch)
                 _check_finite_tensor(prediction, name="train prediction batch")
-                loss = loss_fn(prediction, state_target_batch)
+                loss, per_channel_loss = loss_fn.loss_with_channels(
+                    prediction,
+                    state_target_batch,
+                )
             if not torch.isfinite(loss).item():
                 raise RuntimeError("Training loss became non-finite")
 
@@ -1515,35 +1886,78 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 optimizer.step()
 
             train_loss_sum += float(loss.detach().item())
+            train_channel_loss_sum += per_channel_loss.detach().cpu().numpy().astype(np.float64)
             train_count += 1
         train_seconds = time.perf_counter() - train_phase_start
-        del train_pair_table
-        train_split = _release_preloaded_sequence_split(train_split)
+        if train_pair_table is not None:
+            del train_pair_table
+        if train_split is not None:
+            train_split = _release_preloaded_sequence_split(train_split)
 
-        val_split = _load_sequence_split_to_device(
-            processed_dir=processed_dir,
-            shard_entries=processed_meta["splits"]["val"],
-            device=device,
-        )
-        if val_pair_table is None:
-            val_pair_table = _sample_live_pair_table(
-                split=val_split,
-                catalog=device_catalog,
-                live_pairs_per_sequence=live_pairs_per_sequence,
-                seed=val_pair_seed,
-                shuffle_pairs=False,
-            )
         model.eval()
         val_loss_sum = 0.0
+        val_channel_loss_sum = np.zeros((state_chans,), dtype=np.float64)
         val_count = 0
-        val_samples = int(val_pair_table.n_pairs)
         val_phase_start = time.perf_counter()
-        with torch.no_grad():
-            for conditioning_batch, state_input_batch, state_target_batch in _iter_live_pair_batches(
+        if pair_iteration_mode == "live_sampled_gpu":
+            val_split = _load_sequence_split_to_device(
+                processed_dir=processed_dir,
+                shard_entries=processed_meta["splits"]["val"],
+                device=device,
+            )
+            if val_pair_table is None:
+                val_pair_table = _sample_live_pair_table(
+                    split=val_split,
+                    catalog=device_catalog,
+                    live_pairs_per_sequence=live_pairs_per_sequence,
+                    seed=val_pair_seed,
+                    shuffle_pairs=False,
+                )
+            val_samples = int(val_pair_table.n_pairs)
+            val_batches = _iter_live_pair_batches(
                 split=val_split,
                 pair_table=val_pair_table,
                 batch_size=batch_size,
-            ):
+            )
+        else:
+            val_split = (
+                _load_sequence_split_to_device(
+                    processed_dir=processed_dir,
+                    shard_entries=processed_meta["splits"]["val"],
+                    device=device,
+                )
+                if preload_to_gpu
+                else None
+            )
+            if val_resampled_plan is None:
+                val_resampled_plan = _build_resampled_split_plan(
+                    n_sequences=int(processed_meta["split_sequence_counts"]["val"]),
+                    sequence_length=int(processed_meta["sequence_length"]),
+                    catalog=live_catalog,
+                    pairs_per_sim=pairs_per_sim,
+                    pair_sampling_policy=pair_sampling_policy,
+                    transition_time_stats=stats.transition_time,
+                    seed=val_pair_seed,
+                    shuffle_sequences=False,
+                )
+            val_samples = int(val_resampled_plan.n_pairs)
+            if preload_to_gpu and val_split is not None:
+                val_batches = _iter_resampled_pair_batches_preloaded(
+                    split=val_split,
+                    plan=val_resampled_plan,
+                    batch_size=batch_size,
+                )
+            else:
+                val_batches = _iter_resampled_pair_batches(
+                    processed_dir=processed_dir,
+                    shard_entries=processed_meta["splits"]["val"],
+                    plan=val_resampled_plan,
+                    batch_size=batch_size,
+                    device=device,
+                )
+
+        with torch.no_grad():
+            for conditioning_batch, state_input_batch, state_target_batch in val_batches:
                 _check_finite_tensor(conditioning_batch, name="val conditioning batch")
                 _check_finite_tensor(state_input_batch, name="val state_input batch")
                 _check_finite_tensor(state_target_batch, name="val target batch")
@@ -1551,18 +1965,27 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 with autocast_context(device, runtime_amp_mode):
                     prediction = model(state_input_batch, conditioning_batch)
                     _check_finite_tensor(prediction, name="val prediction batch")
-                    vloss = loss_fn(prediction, state_target_batch)
+                    vloss, val_per_channel_loss = loss_fn.loss_with_channels(
+                        prediction,
+                        state_target_batch,
+                    )
                 if not torch.isfinite(vloss).item():
                     raise RuntimeError("Validation loss became non-finite")
                 val_loss_sum += float(vloss.detach().item())
+                val_channel_loss_sum += (
+                    val_per_channel_loss.detach().cpu().numpy().astype(np.float64)
+                )
                 val_count += 1
         val_seconds = time.perf_counter() - val_phase_start
-        val_split = _release_preloaded_sequence_split(val_split)
+        if val_split is not None:
+            val_split = _release_preloaded_sequence_split(val_split)
 
         if train_count == 0 or val_count == 0:
             raise RuntimeError("No training or validation batches were produced")
         train_loss = train_loss_sum / float(train_count)
         val_loss = val_loss_sum / float(val_count)
+        train_channel_loss = train_channel_loss_sum / float(train_count)
+        val_channel_loss = val_channel_loss_sum / float(val_count)
         best_val, epochs_without_improvement, val_improved = _update_loss_tracking(
             current=val_loss,
             best=best_val,
@@ -1607,6 +2030,14 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
                 "epoch": float(epoch),
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                **{
+                    f"train_loss_{field_name.lower()}": float(train_channel_loss[field_index])
+                    for field_index, field_name in enumerate(state_field_names)
+                },
+                **{
+                    f"val_loss_{field_name.lower()}": float(val_channel_loss[field_index])
+                    for field_index, field_name in enumerate(state_field_names)
+                },
                 "lr": current_lr,
                 "train_seconds": float(train_seconds),
                 "val_seconds": float(val_seconds),
@@ -1641,10 +2072,12 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
             "training_config": asdict(cfg.training),
             "runtime_amp_mode": runtime_amp_mode,
             "resolved_config": resolved_cfg_dict,
-            "source_config_path": str(config_path),
+            "source_config_path": _display_repo_path(config_path),
             "epoch": int(epoch),
             "train_loss": float(train_loss),
             "val_loss": float(val_loss),
+            "train_per_channel_loss": _named_scalar_map(train_channel_loss, state_field_names),
+            "val_per_channel_loss": _named_scalar_map(val_channel_loss, state_field_names),
             "learning_rate": float(current_lr),
             "epoch_seconds": float(epoch_seconds),
         }
@@ -1665,50 +2098,122 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
 
     best_checkpoint = torch.load(best_path, map_location=device)
     model.load_state_dict(best_checkpoint["model_state"], strict=True)
-    val_split = _load_sequence_split_to_device(
-        processed_dir=processed_dir,
-        shard_entries=processed_meta["splits"]["val"],
-        device=device,
-    )
-    if val_pair_table is None:
-        val_pair_table = _sample_live_pair_table(
+    if pair_iteration_mode == "live_sampled_gpu":
+        val_split = _load_sequence_split_to_device(
+            processed_dir=processed_dir,
+            shard_entries=processed_meta["splits"]["val"],
+            device=device,
+        )
+        if val_pair_table is None:
+            val_pair_table = _sample_live_pair_table(
+                split=val_split,
+                catalog=device_catalog,
+                live_pairs_per_sequence=live_pairs_per_sequence,
+                seed=val_pair_seed,
+                shuffle_pairs=False,
+            )
+        val_pred, val_target = _collect_predictions(
+            model=model,
             split=val_split,
-            catalog=device_catalog,
-            live_pairs_per_sequence=live_pairs_per_sequence,
-            seed=val_pair_seed,
-            shuffle_pairs=False,
+            pair_table=val_pair_table,
+            batch_size=batch_size,
+            device=device,
+            amp_mode=runtime_amp_mode,
         )
-    val_pred, val_target = _collect_predictions(
-        model=model,
-        split=val_split,
-        pair_table=val_pair_table,
-        batch_size=batch_size,
-        device=device,
-        amp_mode=runtime_amp_mode,
-    )
-    val_split = _release_preloaded_sequence_split(val_split)
-    test_split = _load_sequence_split_to_device(
-        processed_dir=processed_dir,
-        shard_entries=processed_meta["splits"]["test"],
-        device=device,
-    )
-    if test_pair_table is None:
-        test_pair_table = _sample_live_pair_table(
+        val_split = _release_preloaded_sequence_split(val_split)
+        test_split = _load_sequence_split_to_device(
+            processed_dir=processed_dir,
+            shard_entries=processed_meta["splits"]["test"],
+            device=device,
+        )
+        if test_pair_table is None:
+            test_pair_table = _sample_live_pair_table(
+                split=test_split,
+                catalog=device_catalog,
+                live_pairs_per_sequence=live_pairs_per_sequence,
+                seed=test_pair_seed,
+                shuffle_pairs=False,
+            )
+        test_pred, test_target = _collect_predictions(
+            model=model,
             split=test_split,
-            catalog=device_catalog,
-            live_pairs_per_sequence=live_pairs_per_sequence,
-            seed=test_pair_seed,
-            shuffle_pairs=False,
+            pair_table=test_pair_table,
+            batch_size=batch_size,
+            device=device,
+            amp_mode=runtime_amp_mode,
         )
-    test_pred, test_target = _collect_predictions(
-        model=model,
-        split=test_split,
-        pair_table=test_pair_table,
-        batch_size=batch_size,
-        device=device,
-        amp_mode=runtime_amp_mode,
-    )
-    test_split = _release_preloaded_sequence_split(test_split)
+        test_split = _release_preloaded_sequence_split(test_split)
+    else:
+        if val_resampled_plan is None:
+            val_resampled_plan = _build_resampled_split_plan(
+                n_sequences=int(processed_meta["split_sequence_counts"]["val"]),
+                sequence_length=int(processed_meta["sequence_length"]),
+                catalog=live_catalog,
+                pairs_per_sim=pairs_per_sim,
+                pair_sampling_policy=pair_sampling_policy,
+                transition_time_stats=stats.transition_time,
+                seed=val_pair_seed,
+                shuffle_sequences=False,
+            )
+        if test_resampled_plan is None:
+            test_resampled_plan = _build_resampled_split_plan(
+                n_sequences=int(processed_meta["split_sequence_counts"]["test"]),
+                sequence_length=int(processed_meta["sequence_length"]),
+                catalog=live_catalog,
+                pairs_per_sim=pairs_per_sim,
+                pair_sampling_policy=pair_sampling_policy,
+                transition_time_stats=stats.transition_time,
+                seed=test_pair_seed,
+                shuffle_sequences=False,
+            )
+        if preload_to_gpu:
+            val_split = _load_sequence_split_to_device(
+                processed_dir=processed_dir,
+                shard_entries=processed_meta["splits"]["val"],
+                device=device,
+            )
+            val_pred, val_target = _collect_predictions_resampled_preloaded(
+                model=model,
+                split=val_split,
+                plan=val_resampled_plan,
+                batch_size=batch_size,
+                device=device,
+                amp_mode=runtime_amp_mode,
+            )
+            val_split = _release_preloaded_sequence_split(val_split)
+            test_split = _load_sequence_split_to_device(
+                processed_dir=processed_dir,
+                shard_entries=processed_meta["splits"]["test"],
+                device=device,
+            )
+            test_pred, test_target = _collect_predictions_resampled_preloaded(
+                model=model,
+                split=test_split,
+                plan=test_resampled_plan,
+                batch_size=batch_size,
+                device=device,
+                amp_mode=runtime_amp_mode,
+            )
+            test_split = _release_preloaded_sequence_split(test_split)
+        else:
+            val_pred, val_target = _collect_predictions_resampled(
+                model=model,
+                processed_dir=processed_dir,
+                shard_entries=processed_meta["splits"]["val"],
+                plan=val_resampled_plan,
+                batch_size=batch_size,
+                device=device,
+                amp_mode=runtime_amp_mode,
+            )
+            test_pred, test_target = _collect_predictions_resampled(
+                model=model,
+                processed_dir=processed_dir,
+                shard_entries=processed_meta["splits"]["test"],
+                plan=test_resampled_plan,
+                batch_size=batch_size,
+                device=device,
+                amp_mode=runtime_amp_mode,
+            )
     val_metrics = _compute_one_step_metrics(
         pred_norm=val_pred,
         target_norm=val_target,
@@ -1739,12 +2244,12 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
     )
 
     return {
-        "best_checkpoint": str(best_path),
-        "last_checkpoint": str(last_path),
+        "best_checkpoint": _display_repo_path(best_path),
+        "last_checkpoint": _display_repo_path(last_path),
         "best_val_loss": float(best_val),
-        "history_path": str(model_dir / "training_history.json"),
-        "history_csv_path": str(model_dir / "training_history.csv"),
-        "val_metrics_path": str(model_dir / "val_metrics.json"),
-        "test_metrics_path": str(model_dir / "test_metrics.json"),
-        "processed_meta": str(processed_dir / "processed_meta.json"),
+        "history_path": _display_repo_path(model_dir / "training_history.json"),
+        "history_csv_path": _display_repo_path(model_dir / "training_history.csv"),
+        "val_metrics_path": _display_repo_path(model_dir / "val_metrics.json"),
+        "test_metrics_path": _display_repo_path(model_dir / "test_metrics.json"),
+        "processed_meta": _display_repo_path(processed_dir / "processed_meta.json"),
     }

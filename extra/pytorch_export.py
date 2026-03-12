@@ -14,6 +14,7 @@ without rebuilding the model architecture from the checkpoint.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -49,8 +50,8 @@ EXPORT_META_NAME = "model_export.meta.json"
 EXAMPLE_BATCH_SIZE = 1
 STRICT_TRACE = True
 SUPPRESS_KNOWN_EXPORT_WARNINGS = True
-RUN_NAME = "v1"
-RUN_DIR: Path | None = (PROJECT_ROOT / "models" / RUN_NAME).resolve()
+RUN_NAME = "v2"
+RUN_DIR: Path | None = Path("models") / RUN_NAME
 CHECKPOINT_PATH: Path | None = None
 
 # Keep the device choice explicit for now. Supported values are only "cpu" and
@@ -75,19 +76,32 @@ def _dict_to_namespace(obj: Any) -> Any:
     return obj
 
 
+def _resolve_repo_path(path: Path) -> Path:
+    """Resolve repository-relative paths from the project root."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (PROJECT_ROOT / candidate).resolve()
+
+
+def _display_repo_path(path: Path) -> str:
+    """Return a repository-relative path string for messages and metadata."""
+    return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
+
+
 def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -> Path:
     """Resolve checkpoint path from top-level run settings."""
     if checkpoint is not None:
-        resolved = checkpoint.resolve()
+        resolved = _resolve_repo_path(checkpoint)
         if not resolved.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {resolved}")
+            raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(checkpoint)}")
         return resolved
     if run_dir is None:
         raise ValueError("Set RUN_DIR or CHECKPOINT_PATH at the top of this file")
-    resolved_run_dir = run_dir.resolve()
-    ckpt_path = (resolved_run_dir / "best.pt").resolve()
+    ckpt_rel_path = Path(run_dir) / "best.pt"
+    ckpt_path = _resolve_repo_path(ckpt_rel_path)
     if not ckpt_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(ckpt_rel_path)}")
     return ckpt_path
 
 
@@ -469,12 +483,12 @@ def main() -> None:
     ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
     export_path = (
-        OUTPUT_PATH.resolve()
+        _resolve_repo_path(OUTPUT_PATH)
         if OUTPUT_PATH is not None
         else (run_dir / EXPORT_NAME).resolve()
     )
     meta_path = (
-        META_OUTPUT_PATH.resolve()
+        _resolve_repo_path(META_OUTPUT_PATH)
         if META_OUTPUT_PATH is not None
         else (run_dir / EXPORT_META_NAME).resolve()
     )
@@ -507,17 +521,12 @@ def main() -> None:
             "Checkpoint sampling metadata is missing the sequence-cadence or live-jump fields. "
             "Export only supports checkpoints trained with the sequence-based live-sampling path."
         )
-    residual_input_indices = list(range(state_chans))
-
     core_model = build_state_conditioned_transition_model(
         img_size=(int(shape["H"]), int(shape["W"])),
         input_state_chans=state_chans,
         target_state_chans=state_chans,
         param_dim=int(len(ckpt["conditioning_names"])),
-        residual_input_indices=residual_input_indices,
         cfg_model=model_cfg,
-        lat_order="north_to_south",
-        lon_origin="0_to_2pi",
     )
     core_model.load_state_dict(ckpt["model_state"], strict=True)
     core_model.to(device=device).eval()
@@ -583,8 +592,8 @@ def main() -> None:
     meta = {
         "artifact_kind": "direct_jump_physical_state_transition",
         "export_format": "torchscript",
-        "checkpoint_path": str(ckpt_path),
-        "export_path": str(export_path),
+        "checkpoint_path": _display_repo_path(ckpt_path),
+        "export_path": _display_repo_path(export_path),
         "device": str(device),
         "supported_devices": ["cpu", "gpu"],
         "runtime_hints": {
@@ -629,8 +638,8 @@ def main() -> None:
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    print(f"Saved TorchScript export: {export_path}")
-    print(f"Saved export metadata: {meta_path}")
+    print(f"Saved TorchScript export: {_display_repo_path(export_path)}")
+    print(f"Saved export metadata: {_display_repo_path(meta_path)}")
 
 
 if __name__ == "__main__":

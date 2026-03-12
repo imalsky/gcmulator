@@ -73,7 +73,6 @@ def _config_dict() -> dict[str, object]:
             "normalization_layer": "instance_norm",
             "hard_thresholding_fraction": 1.0,
             "residual_prediction": True,
-            "residual_init_scale": 1.0e-2,
             "pos_embed": "spectral",
             "bias": False,
         },

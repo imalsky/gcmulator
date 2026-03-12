@@ -33,7 +33,6 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from gcmulator.config import resolve_path
 from gcmulator.modeling import (
     build_state_conditioned_transition_model,
     ensure_torch_harmonics_importable,
@@ -68,7 +67,7 @@ DEVICE_MARKERS = {
 
 # User-editable run settings
 RUN_NAME = "v1"
-RUN_DIR: Path | None = (PROJECT_ROOT / "models" / RUN_NAME).resolve()
+RUN_DIR: Path | None = Path("models") / RUN_NAME
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 DEVICE_MODES: Sequence[str] = ("cpu", "gpu")
@@ -85,18 +84,32 @@ def _dict_to_namespace(obj: Any) -> Any:
     return obj
 
 
+def _resolve_repo_path(path: Path) -> Path:
+    """Resolve repository-relative paths from the project root."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (PROJECT_ROOT / candidate).resolve()
+
+
+def _display_repo_path(path: Path) -> str:
+    """Return a repository-relative path string for messages and metadata."""
+    return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
+
+
 def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -> Path:
     """Resolve checkpoint path from the top-level run settings."""
     if checkpoint is not None:
-        resolved = checkpoint.resolve()
+        resolved = _resolve_repo_path(checkpoint)
         if not resolved.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {resolved}")
+            raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(checkpoint)}")
         return resolved
     if run_dir is None:
         raise ValueError("Set RUN_DIR or CHECKPOINT_PATH at the top of this file")
-    ckpt_path = (run_dir.resolve() / "best.pt").resolve()
+    ckpt_rel_path = Path(run_dir) / "best.pt"
+    ckpt_path = _resolve_repo_path(ckpt_rel_path)
     if not ckpt_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(ckpt_rel_path)}")
     return ckpt_path
 
 
@@ -137,13 +150,12 @@ def _resolve_devices(modes: Sequence[str]) -> list[torch.device]:
 def _resolve_processed_dir(ckpt: Dict[str, Any]) -> Path:
     """Resolve the processed directory, defaulting to the checkpoint's dataset."""
     if PROCESSED_DIR is not None:
-        resolved = PROCESSED_DIR.resolve()
+        processed_dir_path = Path(PROCESSED_DIR)
     else:
-        source_config_path = ckpt.get("source_config_path")
         resolved_config = ckpt.get("resolved_config")
-        if not isinstance(source_config_path, str) or not isinstance(resolved_config, dict):
+        if not isinstance(resolved_config, dict):
             raise ValueError(
-                "Checkpoint is missing source config metadata; set PROCESSED_DIR explicitly"
+                "Checkpoint is missing resolved config metadata; set PROCESSED_DIR explicitly"
             )
         paths_cfg = resolved_config.get("paths")
         if not isinstance(paths_cfg, dict):
@@ -155,9 +167,12 @@ def _resolve_processed_dir(ckpt: Dict[str, Any]) -> Path:
             raise ValueError(
                 "Checkpoint is missing paths.processed_dir; set PROCESSED_DIR explicitly"
             )
-        resolved = resolve_path(Path(source_config_path), processed_dir_value)
+        processed_dir_path = Path(processed_dir_value)
+    resolved = _resolve_repo_path(processed_dir_path)
     if not resolved.is_dir():
-        raise FileNotFoundError(f"Processed directory not found: {resolved}")
+        raise FileNotFoundError(
+            f"Processed directory not found: {_display_repo_path(processed_dir_path)}"
+        )
     return resolved
 
 
@@ -165,7 +180,7 @@ def _load_test_split_entries(processed_dir: Path) -> list[dict[str, Any]]:
     """Return held-out processed shard entries from the test split."""
     meta_path = (processed_dir / "processed_meta.json").resolve()
     if not meta_path.is_file():
-        raise FileNotFoundError(f"Processed metadata not found: {meta_path}")
+        raise FileNotFoundError(f"Processed metadata not found: {_display_repo_path(meta_path)}")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     split_entries = list(meta["splits"]["test"])
     if not split_entries:
@@ -200,7 +215,7 @@ def _load_direct_jump_batch(
     shard_name = str(shard_entry["file"])
     shard_path = (processed_dir / shard_name).resolve()
     if not shard_path.is_file():
-        raise FileNotFoundError(f"Processed shard not found: {shard_path}")
+        raise FileNotFoundError(f"Processed shard not found: {_display_repo_path(shard_path)}")
 
     meta_path = (processed_dir / "processed_meta.json").resolve()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -215,10 +230,14 @@ def _load_direct_jump_batch(
         transition_time_stats=stats.transition_time,
         device=torch.device("cpu"),
     )
+    pair_budget = max(
+        int(max_batch_size),
+        int(meta["sampling"].get("live_pairs_per_sequence", 1)),
+    )
     pair_table = _sample_live_pair_table(
         split=split,
         catalog=catalog,
-        live_pairs_per_sequence=int(meta["sampling"]["live_pairs_per_sequence"]),
+        live_pairs_per_sequence=pair_budget,
         seed=300_000,
         shuffle_pairs=False,
     )
@@ -288,7 +307,7 @@ def _benchmark_batch_size(
 def _apply_plot_style() -> None:
     """Load the shared plotting style."""
     if not STYLE_PATH.is_file():
-        raise FileNotFoundError(f"Plot style not found: {STYLE_PATH}")
+        raise FileNotFoundError(f"Plot style not found: {_display_repo_path(STYLE_PATH)}")
     plt.style.use(str(STYLE_PATH))
     plt.rcParams["savefig.dpi"] = int(FIGURE_DPI)
 
@@ -352,12 +371,12 @@ def main() -> None:
     ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
     figure_path = (
-        FIGURE_PATH.resolve()
+        _resolve_repo_path(FIGURE_PATH)
         if FIGURE_PATH is not None
         else (run_dir / "plots" / FIGURE_NAME).resolve()
     )
     csv_path = (
-        CSV_PATH.resolve()
+        _resolve_repo_path(CSV_PATH)
         if CSV_PATH is not None
         else (run_dir / "plots" / CSV_NAME).resolve()
     )
@@ -374,9 +393,6 @@ def main() -> None:
 
     model_cfg = _dict_to_namespace(ckpt["model_config"])
     shape = dict(ckpt["shape"])
-    geometry = dict(ckpt.get("geometry", {}))
-    state_fields = list(ckpt["state_fields"])
-    residual_input_indices = list(range(len(state_fields)))
     devices = _resolve_devices(DEVICE_MODES)
 
     rows: list[Dict[str, Any]] = []
@@ -386,10 +402,7 @@ def main() -> None:
             input_state_chans=int(shape["C"]),
             target_state_chans=int(shape["C"]),
             param_dim=int(len(ckpt["conditioning_names"])),
-            residual_input_indices=residual_input_indices,
             cfg_model=model_cfg,
-            lat_order=str(geometry.get("lat_order", "north_to_south")),
-                lon_origin=str(geometry.get("lon_origin", "0_to_2pi")),
         )
         model.load_state_dict(ckpt["model_state"], strict=True)
         model.to(device=device).eval()
@@ -415,8 +428,8 @@ def main() -> None:
 
     _write_results_csv(rows=rows, csv_path=csv_path)
     _save_figure(rows=rows, out_path=figure_path)
-    print(f"Saved direct-jump latency CSV: {csv_path}")
-    print(f"Saved direct-jump latency figure: {figure_path}")
+    print(f"Saved direct-jump latency CSV: {_display_repo_path(csv_path)}")
+    print(f"Saved direct-jump latency figure: {_display_repo_path(figure_path)}")
 
 
 if __name__ == "__main__":

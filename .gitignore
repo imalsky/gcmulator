@@ -238,6 +238,7 @@ plots/
 *.parquet
 *.feather
 *.arrow
+*.zip
 
 # Model files/checkpoints
 *.pt

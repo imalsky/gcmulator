@@ -76,7 +76,6 @@ def _minimal_config_dict() -> dict[str, object]:
             "normalization_layer": "instance_norm",
             "hard_thresholding_fraction": 1.0,
             "residual_prediction": True,
-            "residual_init_scale": 1.0e-2,
             "pos_embed": "spectral",
             "bias": False,
         },
@@ -170,6 +169,18 @@ def test_load_config_rejects_removed_coord_channel_flag(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_load_config_rejects_removed_residual_init_scale(tmp_path: Path) -> None:
+    """The scaled residual knob should no longer be part of the public config."""
+    payload = _minimal_config_dict()
+    model_section = dict(payload["model"])
+    model_section["residual_init_scale"] = 1.0
+    payload["model"] = model_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_config(config_path)
+
+
 def test_load_config_defaults_to_plateau_with_relative_min_lr(tmp_path: Path) -> None:
     """Default scheduler settings should resolve from the configured start LR."""
     payload = _minimal_config_dict()
@@ -205,6 +216,58 @@ def test_load_config_rejects_legacy_pair_sampling_keys(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_load_config_accepts_channel_loss_weights(tmp_path: Path) -> None:
+    """Explicit per-channel loss weights should parse in canonical field order."""
+    payload = _minimal_config_dict()
+    training_section = dict(payload["training"])
+    training_section["channel_loss_weights"] = {
+        "Phi": 1.0,
+        "eta": 2.0,
+        "delta": 3.0,
+    }
+    payload["training"] = training_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    assert cfg.training.channel_loss_weights == {
+        "Phi": pytest.approx(1.0),
+        "eta": pytest.approx(2.0),
+        "delta": pytest.approx(3.0),
+    }
+
+
+def test_load_config_rejects_partial_channel_loss_weights(tmp_path: Path) -> None:
+    """Per-channel weights must be explicit for all prognostic fields."""
+    payload = _minimal_config_dict()
+    training_section = dict(payload["training"])
+    training_section["channel_loss_weights"] = {
+        "Phi": 1.0,
+        "eta": 2.0,
+    }
+    payload["training"] = training_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="channel_loss_weights"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_nonpositive_channel_loss_weights(tmp_path: Path) -> None:
+    """Per-channel loss weights must stay finite and positive."""
+    payload = _minimal_config_dict()
+    training_section = dict(payload["training"])
+    training_section["channel_loss_weights"] = {
+        "Phi": 1.0,
+        "eta": 0.0,
+        "delta": 3.0,
+    }
+    payload["training"] = training_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="channel_loss_weights"):
+        load_config(config_path)
+
+
 def test_load_config_requires_batch_size_divisible_by_live_pairs(tmp_path: Path) -> None:
     """The effective pair batch must decompose into whole sequences."""
     payload = _minimal_config_dict()
@@ -215,3 +278,57 @@ def test_load_config_requires_batch_size_divisible_by_live_pairs(tmp_path: Path)
     config_path = _write_config(tmp_path, payload)
     with pytest.raises(ValueError, match="batch_size"):
         load_config(config_path)
+
+
+def test_load_config_derives_saved_interval_from_snapshot_count(tmp_path: Path) -> None:
+    """Snapshot-count configs should resolve to the matching saved cadence."""
+    payload = _minimal_config_dict()
+    sampling_section = dict(payload["sampling"])
+    sampling_section.pop("saved_checkpoint_interval_days")
+    sampling_section["saved_snapshots_per_sim"] = 9
+    sampling_section["pairs_per_sim"] = 7
+    sampling_section["pair_sampling_policy"] = "uniform_pairs"
+    payload["sampling"] = sampling_section
+
+    training_section = dict(payload["training"])
+    training_section["pair_iteration_mode"] = "resample_from_saved_sequences"
+    training_section["preload_to_gpu"] = True
+    payload["training"] = training_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    expected_interval_days = 2.0 * (240.0 / 86400.0)
+    assert cfg.sampling.saved_snapshots_per_sim == 9
+    assert cfg.sampling.saved_checkpoint_interval_days == pytest.approx(expected_interval_days)
+    assert cfg.sampling.pairs_per_sim == 7
+    assert cfg.sampling.pair_sampling_policy == "uniform_pairs"
+    assert cfg.training.pair_iteration_mode == "resample_from_saved_sequences"
+    assert cfg.training.preload_to_gpu is True
+
+
+def test_load_config_rejects_saved_interval_and_snapshot_count_together(tmp_path: Path) -> None:
+    """Users must choose either an interval cadence or a snapshot count."""
+    payload = _minimal_config_dict()
+    sampling_section = dict(payload["sampling"])
+    sampling_section["saved_snapshots_per_sim"] = 9
+    payload["sampling"] = sampling_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        load_config(config_path)
+
+
+def test_load_config_allows_preload_to_gpu_for_resampled_mode(tmp_path: Path) -> None:
+    """Resampled mode may preload full sequence splits when VRAM is sufficient."""
+    payload = _minimal_config_dict()
+    training_section = dict(payload["training"])
+    training_section["pair_iteration_mode"] = "resample_from_saved_sequences"
+    training_section["preload_to_gpu"] = True
+    payload["training"] = training_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    assert cfg.training.pair_iteration_mode == "resample_from_saved_sequences"
+    assert cfg.training.preload_to_gpu is True

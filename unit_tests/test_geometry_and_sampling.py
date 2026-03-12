@@ -11,6 +11,7 @@ from gcmulator.sampling import (
     build_uniform_checkpoint_schedule,
     sample_parameter_dict,
     to_extended9,
+    valid_anchor_counts_for_catalog,
 )
 
 
@@ -73,6 +74,22 @@ def test_uniform_checkpoint_schedule_maps_to_solver_grid() -> None:
     )
 
 
+def test_uniform_checkpoint_schedule_supports_snapshot_count() -> None:
+    """Snapshot-count scheduling should derive the exact saved cadence."""
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=100.0,
+        dt_seconds=120.0,
+        saved_snapshots_per_sim=1000,
+    )
+
+    assert schedule.interval_steps == 72
+    assert schedule.interval_days == np.float64(0.1)
+    assert schedule.checkpoint_steps.shape == (1001,)
+    assert schedule.checkpoint_days.shape == (1001,)
+    assert schedule.checkpoint_days[0] == np.float64(0.0)
+    assert schedule.checkpoint_days[-1] == np.float64(100.0)
+
+
 def test_fixed_live_transition_catalog_picks_exact_gap() -> None:
     """A fixed live jump should resolve to the nearest feasible checkpoint gap."""
     step_days = 240.0 / 86400.0
@@ -117,3 +134,47 @@ def test_variable_live_transition_catalog_stays_within_saved_gaps() -> None:
     assert np.isclose(np.sum(catalog.probabilities), 1.0)
     assert catalog.burn_in_start_index == 1
     assert catalog.probabilities[0] > catalog.probabilities[-1]
+
+
+def test_uniform_gap_policy_uses_flat_catalog_weights() -> None:
+    """Uniform-gap mode should not retain the inverse-time short-gap bias."""
+    step_days = 240.0 / 86400.0
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=0.05,
+        dt_seconds=240.0,
+        saved_checkpoint_interval_days=2.0 * step_days,
+    )
+    catalog = build_live_transition_catalog(
+        checkpoint_days=schedule.checkpoint_days,
+        burn_in_days=2.0 * step_days,
+        transition_days_min=4.0 * step_days,
+        transition_days_max=10.0 * step_days,
+        tolerance_fraction=0.1,
+        pair_sampling_policy="uniform_gaps",
+    )
+
+    assert np.allclose(catalog.probabilities, np.full((4,), 0.25, dtype=np.float64))
+
+
+def test_valid_anchor_counts_follow_burn_in_and_gap_offsets() -> None:
+    """Per-gap anchor counts should respect both burn-in and target reachability."""
+    step_days = 240.0 / 86400.0
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=0.05,
+        dt_seconds=240.0,
+        saved_checkpoint_interval_days=2.0 * step_days,
+    )
+    catalog = build_live_transition_catalog(
+        checkpoint_days=schedule.checkpoint_days,
+        burn_in_days=2.0 * step_days,
+        transition_days_min=4.0 * step_days,
+        transition_days_max=10.0 * step_days,
+        tolerance_fraction=0.1,
+    )
+
+    counts = valid_anchor_counts_for_catalog(
+        sequence_length=int(schedule.checkpoint_days.shape[0]),
+        catalog=catalog,
+    )
+
+    assert np.array_equal(counts, np.array([7, 6, 5, 4], dtype=np.int64))

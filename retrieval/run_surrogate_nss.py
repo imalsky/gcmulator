@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import os
 from pathlib import Path
 
 from surrogate_backend import (
@@ -32,7 +33,7 @@ class RetrievalRunConfig:
     # the export bundle directly.
     checkpoint_path: Path | None = None
     export_path: Path | None = None
-    report_path: Path = (PROJECT_ROOT / "retrieval" / "artifact_readiness.json")
+    report_path: Path = Path("retrieval") / "artifact_readiness.json"
     model_days: float = 100.0
 
     # Smoke-test the batched Torch runtime after the contract check succeeds.
@@ -46,25 +47,38 @@ class RetrievalRunConfig:
 CONFIG = RetrievalRunConfig()
 
 
+def _resolve_repo_path(path: Path) -> Path:
+    """Resolve repository-relative paths from the project root."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (PROJECT_ROOT / candidate).resolve()
+
+
+def _display_repo_path(path: Path) -> str:
+    """Return a repository-relative path string for JSON reports and logs."""
+    return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
+
+
 def _resolve_artifact_paths(config: RetrievalRunConfig) -> tuple[Path, Path | None]:
     """Resolve export/checkpoint paths from the config block."""
     if config.export_path is None:
-        run_dir = (PROJECT_ROOT / "models" / str(config.run_name)).resolve()
+        run_dir = _resolve_repo_path(Path("models") / str(config.run_name))
         export_path = (run_dir / "model_export.torchscript.pt").resolve()
     else:
-        export_path = Path(config.export_path).resolve()
+        export_path = _resolve_repo_path(config.export_path)
     if config.checkpoint_path is None:
         if config.export_path is None:
-            candidate_checkpoint = (
-                PROJECT_ROOT / "models" / str(config.run_name) / "best.pt"
-            ).resolve()
+            candidate_checkpoint = _resolve_repo_path(
+                Path("models") / str(config.run_name) / "best.pt"
+            )
             checkpoint_path = (
                 candidate_checkpoint if candidate_checkpoint.is_file() else None
             )
         else:
             checkpoint_path = None
     else:
-        checkpoint_path = Path(config.checkpoint_path).resolve()
+        checkpoint_path = _resolve_repo_path(config.checkpoint_path)
     return export_path, checkpoint_path
 
 
@@ -77,15 +91,15 @@ def _write_report(report_path: Path, payload: dict[str, object]) -> None:
 def main() -> None:
     """Write a contract report and optionally benchmark a valid Torch runtime."""
     export_path, checkpoint_path = _resolve_artifact_paths(CONFIG)
-    report_path = Path(CONFIG.report_path).resolve()
+    report_path = _resolve_repo_path(CONFIG.report_path)
     base_report: dict[str, object] = {
         "config": {
             **asdict(CONFIG),
             "checkpoint_path": (
-                None if checkpoint_path is None else str(checkpoint_path)
+                None if checkpoint_path is None else _display_repo_path(checkpoint_path)
             ),
-            "export_path": str(export_path),
-            "report_path": str(report_path),
+            "export_path": _display_repo_path(export_path),
+            "report_path": _display_repo_path(report_path),
         }
     }
     try:
@@ -132,7 +146,7 @@ def main() -> None:
             "The current surrogate artifact is not runnable in the direct-jump Torch "
             "retrieval backend.\n"
             f"{joined}\n"
-            f"Read {report_path} for the exact blocker list."
+            f"Read {_display_repo_path(report_path)} for the exact blocker list."
         )
 
 

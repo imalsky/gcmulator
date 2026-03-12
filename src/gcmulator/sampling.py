@@ -138,24 +138,44 @@ def build_uniform_checkpoint_schedule(
     *,
     time_days: float,
     dt_seconds: float,
-    saved_checkpoint_interval_days: float,
+    saved_checkpoint_interval_days: float | None = None,
+    saved_snapshots_per_sim: int | None = None,
 ) -> CheckpointSchedule:
     """Resolve a uniform checkpoint cadence onto the discrete solver grid."""
     if time_days <= 0:
         raise ValueError("time_days must be > 0")
     if dt_seconds <= 0:
         raise ValueError("dt_seconds must be > 0")
-    if saved_checkpoint_interval_days <= 0:
-        raise ValueError("saved_checkpoint_interval_days must be > 0")
+    if (saved_checkpoint_interval_days is None) == (saved_snapshots_per_sim is None):
+        raise ValueError(
+            "Provide exactly one of saved_checkpoint_interval_days or saved_snapshots_per_sim"
+        )
 
     n_steps_total = max(
         1,
         int(round(float(time_days) * SECONDS_PER_DAY / float(dt_seconds))),
     )
-    interval_steps = max(
-        1,
-        int(round(float(saved_checkpoint_interval_days) * SECONDS_PER_DAY / float(dt_seconds))),
-    )
+    if saved_snapshots_per_sim is not None:
+        if saved_snapshots_per_sim < 1:
+            raise ValueError("saved_snapshots_per_sim must be >= 1")
+        if int(saved_snapshots_per_sim) > int(n_steps_total):
+            raise ValueError(
+                "saved_snapshots_per_sim must be <= the total number of solver steps"
+            )
+        if int(n_steps_total) % int(saved_snapshots_per_sim) != 0:
+            raise ValueError(
+                "saved_snapshots_per_sim must divide the total number of solver steps "
+                f"exactly; total_steps={n_steps_total}, "
+                f"saved_snapshots_per_sim={saved_snapshots_per_sim}"
+            )
+        interval_steps = max(1, int(n_steps_total) // int(saved_snapshots_per_sim))
+    else:
+        if saved_checkpoint_interval_days is None or saved_checkpoint_interval_days <= 0:
+            raise ValueError("saved_checkpoint_interval_days must be > 0")
+        interval_steps = max(
+            1,
+            int(round(float(saved_checkpoint_interval_days) * SECONDS_PER_DAY / float(dt_seconds))),
+        )
     checkpoint_steps = np.arange(0, n_steps_total + 1, interval_steps, dtype=np.int64)
     checkpoint_days = checkpoint_steps.astype(np.float64) * float(dt_seconds) / SECONDS_PER_DAY
     return CheckpointSchedule(
@@ -173,6 +193,7 @@ def build_live_transition_catalog(
     transition_days_min: float,
     transition_days_max: float,
     tolerance_fraction: float,
+    pair_sampling_policy: str = "inverse_time",
 ) -> LiveTransitionCatalog:
     """Build the feasible discrete jump catalog induced by the saved cadence."""
     checkpoint_days = np.asarray(checkpoint_days, dtype=np.float64)
@@ -190,6 +211,11 @@ def build_live_transition_catalog(
         raise ValueError("transition_days_min must be <= transition_days_max")
     if tolerance_fraction < 0.0 or tolerance_fraction > 1.0:
         raise ValueError("tolerance_fraction must be in [0,1]")
+    if pair_sampling_policy not in {"uniform_pairs", "uniform_gaps", "inverse_time"}:
+        raise ValueError(
+            "pair_sampling_policy must be one of "
+            "['uniform_pairs','uniform_gaps','inverse_time']"
+        )
 
     burn_in_start_index = int(np.searchsorted(checkpoint_days, float(burn_in_days), side="left"))
     max_gap_offset = int(checkpoint_days.shape[0] - 1 - burn_in_start_index)
@@ -226,7 +252,10 @@ def build_live_transition_catalog(
             "No feasible discrete transition days fall within the requested live range"
         )
     transition_days = candidate_days[mask].astype(np.float64)
-    weights = (1.0 / np.maximum(transition_days, 1.0e-30)).astype(np.float64)
+    if pair_sampling_policy == "inverse_time":
+        weights = (1.0 / np.maximum(transition_days, 1.0e-30)).astype(np.float64)
+    else:
+        weights = np.ones_like(transition_days, dtype=np.float64)
     weights /= np.sum(weights)
     return LiveTransitionCatalog(
         gap_offsets=candidate_offsets[mask].astype(np.int64),
@@ -234,6 +263,21 @@ def build_live_transition_catalog(
         probabilities=weights,
         burn_in_start_index=int(burn_in_start_index),
     )
+
+
+def valid_anchor_counts_for_catalog(
+    *,
+    sequence_length: int,
+    catalog: LiveTransitionCatalog,
+) -> np.ndarray:
+    """Return the number of valid anchors for each catalog gap offset."""
+    if sequence_length < 2:
+        raise ValueError("sequence_length must be >= 2")
+    max_anchor = int(sequence_length) - 1 - catalog.gap_offsets.astype(np.int64)
+    counts = max_anchor - int(catalog.burn_in_start_index) + 1
+    if np.any(counts <= 0):
+        raise ValueError("Catalog produced one or more invalid anchor counts")
+    return counts.astype(np.int64)
 
 
 def weighted_log10_transition_stats(

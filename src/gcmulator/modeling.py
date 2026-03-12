@@ -46,18 +46,8 @@ def ensure_torch_harmonics_importable() -> None:
 
 
 def import_sfno() -> type[nn.Module]:
-    """Import the SFNO model class with a small cross-version compatibility shim."""
-    import torch_harmonics.examples.models.sfno as sfno_mod
-
-    # Some torch-harmonics builds reference DropPath from ``sfno.py`` without
-    # re-exporting it there. Patch the module once so downstream code can stay
-    # version-agnostic.
-    if not hasattr(sfno_mod, "DropPath"):
-        from torch_harmonics.examples.models._layers import DropPath
-
-        sfno_mod.DropPath = DropPath
-
-    SphericalFourierNeuralOperator = sfno_mod.SphericalFourierNeuralOperator
+    """Import the SFNO model class."""
+    from torch_harmonics.examples.models.sfno import SphericalFourierNeuralOperator
 
     return SphericalFourierNeuralOperator
 
@@ -167,7 +157,14 @@ def autocast_context(device: torch.device, amp_mode: str) -> Any:
 class SphereLoss(nn.Module):
     """Quadrature-weighted squared L2 over the sphere."""
 
-    def __init__(self, nlat: int, nlon: int, grid: str) -> None:
+    def __init__(
+        self,
+        nlat: int,
+        nlon: int,
+        grid: str,
+        *,
+        channel_weights: Sequence[float] | None = None,
+    ) -> None:
         """Precompute quadrature weights for the chosen spherical grid."""
         super().__init__()
         from torch_harmonics.examples.losses import get_quadrature_weights
@@ -180,9 +177,20 @@ class SphereLoss(nn.Module):
             normalized=True,
         )
         self.register_buffer("quad", weights.to(torch.float32))
+        if channel_weights is None:
+            self.register_buffer(
+                "channel_weights",
+                torch.empty((0,), dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "channel_weights",
+                torch.as_tensor(channel_weights, dtype=torch.float32),
+            )
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute quadrature-weighted MSE on the sphere."""
+    def per_channel_losses(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute one quadrature-weighted MSE scalar per channel."""
         if pred.shape != target.shape:
             raise ValueError(
                 f"shape mismatch pred={tuple(pred.shape)} "
@@ -192,9 +200,41 @@ class SphereLoss(nn.Module):
         if quad.ndim == 2:
             quad = quad[:, 0]
         quad = quad[None, None, :, None].to(device=pred.device, dtype=pred.dtype)
-        return (
-            (((pred - target) ** 2) * quad).sum(dim=(-2, -1))
-        ).mean()
+        return (((pred - target) ** 2) * quad).sum(dim=(-2, -1)).mean(dim=0)
+
+    def reduce_channel_losses(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
+        """Aggregate per-channel losses with an optional weighted mean."""
+        if per_channel_loss.ndim != 1:
+            raise ValueError(
+                f"per_channel_loss must be rank-1, got {tuple(per_channel_loss.shape)}"
+            )
+        if self.channel_weights.numel() == 0:
+            return per_channel_loss.mean()
+        if self.channel_weights.shape != per_channel_loss.shape:
+            raise ValueError(
+                "channel weight count must match the model output channels: "
+                f"weights={tuple(self.channel_weights.shape)}, "
+                f"channels={tuple(per_channel_loss.shape)}"
+            )
+        weights = self.channel_weights.to(
+            device=per_channel_loss.device,
+            dtype=per_channel_loss.dtype,
+        )
+        return torch.sum(per_channel_loss * weights) / torch.sum(weights)
+
+    def loss_with_channels(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the aggregate loss and the ordered per-channel loss vector."""
+        per_channel_loss = self.per_channel_losses(pred, target)
+        return self.reduce_channel_losses(per_channel_loss), per_channel_loss
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute quadrature-weighted MSE on the sphere."""
+        loss, _ = self.loss_with_channels(pred, target)
+        return loss
 
 
 class FiLMConditioner(nn.Module):
@@ -214,8 +254,8 @@ class FiLMConditioner(nn.Module):
         )
         last_layer = self.net[-1]
         if isinstance(last_layer, nn.Linear):
-            # Start from identity FiLM modulation so the residual path controls
-            # the initial behavior rather than arbitrary parameter scaling.
+            # Start from identity FiLM modulation so conditioning only changes
+            # behavior once the network learns a nonzero modulation.
             nn.init.constant_(last_layer.weight, 0.0)
             nn.init.constant_(last_layer.bias, 0.0)
 
@@ -240,13 +280,11 @@ class StateConditionedTransitionModel(nn.Module):
         param_dim: int,
         input_state_chans: int,
         target_state_chans: int,
-        residual_input_indices: Sequence[int],
         nlat: int,
         nlon: int,
         residual_prediction: bool,
-        residual_init_scale: float,
     ) -> None:
-        """Wrap the base SFNO with state/conditioning adapters and residual heads."""
+        """Wrap the base SFNO with state/conditioning adapters and an optional big skip."""
         super().__init__()
         self.base = base
         self.param_dim = int(param_dim)
@@ -255,22 +293,15 @@ class StateConditionedTransitionModel(nn.Module):
         self.nlat = int(nlat)
         self.nlon = int(nlon)
         self.residual_prediction = bool(residual_prediction)
+        if self.residual_prediction and self.input_state_chans != self.target_state_chans:
+            raise ValueError(
+                "Fixed residual_prediction requires identical input and target channels"
+            )
         self.conditioner = FiLMConditioner(
             param_dim=self.param_dim,
             embed_dim=int(getattr(base, "embed_dim")),
             num_sites=int(getattr(base, "num_layers")) + 1,
         )
-        self.register_buffer(
-            "residual_input_indices",
-            torch.tensor([int(index) for index in residual_input_indices], dtype=torch.int64),
-            persistent=False,
-        )
-
-        scale_init = torch.tensor(float(residual_init_scale), dtype=torch.float32)
-        if self.residual_prediction:
-            self.residual_scale = nn.Parameter(scale_init)
-        else:
-            self.register_buffer("residual_scale", scale_init, persistent=False)
 
     @staticmethod
     def _apply_film(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -312,12 +343,7 @@ class StateConditionedTransitionModel(nn.Module):
 
         if not self.residual_prediction:
             return output
-        residual = state0.index_select(
-            dim=1,
-            index=self.residual_input_indices.to(device=state0.device),
-        )
-        scale = self.residual_scale.to(device=output.device, dtype=output.dtype)
-        return residual + scale * output
+        return state0 + output
 
 
 def build_state_conditioned_transition_model(
@@ -326,7 +352,6 @@ def build_state_conditioned_transition_model(
     input_state_chans: int,
     target_state_chans: int,
     param_dim: int,
-    residual_input_indices: Sequence[int],
     cfg_model,
 ) -> StateConditionedTransitionModel:
     """Construct the configurable FiLM-conditioned SFNO transition model.
@@ -387,9 +412,7 @@ def build_state_conditioned_transition_model(
         param_dim=int(param_dim),
         input_state_chans=int(input_state_chans),
         target_state_chans=int(target_state_chans),
-        residual_input_indices=residual_input_indices,
         nlat=height,
         nlon=width,
         residual_prediction=bool(cfg_model.residual_prediction),
-        residual_init_scale=float(cfg_model.residual_init_scale),
     )

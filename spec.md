@@ -34,7 +34,7 @@ Default operator routine:
 1. Activate the environment:
    `conda activate nn`
 2. Work from the repository root:
-   `cd /Users/imalsky/Desktop/SWAMPE_Project/gcmulator`
+   `cd gcmulator`
 3. Install the local package into the active environment:
    `python -m pip install -e . --no-build-isolation`
 4. Confirm the required imports before debugging repository code:
@@ -76,10 +76,6 @@ Boundary checks are appropriate at:
 3. processed-metadata loading
 4. model input shape validation
 5. export/checkpoint loading
-
-Current code still contains a compatibility shim for the `torch_harmonics`
-import in `src/gcmulator/modeling.py`. This should not be treated as a pattern
-to extend.
 
 ### 2.2 No Fallback Contract
 The active contract is:
@@ -226,13 +222,19 @@ Definitions:
    Initial simulated duration excluded from live anchor sampling.
 4. `saved_checkpoint_interval_days`
    Physical spacing between stored solver checkpoints in one raw sequence.
-5. `live_transition_days_min`
+   This is always recorded in raw artifacts, even when the config specified
+   snapshot density through `saved_snapshots_per_sim`.
+5. `saved_snapshots_per_sim`
+   Optional count of non-initial saved checkpoints over
+   `(0, default_time_days]`. When provided, day `0` is still stored, so the
+   total sequence length is `saved_snapshots_per_sim + 1`.
+6. `live_transition_days_min`
    Minimum requested physical direct-jump horizon in days during live sampling.
-6. `live_transition_days_max`
+7. `live_transition_days_max`
    Maximum requested physical direct-jump horizon in days during live sampling.
-7. `transition_days`
+8. `transition_days`
    Physical duration of one live-sampled jump derived from saved checkpoint gaps.
-8. `starttime_index`
+9. `starttime_index`
    MY_SWAMP initial time index. The active config requires `>= 2`, matching the
    two-level solver initialization constraints enforced by the code.
 
@@ -250,9 +252,13 @@ The active contract supports both:
 Required semantics:
 1. raw files store uniformly spaced checkpoint sequences, not precomputed pairs
 2. preprocessing normalizes saved checkpoint states and stores one sequence per shard
-3. training samples direct-jump pairs live and appends normalized `log10_transition_days`
+3. training derives direct-jump pairs from saved sequences and appends normalized
+   `log10_transition_days`
 4. no stage silently collapses variable-jump data into a fixed-jump assumption
-5. live sampling preserves exact discrete `(anchor_checkpoint, target_checkpoint)` pairing
+5. `uniform_pairs` sampling means every feasible discrete
+   `(anchor_checkpoint, target_checkpoint)` pair inside the configured
+   day-valued range is equally likely
+6. validation and test pair selections are deterministic for a fixed seed
 
 ## 4. End-To-End Pipeline
 ### 4.1 CLI
@@ -290,17 +296,22 @@ Training performs preprocessing internally before optimization.
 `src/gcmulator/training.py::train_emulator`:
 1. loads processed metadata
 2. builds a discrete live-jump catalog from the saved checkpoint cadence
-3. preloads only one active split to GPU at a time and hard-fails if the split
-   cannot fit with 20% VRAM headroom
-4. builds the SFNO-based transition model
-5. trains with sphere-weighted loss on GPU-only live-sampled direct-jump pairs
-6. resamples training pairs every epoch with deterministic seeds and reuses
-   fixed validation/test live-pair tables
-7. saves `last.pt` and `best.pt`
-8. computes single-call direct-jump metrics for the validation and test splits
-9. writes `training_history.json`, `training_history.csv`,
+3. supports two pair-iteration modes:
+   `live_sampled_gpu` and `resample_from_saved_sequences`
+4. in `live_sampled_gpu`, preloads only one active split to GPU at a time and
+   hard-fails if the split cannot fit with 20% VRAM headroom
+5. in `resample_from_saved_sequences`, resamples exactly `pairs_per_sim` pairs
+   per sequence each train epoch and can gather them either from CPU shards or
+   from one GPU-preloaded active split
+6. builds the SFNO-based transition model
+7. trains with sphere-weighted loss on GPU direct-jump pairs
+8. resamples training pairs every epoch with deterministic seeds and reuses
+   fixed validation/test pair selections
+9. saves `last.pt` and `best.pt`
+10. computes single-call direct-jump metrics for the validation and test splits
+11. writes `training_history.json`, `training_history.csv`,
    `val_metrics.json`, and `test_metrics.json`
-10. does not implement emulator rollout evaluation or rollout artifacts
+12. does not implement emulator rollout evaluation or rollout artifacts
 
 ### 4.5 Export And Utilities
 The `extra/` scripts provide:
@@ -347,7 +358,9 @@ Each utility script has user-editable constants at the top (e.g. `RUN_NAME`,
 `CHECKPOINT_PATH`) that control which trained run is inspected. Edit those
 before running. If `PROCESSED_DIR` is left unset in `extra/predictions.py` or
 `extra/batch_size_benchmark.py`, the scripts resolve the processed dataset path
-from the checkpoint's stored `source_config_path` and `resolved_config`.
+from `resolved_config.paths.processed_dir`, interpreted relative to the
+repository root. They do not reconstruct dataset locations from the
+checkpoint's repository-relative `source_config_path`.
 
 ## 5. Torch-Harmonics Interface
 ### 5.1 Required APIs
@@ -366,7 +379,7 @@ Preferred baseline version:
 3. FiLM modulation from parameter conditioning
 4. SFNO positional embedding and block stack
 5. SFNO decoder
-6. optional residual prognostic head
+6. optional fixed 1:1 architectural skip from input state to output state
 
 The active wrapper class is:
 `StateConditionedTransitionModel`
@@ -388,10 +401,11 @@ This is a repository-specific compatibility fix, not a scientific feature.
 
 ### 5.5 Losses And Spectral Metrics
 `torch_harmonics` is used in two distinct ways:
-1. `get_quadrature_weights` for sphere-aware training loss
+1. `get_quadrature_weights` for sphere-aware training loss with ordered per-channel aggregation over `Phi`, `eta`, and `delta`
 2. `RealSHT` for true spherical power-spectrum evaluation
 
 No planar FFT surrogate is part of the contract for spherical spectral metrics.
+No spectral loss term is part of the training objective contract.
 
 ## 6. File Responsibilities
 ### 6.1 Repository Root
@@ -476,11 +490,12 @@ No planar FFT surrogate is part of the contract for spherical spectral metrics.
 ## 7. Config Contract And Variable Definitions
 ### 7.1 `paths`
 1. `dataset_dir`
-   Raw simulation directory.
+   Raw simulation directory, expressed relative to the repository root.
 2. `processed_dir`
-   Processed shard directory.
+   Processed shard directory, expressed relative to the repository root.
 3. `model_dir`
-   Run artifact directory for checkpoints and metrics.
+   Run artifact directory for checkpoints and metrics, expressed relative to
+   the repository root.
 4. `overwrite_dataset`
    Whether generation may delete existing raw files before writing new ones.
 
@@ -526,16 +541,28 @@ Internal MY_SWAMP geometry terms derived from `M`:
 4. `burn_in_days`
    Initial saved-checkpoint duration excluded from live anchor sampling.
 5. `saved_checkpoint_interval_days`
-   Physical cadence used when storing solver checkpoints.
-6. `live_pairs_per_sequence`
-   Number of live-sampled training pairs emitted per stored sequence per epoch.
-7. `live_transition_days_min`
+   Physical cadence used when storing solver checkpoints. Mutually exclusive
+   with `saved_snapshots_per_sim`.
+6. `saved_snapshots_per_sim`
+   Optional count of nonzero saved times over `(0, default_time_days]`.
+   Day `0` is always stored too, so the resulting sequence length is
+   `saved_snapshots_per_sim + 1`.
+7. `live_pairs_per_sequence`
+   Number of per-sequence pairs used only by `training.pair_iteration_mode =
+   "live_sampled_gpu"`.
+8. `pairs_per_sim`
+   Number of per-sequence pairs sampled in
+   `training.pair_iteration_mode = "resample_from_saved_sequences"`.
+9. `pair_sampling_policy`
+   Pair sampling rule. Supported values:
+   `uniform_pairs`, `uniform_gaps`, `inverse_time`.
+10. `live_transition_days_min`
    Minimum or fixed physical jump duration in days for live sampling.
-8. `live_transition_days_max`
+11. `live_transition_days_max`
    Optional maximum physical jump duration in days for variable-jump training.
-9. `live_transition_tolerance_fraction`
+12. `live_transition_tolerance_fraction`
    Relative tolerance used when a requested fixed jump must be matched to the nearest feasible saved gap.
-10. `parameters`
+13. `parameters`
    List of per-parameter sampling rules.
 
 Config examples:
@@ -562,12 +589,29 @@ Variable direct-jump training:
 }
 ```
 
+Dense saved snapshots with CPU-side pair resampling:
+```json
+"sampling": {
+  "saved_snapshots_per_sim": 1000,
+  "pairs_per_sim": 512,
+  "pair_sampling_policy": "uniform_pairs",
+  "live_transition_days_min": 0.1,
+  "live_transition_days_max": 0.1,
+  "live_transition_tolerance_fraction": 0.1
+}
+```
+
 Interpretation:
 1. `dt_seconds` remains the fixed MY_SWAMP solver step
 2. the sampled direct-jump horizon varies over the inclusive physical-day range
    `[live_transition_days_min, live_transition_days_max]`
 3. the learned conditioning feature is the corresponding normalized
    `log10_transition_days`
+4. `saved_snapshots_per_sim` and `saved_checkpoint_interval_days` are mutually
+   exclusive config inputs, but all artifacts still record the resolved
+   `saved_checkpoint_interval_days`
+5. `uniform_pairs` is exact over the discrete candidate pair set induced by the
+   saved checkpoint cadence and burn-in window
 
 Supported sampling distributions:
 1. `uniform`
@@ -620,12 +664,10 @@ Parameter normalization keys:
 13. `hard_thresholding_fraction`
     Spectral thresholding fraction.
 14. `residual_prediction`
-    Whether to predict residual updates on target channels.
-15. `residual_init_scale`
-    Initial learned residual scale.
-16. `pos_embed`
+    Whether to enable the fixed 1:1 architectural skip from the input state.
+15. `pos_embed`
     Positional embedding mode used by SFNO.
-17. `bias`
+16. `bias`
     Whether pointwise layers use bias.
 
 ### 7.7 `training`
@@ -641,26 +683,32 @@ Parameter normalization keys:
 5. `epochs`
    Number of training epochs.
 6. `batch_size`
-   Effective live-pair batch size per optimizer step.
+   Effective direct-jump pair batch size per optimizer step.
 7. `num_workers`
-   Must be `0` in the active live-sampling path.
+   Must be `0` in both active training modes.
 8. `shuffle`
-   Whether to shuffle the epoch-level live pair table for the training split.
+   Whether to shuffle the train split pair order each epoch.
 9. `preload_to_gpu`
-   Must be `true`; the active path requires GPU-resident sequence splits.
-10. `learning_rate`
+   Whether one active split is materialized on GPU. Required for
+   `live_sampled_gpu`. Optional for `resample_from_saved_sequences`.
+10. `pair_iteration_mode`
+   One of `live_sampled_gpu` or `resample_from_saved_sequences`.
+11. `learning_rate`
    Base optimizer learning rate.
-11. `weight_decay`
+12. `weight_decay`
    AdamW weight decay.
-12. `grad_clip_norm`
+13. `channel_loss_weights`
+   Optional explicit per-channel training-loss weights keyed by
+   `Phi`, `eta`, and `delta`.
+14. `grad_clip_norm`
    Maximum gradient norm for gradient clipping. Default is `1.0`.
-13. `val_fraction`
+15. `val_fraction`
    File-level validation split fraction.
-14. `test_fraction`
+16. `test_fraction`
    File-level test split fraction.
-15. `split_seed`
+17. `split_seed`
    Train/val/test split seed.
-16. `scheduler`
+18. `scheduler`
    Scheduler configuration block.
 
 Scheduler keys:
@@ -687,16 +735,23 @@ Active default scheduler behavior:
 
 Active runtime behavior:
 1. `preload_to_gpu=true` requires CUDA and forces `num_workers=0`
-2. `batch_size` must be divisible by `sampling.live_pairs_per_sequence`
-3. `sequence_batch_size = batch_size / live_pairs_per_sequence`
-4. the active default is `deterministic=false`, favoring throughput
-5. `deterministic=true` enables deterministic algorithms and disables cuDNN
+2. `training.pair_iteration_mode='live_sampled_gpu'` requires
+   `preload_to_gpu=true`
+3. in `live_sampled_gpu`, `batch_size` must be divisible by
+   `sampling.live_pairs_per_sequence`
+4. in `live_sampled_gpu`,
+   `sequence_batch_size = batch_size / live_pairs_per_sequence`
+5. `training.pair_iteration_mode='resample_from_saved_sequences'` requires
+   `num_workers=0`; `preload_to_gpu` may be either `true` or `false`
+6. when `resample_from_saved_sequences` and `preload_to_gpu=true`, one active
+   split is loaded to GPU and batches are gathered from that resident split
+7. the active default is `deterministic=false`, favoring throughput
+8. `deterministic=true` enables deterministic algorithms and disables cuDNN
    benchmark mode, favoring reproducibility over throughput
-6. the active path does not use PyTorch dataloaders; it gathers live-sampled
-   pairs directly from GPU-resident sequence tensors
-7. the first-line throughput knobs are `batch_size`,
-   `sampling.live_pairs_per_sequence`, `saved_checkpoint_interval_days`,
-   `preload_to_gpu`, `amp_mode`, and `deterministic=false`
+9. neither active path uses PyTorch dataloaders
+10. the first-line throughput knobs are `batch_size`, saved checkpoint density,
+   `pairs_per_sim` or `live_pairs_per_sequence`, `preload_to_gpu`, `amp_mode`,
+   and `deterministic=false`
 
 ### 7.8 Common Artifact Variable Names
 These names recur across raw files, processed metadata, checkpoints, and code:
@@ -819,6 +874,9 @@ Each `items[]` entry includes:
 19. `lon_shift`
 
 The manifest is descriptive only. Training reads raw `.npy` files directly.
+When `saved_snapshots_per_sim` was used in config, the manifest still records
+the resolved `saved_checkpoint_interval_days` plus the original
+`sampling.saved_snapshots_per_sim` value inside the top-level `sampling` block.
 
 ### 8.3 Processed Shard Contract
 Processed data is written as one `.npz` shard per raw simulation file.
@@ -869,6 +927,9 @@ Important exact semantics:
 5. `geometry` currently stores:
    `flip_latitude_to_north_south`, `roll_longitude_to_0_2pi`, `lat_order`,
    and `lon_origin`
+6. `sampling` stores the full resolved generation/training sampling config,
+   including `saved_snapshots_per_sim`, `pairs_per_sim`, and
+   `pair_sampling_policy`
 
 ### 8.5 Normalization Metadata Contract
 Normalization JSON includes:
@@ -922,6 +983,9 @@ The transition-time block contains the same fields, with
 
 These fields are part of the practical artifact contract because downstream
 tools in `extra/` read them directly.
+For path recovery, the active `extra/` utilities treat
+`resolved_config.paths.processed_dir` as repository-relative and use
+`source_config_path` for repository-relative provenance only.
 
 ### 8.7 Training Output Contract
 Training writes at least:
@@ -973,6 +1037,9 @@ The export metadata contains:
 15. `sampling`
 16. `normalization`
 17. `verification`
+
+The path-valued metadata fields (`checkpoint_path`, `export_path`) are stored
+relative to the repository root rather than as absolute filesystem paths.
 
 Active exact semantics:
 1. `artifact_kind` must be `direct_jump_physical_state_transition`

@@ -16,8 +16,9 @@ The current training and export methodology is:
 1. raw data stores uniformly spaced physical checkpoint sequences
 2. processed splits store normalized checkpoint sequences, not precomputed
    `(anchor, target)` pairs
-3. training samples direct-jump pairs live from those saved checkpoints and
-   conditions on `log10_transition_days`
+3. training derives direct-jump pairs from those saved checkpoints, either by
+   live GPU sampling or by CPU-side per-epoch resampling from stored sequences,
+   and conditions on `log10_transition_days`
 4. the export accepts physical `state0`, physical `params`, and physical
    `transition_days`
 5. the export normalizes those inputs internally and returns physical `state1`
@@ -41,10 +42,10 @@ following:
 
 ## Files
 
-- [`surrogate_backend.py`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/retrieval/surrogate_backend.py)
+- [`surrogate_backend.py`](surrogate_backend.py)
   inspects the export bundle and provides `TorchSurrogateRuntime`, a batched
   inference wrapper for valid direct-jump artifacts.
-- [`run_surrogate_nss.py`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/retrieval/run_surrogate_nss.py)
+- [`run_surrogate_nss.py`](run_surrogate_nss.py)
   exposes a small config block at the top, writes a JSON readiness report, and
   can benchmark the optimized runtime on representative inputs.
 
@@ -74,13 +75,13 @@ For throughput, the runtime:
 
 Those settings live in `SurrogateRuntimeConfig`, which sits inside the config
 block near the top of
-[`run_surrogate_nss.py`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/retrieval/run_surrogate_nss.py).
+[`run_surrogate_nss.py`](run_surrogate_nss.py).
 
 ## Practical Use
 
 1. Export a fresh model with
-   [`pytorch_export.py`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/extra/pytorch_export.py).
+   [`pytorch_export.py`](../extra/pytorch_export.py).
 2. Edit the config block at the top of
-   [`run_surrogate_nss.py`](/Users/imalsky/Desktop/SWAMPE_Project/gcmulator/retrieval/run_surrogate_nss.py).
+   [`run_surrogate_nss.py`](run_surrogate_nss.py).
 3. Pick `runtime.device_mode = "cpu"` or `"gpu"`.
 4. Run the script to write the readiness report and optional smoke benchmark.

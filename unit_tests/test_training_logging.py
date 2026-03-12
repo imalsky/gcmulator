@@ -26,6 +26,12 @@ def test_write_training_history_csv_formats_metric_columns_scientifically(
                 "epoch": 3.0,
                 "train_loss": 1.23456e-3,
                 "val_loss": 9.87654e-4,
+                "train_loss_phi": 2.5e-3,
+                "train_loss_eta": 3.5e-3,
+                "train_loss_delta": 4.5e-3,
+                "val_loss_phi": 5.5e-3,
+                "val_loss_eta": 6.5e-3,
+                "val_loss_delta": 7.5e-3,
                 "lr": 3.0e-4,
                 "train_seconds": 12.3456,
                 "val_seconds": 2.5,
@@ -47,6 +53,12 @@ def test_write_training_history_csv_formats_metric_columns_scientifically(
     assert row["epoch"] == "3"
     assert row["train_loss"] == "1.235e-03"
     assert row["val_loss"] == "9.877e-04"
+    assert row["train_loss_phi"] == "2.500e-03"
+    assert row["train_loss_eta"] == "3.500e-03"
+    assert row["train_loss_delta"] == "4.500e-03"
+    assert row["val_loss_phi"] == "5.500e-03"
+    assert row["val_loss_eta"] == "6.500e-03"
+    assert row["val_loss_delta"] == "7.500e-03"
     assert row["lr"] == "3.000e-04"
     assert row["train_seconds"] == "1.235e+01"
     assert row["val_seconds"] == "2.500e+00"

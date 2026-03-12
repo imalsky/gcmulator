@@ -34,14 +34,25 @@ GPU_BACKENDS = {"gpu", "cuda", "rocm", "metal"}
 
 
 def _list_existing_raw_files(dataset_dir: Path) -> List[Path]:
-    """Return all raw simulation files, including unsupported legacy leftovers."""
-    return sorted(
-        list(dataset_dir.glob("sim_*.npy")) + list(dataset_dir.glob("sim_*.npz"))
-    )
+    """Return generated raw simulation files written by the active contract."""
+    return sorted(dataset_dir.glob("sim_*.npy"))
+
+
+def _list_legacy_raw_files(dataset_dir: Path) -> List[Path]:
+    """Return unsupported legacy raw files that should fail fast."""
+    return sorted(dataset_dir.glob("sim_*.npz"))
 
 
 def _clear_dataset_dir(dataset_dir: Path) -> None:
     """Remove existing generated simulation files and manifest."""
+    legacy = _list_legacy_raw_files(dataset_dir)
+    if legacy:
+        raise RuntimeError(
+            "Unsupported legacy raw files were found in the dataset directory. "
+            "Remove "
+            f"{len(legacy)} sim_*.npz files before regenerating the dataset: "
+            f"{dataset_dir}"
+        )
     for path in _list_existing_raw_files(dataset_dir):
         path.unlink()
     manifest = dataset_dir / "manifest.json"
@@ -187,10 +198,16 @@ def _resolve_generation_batch_size(
 
 def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
     """Generate the raw checkpoint-sequence dataset using MY_SWAMP as the source of truth."""
-    ensure_my_swamp_importable(config_path.parent)
-
     dataset_dir = resolve_path(config_path, cfg.paths.dataset_dir)
     dataset_dir.mkdir(parents=True, exist_ok=True)
+    legacy = _list_legacy_raw_files(dataset_dir)
+    if legacy:
+        raise RuntimeError(
+            "Unsupported legacy raw files were found in the dataset directory. "
+            "Remove "
+            f"{len(legacy)} sim_*.npz files before generating a new dataset: "
+            f"{dataset_dir}"
+        )
     if cfg.paths.overwrite_dataset:
         _clear_dataset_dir(dataset_dir)
     else:
@@ -198,9 +215,11 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         if existing:
             raise FileExistsError(
                 "Dataset directory already contains raw simulation files "
-                f"({len(existing)} .npy/.npz files) and overwrite_dataset=false: "
+                f"({len(existing)} sim_*.npy files) and overwrite_dataset=false: "
                 f"{dataset_dir}"
             )
+
+    ensure_my_swamp_importable(config_path.parent)
 
     n_sims = int(cfg.sampling.n_sims)
     rng = np.random.default_rng(int(cfg.sampling.seed))
@@ -208,6 +227,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         time_days=float(cfg.solver.default_time_days),
         dt_seconds=float(cfg.solver.dt_seconds),
         saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+        saved_snapshots_per_sim=cfg.sampling.saved_snapshots_per_sim,
     )
 
     jax_backend = detect_jax_backend()
@@ -327,7 +347,14 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             "resolved_generation_batch_size": int(generation_batch_size),
             "burn_in_days": float(cfg.sampling.burn_in_days),
             "saved_checkpoint_interval_days": float(checkpoint_schedule.interval_days),
+            "saved_snapshots_per_sim": (
+                None
+                if cfg.sampling.saved_snapshots_per_sim is None
+                else int(cfg.sampling.saved_snapshots_per_sim)
+            ),
             "live_pairs_per_sequence": int(cfg.sampling.live_pairs_per_sequence),
+            "pairs_per_sim": int(cfg.sampling.pairs_per_sim),
+            "pair_sampling_policy": str(cfg.sampling.pair_sampling_policy),
             "live_transition_days_min": float(cfg.sampling.live_transition_days_min),
             "live_transition_days_max": float(cfg.sampling.live_transition_days_max),
             "live_transition_tolerance_fraction": float(

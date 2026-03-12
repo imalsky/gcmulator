@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(python3 -c \"import torch_harmonics; print\\(torch_harmonics.__file__\\)\")",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:developer.nvidia.com)",
+      "WebFetch(domain:s3.us-east-1.amazonaws.com)",
+      "WebFetch(domain:catalog.ngc.nvidia.com)",
+      "WebFetch(domain:docs.nvidia.com)",
+      "WebFetch(domain:proceedings.mlr.press)",
+      "Bash(python3 -c \":*)",
+      "Bash(pip3 list)",
+      "WebFetch(domain:www.semanticscholar.org)",
+      "WebFetch(domain:www.emergentmind.com)",
+      "WebFetch(domain:gmd.copernicus.org)",
+      "WebFetch(domain:www.nature.com)",
+      "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
+      "WebFetch(domain:www.climatechange.ai)"
+    ]
+  }
+}

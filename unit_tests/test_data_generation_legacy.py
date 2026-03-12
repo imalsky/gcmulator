@@ -1,4 +1,4 @@
-"""Runtime-order regression tests for training entrypoints."""
+"""Generation-side legacy raw-file regression tests."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
-import gcmulator.training as training_mod
+import gcmulator.data_generation as data_generation_mod
 from gcmulator.config import load_config
 
 
-def _config_dict(*, device: str) -> dict[str, object]:
-    """Return a small but valid training config."""
+def _config_dict() -> dict[str, object]:
+    """Return a minimal config for generation fail-fast checks."""
     step_days = 240.0 / 86400.0
     fixed_jump_days = 2.0 * step_days
     return {
@@ -20,7 +20,7 @@ def _config_dict(*, device: str) -> dict[str, object]:
             "dataset_dir": "raw",
             "processed_dir": "processed",
             "model_dir": "models",
-            "overwrite_dataset": False,
+            "overwrite_dataset": True,
         },
         "solver": {
             "M": 42,
@@ -76,7 +76,7 @@ def _config_dict(*, device: str) -> dict[str, object]:
         },
         "training": {
             "seed": 0,
-            "device": device,
+            "device": "cpu",
             "amp_mode": "none",
             "epochs": 1,
             "batch_size": 4,
@@ -93,23 +93,22 @@ def _config_dict(*, device: str) -> dict[str, object]:
     }
 
 
-def test_train_emulator_rejects_cpu_before_setup(
+def test_generate_dataset_rejects_legacy_npz_before_backend_setup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unsupported CPU training should fail before dependency/setup work starts."""
+    """Legacy raw files should fail before backend import/setup work begins."""
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps(_config_dict(device="cpu")), encoding="utf-8")
+    config_path.write_text(json.dumps(_config_dict()), encoding="utf-8")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "sim_000000.npz").write_bytes(b"legacy")
     cfg = load_config(config_path)
 
     def _unexpected(*args: object, **kwargs: object) -> None:
-        raise AssertionError("runtime validation should fail before setup helpers run")
+        raise AssertionError("legacy raw-file validation should run before backend setup")
 
-    monkeypatch.setattr(training_mod, "ensure_torch_harmonics_importable", _unexpected)
-    monkeypatch.setattr(training_mod, "preprocess_dataset", _unexpected)
+    monkeypatch.setattr(data_generation_mod, "ensure_my_swamp_importable", _unexpected)
 
-    with pytest.raises(RuntimeError, match="requires CUDA"):
-        training_mod.train_emulator(cfg, config_path=config_path)
-
-    assert not (tmp_path / "processed").exists()
-    assert not (tmp_path / "models").exists()
+    with pytest.raises(RuntimeError, match="sim_\\*\\.npz"):
+        data_generation_mod.generate_dataset(cfg, config_path=config_path)

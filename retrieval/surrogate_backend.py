@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -37,6 +38,11 @@ FIELD_MODE_LOG10 = 1
 FIELD_MODE_SIGNED_LOG1P = 2
 
 
+def _display_repo_path(path: Path) -> str:
+    """Return a repository-relative path string for JSON reports and errors."""
+    return str(Path(os.path.relpath(Path(path).resolve(), start=PROJECT_ROOT)))
+
+
 def _load_optional_json(path: Path) -> Optional[Dict[str, Any]]:
     """Return parsed JSON if the file exists, else ``None``."""
     if not path.is_file():
@@ -52,7 +58,7 @@ def _load_required_export_meta(export_path: Path) -> Dict[str, Any]:
     meta = _load_optional_json(meta_path)
     if meta is None:
         raise FileNotFoundError(
-            f"Export metadata not found: {meta_path}. "
+            f"Export metadata not found: {_display_repo_path(meta_path)}. "
             "The retrieval runtime expects a self-contained export bundle."
         )
     return meta
@@ -179,9 +185,11 @@ class SurrogateArtifactContract:
     def to_json_dict(self) -> Dict[str, Any]:
         """Return a JSON-friendly payload."""
         return {
-            "export_path": str(self.export_path),
+            "export_path": _display_repo_path(self.export_path),
             "checkpoint_path": (
-                None if self.checkpoint_path is None else str(self.checkpoint_path)
+                None
+                if self.checkpoint_path is None
+                else _display_repo_path(self.checkpoint_path)
             ),
             "model_days": float(self.model_days),
             "export_format": self.export_format,
@@ -233,7 +241,7 @@ def inspect_surrogate_artifact(
     """Inspect the saved artifact against the current direct-jump contract."""
     resolved_export = Path(export_path).resolve()
     if not resolved_export.is_file():
-        raise FileNotFoundError(f"Export not found: {resolved_export}")
+        raise FileNotFoundError(f"Export not found: {_display_repo_path(resolved_export)}")
     if model_days <= 0.0:
         raise ValueError(f"model_days must be > 0, got {model_days}")
 
@@ -245,7 +253,9 @@ def inspect_surrogate_artifact(
     if checkpoint_path is not None:
         resolved_checkpoint = Path(checkpoint_path).resolve()
         if not resolved_checkpoint.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {resolved_checkpoint}")
+            raise FileNotFoundError(
+                f"Checkpoint not found: {_display_repo_path(resolved_checkpoint)}"
+            )
         checkpoint = torch.load(resolved_checkpoint, map_location="cpu")
 
     solver = _require_meta_mapping(export_meta, key="solver")

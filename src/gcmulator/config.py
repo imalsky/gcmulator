@@ -24,6 +24,8 @@ DEFAULT_SCHEDULER_MIN_LR_RATIO = 50.0
 DEFAULT_SCHEDULER_EPS = 1.0e-10
 
 TransformName = Literal["none", "log10", "signed_log1p"]
+PairSamplingPolicy = Literal["uniform_pairs", "uniform_gaps", "inverse_time"]
+PairIterationMode = Literal["live_sampled_gpu", "resample_from_saved_sequences"]
 
 PHYSICAL_STATE_FIELDS = ("Phi", "eta", "delta")
 CONDITIONING_PARAM_NAMES = (
@@ -161,7 +163,10 @@ class SamplingConfig:
     generation_workers: int = 0
     burn_in_days: float = 0.0
     saved_checkpoint_interval_days: float = 1.0
+    saved_snapshots_per_sim: Optional[int] = None
     live_pairs_per_sequence: int = 10
+    pairs_per_sim: int = 10
+    pair_sampling_policy: PairSamplingPolicy = "inverse_time"
     live_transition_days_min: float = 0.1
     live_transition_days_max: float = 100.0
     live_transition_tolerance_fraction: float = 0.1
@@ -214,7 +219,6 @@ class ModelConfig:
     normalization_layer: str = "instance_norm"
     hard_thresholding_fraction: float = 1.0
     residual_prediction: bool = True
-    residual_init_scale: float = 1.0e-2
     pos_embed: str = "spectral"
     bias: bool = False
 
@@ -244,8 +248,10 @@ class TrainingConfig:
     num_workers: int = 0
     shuffle: bool = True
     preload_to_gpu: bool = True
+    pair_iteration_mode: PairIterationMode = "live_sampled_gpu"
     learning_rate: float = 3e-4
     weight_decay: float = 0.0
+    channel_loss_weights: Optional[Dict[str, float]] = None
     grad_clip_norm: float = 1.0
     val_fraction: float = 0.1
     test_fraction: float = 0.1
@@ -284,7 +290,10 @@ SAMPLING_KEYS = {
     "generation_workers",
     "burn_in_days",
     "saved_checkpoint_interval_days",
+    "saved_snapshots_per_sim",
     "live_pairs_per_sequence",
+    "pairs_per_sim",
+    "pair_sampling_policy",
     "live_transition_days_min",
     "live_transition_days_max",
     "live_transition_tolerance_fraction",
@@ -309,7 +318,6 @@ MODEL_KEYS = {
     "normalization_layer",
     "hard_thresholding_fraction",
     "residual_prediction",
-    "residual_init_scale",
     "pos_embed",
     "bias",
 }
@@ -323,8 +331,10 @@ TRAINING_KEYS = {
     "num_workers",
     "shuffle",
     "preload_to_gpu",
+    "pair_iteration_mode",
     "learning_rate",
     "weight_decay",
+    "channel_loss_weights",
     "grad_clip_norm",
     "val_fraction",
     "test_fraction",
@@ -421,18 +431,89 @@ def _parse_parameter_spec(d: Dict[str, Any]) -> ParameterSpec:
     )
 
 
-def _parse_sampling(d: Dict[str, Any]) -> SamplingConfig:
+def _resolve_saved_checkpoint_interval_days(
+    *,
+    time_days: float,
+    dt_seconds: float,
+    saved_checkpoint_interval_days: float | None,
+    saved_snapshots_per_sim: int | None,
+) -> float:
+    """Resolve one concrete checkpoint interval from either interval-days or snapshot count."""
+    if saved_snapshots_per_sim is not None:
+        if saved_snapshots_per_sim < 1:
+            raise ValueError("sampling.saved_snapshots_per_sim must be >= 1")
+        n_steps_total = max(
+            1,
+            int(round(float(time_days) * SECONDS_PER_DAY / float(dt_seconds))),
+        )
+        if int(saved_snapshots_per_sim) > int(n_steps_total):
+            raise ValueError(
+                "sampling.saved_snapshots_per_sim must be <= the total number of "
+                f"solver steps ({n_steps_total})"
+            )
+        if int(n_steps_total) % int(saved_snapshots_per_sim) != 0:
+            raise ValueError(
+                "sampling.saved_snapshots_per_sim must divide the total number of "
+                f"solver steps exactly; total_steps={n_steps_total}, "
+                f"saved_snapshots_per_sim={saved_snapshots_per_sim}"
+            )
+        interval_steps = int(n_steps_total) // int(saved_snapshots_per_sim)
+        return float(interval_steps) * float(dt_seconds) / float(SECONDS_PER_DAY)
+
+    if saved_checkpoint_interval_days is None:
+        return 1.0
+    return float(saved_checkpoint_interval_days)
+
+
+def _parse_sampling(
+    d: Dict[str, Any],
+    *,
+    solver: SolverConfig,
+    raw_sampling: Optional[Dict[str, Any]] = None,
+) -> SamplingConfig:
     """Parse the ``sampling`` section."""
     params_raw = d.get("parameters", [])
     if not isinstance(params_raw, list):
         raise ValueError("sampling.parameters must be a list")
+    raw_sampling = raw_sampling or {}
+    raw_has_saved_interval = (
+        "saved_checkpoint_interval_days" in raw_sampling
+        and raw_sampling.get("saved_checkpoint_interval_days") is not None
+    )
+    raw_has_saved_snapshots = (
+        "saved_snapshots_per_sim" in raw_sampling
+        and raw_sampling.get("saved_snapshots_per_sim") is not None
+    )
+    if raw_has_saved_interval and raw_has_saved_snapshots:
+        raise ValueError(
+            "sampling.saved_checkpoint_interval_days and "
+            "sampling.saved_snapshots_per_sim are mutually exclusive"
+        )
+    saved_snapshots_per_sim = (
+        None
+        if d.get("saved_snapshots_per_sim") is None
+        else int(d.get("saved_snapshots_per_sim"))
+    )
+    resolved_interval_days = _resolve_saved_checkpoint_interval_days(
+        time_days=float(solver.default_time_days),
+        dt_seconds=float(solver.dt_seconds),
+        saved_checkpoint_interval_days=(
+            None
+            if raw_has_saved_snapshots and not raw_has_saved_interval
+            else float(d.get("saved_checkpoint_interval_days", 1.0))
+        ),
+        saved_snapshots_per_sim=saved_snapshots_per_sim,
+    )
     return SamplingConfig(
         seed=int(d.get("seed", 0)),
         n_sims=int(d.get("n_sims", 500)),
         generation_workers=int(d.get("generation_workers", 0)),
         burn_in_days=float(d.get("burn_in_days", 0.0)),
-        saved_checkpoint_interval_days=float(d.get("saved_checkpoint_interval_days", 1.0)),
+        saved_checkpoint_interval_days=float(resolved_interval_days),
+        saved_snapshots_per_sim=saved_snapshots_per_sim,
         live_pairs_per_sequence=int(d.get("live_pairs_per_sequence", 10)),
+        pairs_per_sim=int(d.get("pairs_per_sim", d.get("live_pairs_per_sequence", 10))),
+        pair_sampling_policy=str(d.get("pair_sampling_policy", "inverse_time")),
         live_transition_days_min=float(d.get("live_transition_days_min", 0.1)),
         live_transition_days_max=float(d.get("live_transition_days_max", 100.0)),
         live_transition_tolerance_fraction=float(
@@ -493,7 +574,6 @@ def _parse_model(d: Dict[str, Any]) -> ModelConfig:
             d.get("residual_prediction", True),
             field_name="model.residual_prediction",
         ),
-        residual_init_scale=float(d.get("residual_init_scale", 1.0e-2)),
         pos_embed=str(d.get("pos_embed", "spectral")),
         bias=_parse_bool(d.get("bias", False), field_name="model.bias"),
     )
@@ -539,6 +619,16 @@ def _parse_training(
         raw_scheduler = {}
     if not isinstance(raw_scheduler, dict):
         raise ValueError("training.scheduler must be an object")
+    raw_channel_loss_weights = d.get("channel_loss_weights")
+    if raw_channel_loss_weights is None:
+        channel_loss_weights = None
+    else:
+        if not isinstance(raw_channel_loss_weights, dict):
+            raise ValueError("training.channel_loss_weights must be an object")
+        channel_loss_weights = {
+            canonicalize_state_field(str(key)): float(value)
+            for key, value in raw_channel_loss_weights.items()
+        }
     learning_rate = float(d.get("learning_rate", 3e-4))
     return TrainingConfig(
         seed=int(d.get("seed", 0)),
@@ -556,8 +646,10 @@ def _parse_training(
             d.get("preload_to_gpu", True),
             field_name="training.preload_to_gpu",
         ),
+        pair_iteration_mode=str(d.get("pair_iteration_mode", "live_sampled_gpu")),
         learning_rate=learning_rate,
         weight_decay=float(d.get("weight_decay", 0.0)),
+        channel_loss_weights=channel_loss_weights,
         grad_clip_norm=float(d.get("grad_clip_norm", 1.0)),
         val_fraction=float(d.get("val_fraction", 0.1)),
         test_fraction=float(d.get("test_fraction", 0.1)),
@@ -582,7 +674,11 @@ def load_config(config_path: Path) -> GCMulatorConfig:
         paths=_parse_paths(merged.get("paths", {})),
         solver=_parse_solver(merged.get("solver", {})),
         geometry=_parse_geometry(merged.get("geometry", {})),
-        sampling=_parse_sampling(merged.get("sampling", {})),
+        sampling=_parse_sampling(
+            merged.get("sampling", {}),
+            solver=_parse_solver(merged.get("solver", {})),
+            raw_sampling=raw.get("sampling", {}),
+        ),
         normalization=_parse_norm(merged.get("normalization", {})),
         model=_parse_model(merged.get("model", {})),
         training=_parse_training(
@@ -616,10 +712,26 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("sampling.generation_workers must be >= 0")
     if cfg.sampling.burn_in_days < 0:
         raise ValueError("sampling.burn_in_days must be >= 0")
+    if (
+        cfg.sampling.saved_snapshots_per_sim is not None
+        and cfg.sampling.saved_snapshots_per_sim < 1
+    ):
+        raise ValueError("sampling.saved_snapshots_per_sim must be >= 1")
     if cfg.sampling.saved_checkpoint_interval_days <= 0:
         raise ValueError("sampling.saved_checkpoint_interval_days must be > 0")
     if cfg.sampling.live_pairs_per_sequence < MIN_TRANSITIONS:
         raise ValueError(f"sampling.live_pairs_per_sequence must be >= {MIN_TRANSITIONS}")
+    if cfg.sampling.pairs_per_sim < MIN_TRANSITIONS:
+        raise ValueError(f"sampling.pairs_per_sim must be >= {MIN_TRANSITIONS}")
+    if cfg.sampling.pair_sampling_policy not in {
+        "uniform_pairs",
+        "uniform_gaps",
+        "inverse_time",
+    }:
+        raise ValueError(
+            "sampling.pair_sampling_policy must be one of "
+            "['uniform_pairs','uniform_gaps','inverse_time']"
+        )
     if cfg.sampling.live_transition_days_min <= 0:
         raise ValueError("sampling.live_transition_days_min must be > 0")
     if cfg.sampling.live_transition_days_max <= 0:
@@ -676,21 +788,35 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("training.device must be one of ['auto','cpu','cuda']")
     if cfg.training.amp_mode not in {"none", "bf16", "fp16"}:
         raise ValueError("training.amp_mode must be one of ['none','bf16','fp16']")
+    if cfg.training.pair_iteration_mode not in {
+        "live_sampled_gpu",
+        "resample_from_saved_sequences",
+    }:
+        raise ValueError(
+            "training.pair_iteration_mode must be one of "
+            "['live_sampled_gpu','resample_from_saved_sequences']"
+        )
     if cfg.training.epochs < 1:
         raise ValueError("training.epochs must be >= 1")
     if cfg.training.batch_size < 1:
         raise ValueError("training.batch_size must be >= 1")
     if cfg.training.num_workers < 0:
         raise ValueError("training.num_workers must be >= 0")
-    if not cfg.training.preload_to_gpu:
-        raise ValueError("training.preload_to_gpu must be true for live GPU sampling")
-    if int(cfg.training.batch_size) % int(cfg.sampling.live_pairs_per_sequence) != 0:
-        raise ValueError(
-            "training.batch_size must be divisible by "
-            "sampling.live_pairs_per_sequence"
-        )
-    if cfg.training.preload_to_gpu and cfg.training.num_workers != 0:
-        raise ValueError("training.num_workers must be 0 when training.preload_to_gpu=true")
+    if cfg.training.pair_iteration_mode == "live_sampled_gpu":
+        if not cfg.training.preload_to_gpu:
+            raise ValueError("training.preload_to_gpu must be true for live GPU sampling")
+        if int(cfg.training.batch_size) % int(cfg.sampling.live_pairs_per_sequence) != 0:
+            raise ValueError(
+                "training.batch_size must be divisible by "
+                "sampling.live_pairs_per_sequence"
+            )
+        if cfg.training.num_workers != 0:
+            raise ValueError("training.num_workers must be 0 when training.preload_to_gpu=true")
+    else:
+        if cfg.training.num_workers != 0:
+            raise ValueError(
+                "training.num_workers must be 0 for resample_from_saved_sequences"
+            )
     if cfg.training.learning_rate <= 0:
         raise ValueError("training.learning_rate must be > 0")
     if cfg.training.weight_decay < 0:
@@ -759,8 +885,6 @@ def validate_config(cfg: GCMulatorConfig) -> None:
             "model.pos_embed must be one of "
             "['none','sequence','spectral','learnable lat','learnable latlon']"
         )
-    if cfg.model.residual_init_scale <= 0:
-        raise ValueError("model.residual_init_scale must be > 0")
 
     if not cfg.geometry.flip_latitude_to_north_south:
         raise ValueError(
@@ -772,6 +896,21 @@ def validate_config(cfg: GCMulatorConfig) -> None:
             "geometry.roll_longitude_to_0_2pi must be true for "
             "legendre-gauss training"
         )
+    if cfg.training.channel_loss_weights is not None:
+        weight_keys = set(cfg.training.channel_loss_weights)
+        expected_keys = set(PHYSICAL_STATE_FIELDS)
+        if weight_keys != expected_keys:
+            raise ValueError(
+                "training.channel_loss_weights must define exactly "
+                f"{list(PHYSICAL_STATE_FIELDS)}, got {sorted(weight_keys)}"
+            )
+        for field_name in PHYSICAL_STATE_FIELDS:
+            weight = float(cfg.training.channel_loss_weights[field_name])
+            if not math.isfinite(weight) or weight <= 0.0:
+                raise ValueError(
+                    "training.channel_loss_weights values must be finite and > 0: "
+                    f"{field_name}={weight!r}"
+                )
 
 
 def _validate_parameter_specs(specs: List[ParameterSpec]) -> None:
