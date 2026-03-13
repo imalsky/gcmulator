@@ -507,15 +507,20 @@ def _predict_autoregressive_rollout(
     return np.asarray(current_state_phys, dtype=np.float32), int(len(rollout_schedule))
 
 
-def _diagnose_target_winds(
+def _extract_target_winds(
     target_state: np.ndarray,
     *,
     target_field_names: Sequence[str],
     params: Any,
     solver_cfg: Dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Diagnose physical-space winds from prognostic target channels."""
+    """Return physical-space winds from explicit channels or eta/delta diagnosis."""
     field_index = {str(name): idx for idx, name in enumerate(target_field_names)}
+    if "U" in field_index and "V" in field_index:
+        return (
+            np.asarray(target_state[field_index["U"]], dtype=np.float64),
+            np.asarray(target_state[field_index["V"]], dtype=np.float64),
+        )
     return diagnose_winds(
         np.asarray(target_state[field_index["eta"]], dtype=np.float64),
         np.asarray(target_state[field_index["delta"]], dtype=np.float64),
@@ -565,6 +570,8 @@ def main() -> None:
         target_state_chans=int(shape["C"]),
         param_dim=int(len(ckpt["conditioning_names"])),
         cfg_model=model_cfg,
+        lat_order=str(ckpt["geometry"]["lat_order"]),
+        lon_origin=str(ckpt["geometry"]["lon_origin"]),
     )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device=device).eval()
@@ -579,13 +586,13 @@ def main() -> None:
         device=device,
     )
     solver_cfg = dict(ckpt["solver"])
-    true_winds = _diagnose_target_winds(
+    true_winds = _extract_target_winds(
         true_target_phys,
         target_field_names=stats.state.field_names,
         params=params,
         solver_cfg=solver_cfg,
     )
-    pred_winds = _diagnose_target_winds(
+    pred_winds = _extract_target_winds(
         pred_target_phys,
         target_field_names=stats.state.field_names,
         params=params,

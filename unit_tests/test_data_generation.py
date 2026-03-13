@@ -9,7 +9,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from gcmulator.config import load_config
+from gcmulator.config import PHYSICAL_STATE_FIELDS, load_config
 from gcmulator.data_generation import generate_dataset
 from gcmulator.my_swamp_backend import run_trajectory_checkpoints, run_trajectory_checkpoints_batched
 from gcmulator.sampling import build_uniform_checkpoint_schedule, to_extended9
@@ -138,6 +138,7 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "normalization_layer": "instance_norm",
             "hard_thresholding_fraction": 1.0,
             "residual_prediction": True,
+            "include_coord_channels": False,
             "pos_embed": "spectral",
             "bias": False,
         },
@@ -188,6 +189,6 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
         assert "anchor_steps" not in payload
         assert checkpoint_states.ndim == 4
         assert checkpoint_states.shape[0] == expected_schedule.checkpoint_steps.shape[0]
-        assert checkpoint_states.shape[1] == 3
+        assert checkpoint_states.shape[1] == len(PHYSICAL_STATE_FIELDS)
         assert np.array_equal(checkpoint_steps, expected_schedule.checkpoint_steps)
         assert np.allclose(checkpoint_days, expected_schedule.checkpoint_days)

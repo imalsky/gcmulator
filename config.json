@@ -1,14 +1,14 @@
 {
   "paths": {
-    "dataset_dir": "data/raw_1dt",
-    "processed_dir": "data/processed_1dt",
-    "model_dir": "models/onestep_1dt_v1",
+    "dataset_dir": "data/raw_1dt_smoketest",
+    "processed_dir": "data/processed_1dt_smoketest",
+    "model_dir": "models/onestep_1dt_v1_smoketest",
     "overwrite_dataset": true
   },
   "solver": {
     "M": 42,
     "dt_seconds": 120.0,
-    "default_time_days": 1.0,
+    "default_time_days": 6.0,
     "starttime_index": 2
   },
   "geometry": {
@@ -17,12 +17,12 @@
   },
   "sampling": {
     "seed": 42,
-    "n_sims": 100,
+    "n_sims": 8,
     "generation_workers": 0,
-    "burn_in_days": 0.0,
+    "burn_in_days": 5.0,
     "saved_checkpoint_interval_days": 0.001388888888888889,
     "fixed_transition_steps": 1,
-    "pairs_per_sim": 512,
+    "pairs_per_sim": 32,
     "pair_sampling_policy": "uniform_pairs",
     "live_transition_tolerance_fraction": 0.0,
     "parameters": [
@@ -39,6 +39,8 @@
     "state": {
       "field_transforms": {
         "Phi": "signed_log1p",
+        "U": "signed_log1p",
+        "V": "signed_log1p",
         "eta": "signed_log1p",
         "delta": "signed_log1p"
       },
@@ -66,6 +68,7 @@
     "normalization_layer": "instance_norm",
     "hard_thresholding_fraction": 1.0,
     "residual_prediction": true,
+    "include_coord_channels": true,
     "pos_embed": "spectral",
     "bias": false
   },
@@ -74,8 +77,8 @@
     "device": "auto",
     "amp_mode": "none",
     "deterministic": false,
-    "epochs": 80,
-    "batch_size": 128,
+    "epochs": 3,
+    "batch_size": 16,
     "num_workers": 0,
     "shuffle": true,
     "preload_to_gpu": true,
@@ -88,9 +91,9 @@
     "split_seed": 42,
     "scheduler": {
       "type": "plateau",
-      "warmup_epochs": 5,
+      "warmup_epochs": 1,
       "factor": 0.5,
-      "patience": 6,
+      "patience": 1,
       "min_lr": 5e-6,
       "eps": 1e-10
     }

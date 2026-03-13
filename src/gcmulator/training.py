@@ -1689,6 +1689,8 @@ def train_emulator(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]
         target_state_chans=state_chans,
         param_dim=conditioning_dim,
         cfg_model=cfg.model,
+        lat_order=str(processed_meta["geometry"]["lat_order"]),
+        lon_origin=str(processed_meta["geometry"]["lon_origin"]),
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)

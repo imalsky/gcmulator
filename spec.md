@@ -122,27 +122,33 @@ That means the checked-in surrogate is aligned to the modified-Euler,
 diffusion-enabled, forced MY_SWAMP path, not to every possible solver mode.
 
 ### 3.2 Prognostic State Variables
-The emulator operates autoregressively on three prognostic channels in this
+The emulator operates autoregressively on five visible state channels in this
 exact order:
 1. `Phi`
-2. `eta`
-3. `delta`
+2. `U`
+3. `V`
+4. `eta`
+5. `delta`
 
 Definitions:
 1. `Phi`
    Perturbation geopotential-like field. In MY_SWAMP, the total geopotential-like
    quantity is `Phi + Phibar`.
-2. `eta`
+2. `U`
+   Zonal physical-space wind component.
+3. `V`
+   Meridional physical-space wind component.
+4. `eta`
    The vorticity-like prognostic channel named `eta`. The MY_SWAMP README
    describes this as absolute vorticity.
-3. `delta`
+5. `delta`
    Horizontal divergence.
 
-`U` and `V` (physical-space wind components) are deterministic functions of
-`eta` and `delta` via MY_SWAMP's spectral `invrsUV` transform. They are not
-part of the emulator's state space. When full five-field states are needed
-(e.g. for visualization), `U` and `V` are reconstructed via
-`my_swamp_backend.diagnose_winds()`.
+`U` and `V` are still diagnostically tied to `eta` and `delta` through
+MY_SWAMP's spectral `invrsUV` transform, but the checked-in emulator now
+stores and predicts the full visible five-field state directly. Diagnostic
+wind reconstruction via `my_swamp_backend.diagnose_winds()` remains available
+for validation and compatibility tooling.
 
 ### 3.4 Conditioning Parameters
 The physical conditioning vector is fixed and ordered as:
@@ -699,7 +705,7 @@ Parameter normalization keys:
    AdamW weight decay.
 13. `channel_loss_weights`
    Optional explicit per-channel training-loss weights keyed by
-   `Phi`, `eta`, and `delta`.
+   `Phi`, `U`, `V`, `eta`, and `delta`.
 14. `grad_clip_norm`
    Maximum gradient norm for gradient clipping. Default is `1.0`.
 15. `val_fraction`
@@ -770,7 +776,7 @@ These names recur across raw files, processed metadata, checkpoints, and code:
 7. `nlon`
    Longitude grid size. Numerically equal to `W` for stored arrays.
 8. `state_fields`
-   Ordered list of prognostic state channel names. Used in raw files, processed
+   Ordered list of visible state channel names. Used in raw files, processed
    metadata, and checkpoints.
 10. `param_names`
     Ordered list of canonical physical conditioning parameter names.
@@ -819,10 +825,10 @@ Exact required keys:
 18. `lon_shift`
 
 Shapes and dtypes as written by generation:
-1. `checkpoint_states`: `[S, 3, H, W]`, stored as `float64`
+1. `checkpoint_states`: `[S, 5, H, W]`, stored as `float64`
 2. `checkpoint_steps`: `[S]`, stored as `int64`
 3. `checkpoint_days`: `[S]`, stored as `float64`
-4. `state_fields`: `[3]`, object/string array
+4. `state_fields`: `[5]`, object/string array
 5. `params`: `[7]`, stored as `float64`
 6. `param_names`: `[7]`, object/string array
 7. scalar metadata values are stored as zero-dimensional NumPy scalars
@@ -887,14 +893,14 @@ Each shard stores:
 3. `checkpoint_days`
 
 Shapes and dtypes:
-1. `states_norm`: `[S, 3, H, W]`, `float32`
+1. `states_norm`: `[S, 5, H, W]`, `float32`
 2. `params_norm`: `[7]`, `float32`
 3. `checkpoint_days`: `[S]`, `float64`
 
 Semantic notes:
 1. processed shards store normalized sequences, not precomputed live pairs
-2. `states_norm` contains the single prognostic state used for both model
-   input and target in the autoregressive architecture
+2. `states_norm` contains the same five-channel visible state used for both
+   model input and model target in the autoregressive architecture
 3. `params_norm` is retained separately for tooling that needs only the physical
    parameter vector
 4. `checkpoint_days` keeps the saved cadence explicit for tooling and validation
@@ -1065,15 +1071,21 @@ The autoregressive model call is:
 `model(state0, conditioning)`
 
 Shapes:
-1. `state0`: `[B, 3, H, W]` (Phi, eta, delta)
+1. `state0`: `[B, 5, H, W]` (`Phi`, `U`, `V`, `eta`, `delta`)
 2. `conditioning`: `[B, 8]`
-3. output: `[B, 3, H, W]` (Phi, eta, delta)
+3. output: `[B, 5, H, W]` (`Phi`, `U`, `V`, `eta`, `delta`)
 
 The physical-space export wrapper takes:
 `export_model(state0, params, transition_days)`
 
 Residual prediction uses all input channels directly since input and output
-share the same three prognostic fields.
+share the same five visible fields.
+
+Historical note:
+the current residual head keeps the modern full-state residual contract
+`state0 + output`. The old `v1` artifact used a narrower residual path with a
+learnable residual scale, so comparisons to that run are not exact even when
+other settings are matched.
 
 ### 9.2 One-Step Metrics
 Required single-call metrics, written to `val_metrics.json` and
@@ -1153,9 +1165,10 @@ exact discrete solver carry.
 
 That means:
 1. no learned previous-step carry in the network state
-2. autoregressive prognostic-only architecture (3-channel in, 3-channel out)
-3. deterministic reconstruction of wind channels (`U`, `V`) from prognostics
-   (`eta`, `delta`) when a full five-field state is needed
+2. autoregressive visible-state architecture (5-channel in, 5-channel out)
+3. wind channels (`U`, `V`) remain physically constrained by the backend, but
+   the emulator predicts them directly rather than reconstructing them only at
+   evaluation time
 4. approximate surrogate behavior rather than solver identity
 
 The emulator should be evaluated as a physically informed surrogate, not as an

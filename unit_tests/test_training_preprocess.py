@@ -7,7 +7,12 @@ from pathlib import Path
 
 import numpy as np
 
-from gcmulator.config import CONDITIONING_PARAM_NAMES, TRANSITION_TIME_NAME, load_config
+from gcmulator.config import (
+    CONDITIONING_PARAM_NAMES,
+    PHYSICAL_STATE_FIELDS,
+    TRANSITION_TIME_NAME,
+    load_config,
+)
 from gcmulator.geometry import geometry_shift_for_nlon
 from gcmulator.sampling import build_uniform_checkpoint_schedule
 from gcmulator.training import preprocess_dataset
@@ -73,6 +78,7 @@ def _config_dict() -> dict[str, object]:
             "normalization_layer": "instance_norm",
             "hard_thresholding_fraction": 1.0,
             "residual_prediction": True,
+            "include_coord_channels": False,
             "pos_embed": "spectral",
             "bias": False,
         },
@@ -109,8 +115,12 @@ def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
         [
             np.stack(
                 [
-                    np.full((nlat, nlon), fill_value=base + checkpoint_index + channel_index, dtype=np.float64)
-                    for channel_index in range(3)
+                    np.full(
+                        (nlat, nlon),
+                        fill_value=base + checkpoint_index + channel_index,
+                        dtype=np.float64,
+                    )
+                    for channel_index in range(len(PHYSICAL_STATE_FIELDS))
                 ],
                 axis=0,
             )
@@ -134,7 +144,7 @@ def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
         "checkpoint_states": checkpoint_states,
         "checkpoint_steps": schedule.checkpoint_steps,
         "checkpoint_days": schedule.checkpoint_days,
-        "state_fields": np.asarray(["Phi", "eta", "delta"], dtype=object),
+        "state_fields": np.asarray(list(PHYSICAL_STATE_FIELDS), dtype=object),
         "params": params,
         "param_names": np.asarray(list(CONDITIONING_PARAM_NAMES), dtype=object),
         "default_time_days": np.asarray(0.05, dtype=np.float64),
@@ -175,7 +185,7 @@ def test_preprocess_dataset_writes_sequence_shards(tmp_path: Path) -> None:
         params_norm = np.asarray(npz["params_norm"], dtype=np.float32)
         checkpoint_days = np.asarray(npz["checkpoint_days"], dtype=np.float64)
 
-    assert states_norm.shape == (10, 3, 2, 4)
+    assert states_norm.shape == (10, len(PHYSICAL_STATE_FIELDS), 2, 4)
     assert params_norm.shape == (len(CONDITIONING_PARAM_NAMES),)
     assert checkpoint_days.shape == (10,)
     assert np.allclose(checkpoint_days, np.asarray(meta["checkpoint_days"], dtype=np.float64))

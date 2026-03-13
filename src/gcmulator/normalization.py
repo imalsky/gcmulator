@@ -1,7 +1,7 @@
 """Normalization helpers for states and conditioning parameters.
 
 The autoregressive emulator uses a single set of per-channel statistics for
-both model input and model output since the prognostic fields are identical.
+both model input and model output since the visible state fields are identical.
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ class NormalizationStats:
     """Complete normalization bundle stored in metadata and checkpoints.
 
     The autoregressive model uses a single ``state`` stat for both input
-    normalization and target denormalization since the prognostic fields
-    (Phi, eta, delta) are the same on both sides.
+    normalization and target denormalization since the visible fields
+    ``(Phi, U, V, eta, delta)`` are the same on both sides.
     """
 
     state: StateNormalizationStats

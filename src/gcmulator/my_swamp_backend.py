@@ -19,6 +19,7 @@ from .config import (
     CONDITIONING_PARAM_NAMES,
     Extended9Params,
     PHYSICAL_STATE_FIELDS,
+    PROGNOSTIC_STATE_FIELDS,
     SECONDS_PER_DAY,
 )
 
@@ -27,9 +28,9 @@ MIN_ROLLOUT_STEPS = 1
 # Number of solver time-steps advanced per jitted scan chunk. Balances JIT
 # compilation overhead against peak memory from the stacked chunk history.
 CHUNK_STEPS = 256
-# Indices into the 8-field reduced carry that select the prognostic visible
-# state: Phi_curr(0), eta_curr(3), delta_curr(4).
-CURRENT_FIELD_INDICES = (0, 3, 4)
+# Indices into the 8-field reduced carry that select the visible physical
+# state: Phi_curr(0), U_curr(1), V_curr(2), eta_curr(3), delta_curr(4).
+CURRENT_FIELD_INDICES = (0, 1, 2, 3, 4)
 
 
 @dataclass(frozen=True)
@@ -702,10 +703,10 @@ def reconstruct_full_state_from_prognostics(
         Full visible state with shape ``[5, H, W]`` ordered as
         ``(Phi, U, V, eta, delta)``.
     """
-    if prognostics.shape[0] != len(PHYSICAL_STATE_FIELDS):
+    if prognostics.shape[0] != len(PROGNOSTIC_STATE_FIELDS):
         raise ValueError(
             "prognostics must have "
-            f"{len(PHYSICAL_STATE_FIELDS)} channels, "
+            f"{len(PROGNOSTIC_STATE_FIELDS)} channels, "
             f"got {prognostics.shape[0]}"
         )
     phi = np.asarray(prognostics[0], dtype=np.float64)

@@ -27,7 +27,8 @@ TransformName = Literal["none", "log10", "signed_log1p"]
 PairSamplingPolicy = Literal["uniform_pairs", "uniform_gaps", "inverse_time"]
 PairIterationMode = Literal["live_sampled_gpu", "resample_from_saved_sequences"]
 
-PHYSICAL_STATE_FIELDS = ("Phi", "eta", "delta")
+PHYSICAL_STATE_FIELDS = ("Phi", "U", "V", "eta", "delta")
+PROGNOSTIC_STATE_FIELDS = ("Phi", "eta", "delta")
 CONDITIONING_PARAM_NAMES = (
     "a_m",
     "omega_rad_s",
@@ -220,6 +221,7 @@ class ModelConfig:
     normalization_layer: str = "instance_norm"
     hard_thresholding_fraction: float = 1.0
     residual_prediction: bool = True
+    include_coord_channels: bool = False
     pos_embed: str = "spectral"
     bias: bool = False
 
@@ -320,6 +322,7 @@ MODEL_KEYS = {
     "normalization_layer",
     "hard_thresholding_fraction",
     "residual_prediction",
+    "include_coord_channels",
     "pos_embed",
     "bias",
 }
@@ -669,6 +672,10 @@ def _parse_model(d: Dict[str, Any]) -> ModelConfig:
         residual_prediction=_parse_bool(
             d.get("residual_prediction", True),
             field_name="model.residual_prediction",
+        ),
+        include_coord_channels=_parse_bool(
+            d.get("include_coord_channels", False),
+            field_name="model.include_coord_channels",
         ),
         pos_embed=str(d.get("pos_embed", "spectral")),
         bias=_parse_bool(d.get("bias", False), field_name="model.bias"),

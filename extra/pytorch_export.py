@@ -526,6 +526,8 @@ def main() -> None:
         target_state_chans=state_chans,
         param_dim=int(len(ckpt["conditioning_names"])),
         cfg_model=model_cfg,
+        lat_order=str(ckpt["geometry"]["lat_order"]),
+        lon_origin=str(ckpt["geometry"]["lon_origin"]),
     )
     core_model.load_state_dict(ckpt["model_state"], strict=True)
     core_model.to(device=device).eval()

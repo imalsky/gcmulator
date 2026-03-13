@@ -55,6 +55,8 @@ def _minimal_config_dict() -> dict[str, object]:
             "state": {
                 "field_transforms": {
                     "Phi": "signed_log1p",
+                    "U": "signed_log1p",
+                    "V": "signed_log1p",
                     "eta": "signed_log1p",
                     "delta": "signed_log1p",
                 },
@@ -76,6 +78,7 @@ def _minimal_config_dict() -> dict[str, object]:
             "normalization_layer": "instance_norm",
             "hard_thresholding_fraction": 1.0,
             "residual_prediction": True,
+            "include_coord_channels": False,
             "pos_embed": "spectral",
             "bias": False,
         },
@@ -229,16 +232,17 @@ def test_load_config_rejects_unknown_keys(tmp_path: Path) -> None:
         load_config(config_path)
 
 
-def test_load_config_rejects_removed_coord_channel_flag(tmp_path: Path) -> None:
-    """The legacy explicit coordinate-channel option must stay unsupported."""
+def test_load_config_accepts_include_coord_channels(tmp_path: Path) -> None:
+    """The coordinate-channel option should parse as a supported model flag."""
     payload = _minimal_config_dict()
     model_section = dict(payload["model"])
     model_section["include_coord_channels"] = True
     payload["model"] = model_section
 
     config_path = _write_config(tmp_path, payload)
-    with pytest.raises(ValueError, match="unknown keys"):
-        load_config(config_path)
+    cfg = load_config(config_path)
+
+    assert cfg.model.include_coord_channels is True
 
 
 def test_load_config_rejects_removed_residual_init_scale(tmp_path: Path) -> None:
@@ -294,8 +298,10 @@ def test_load_config_accepts_channel_loss_weights(tmp_path: Path) -> None:
     training_section = dict(payload["training"])
     training_section["channel_loss_weights"] = {
         "Phi": 1.0,
-        "eta": 2.0,
-        "delta": 3.0,
+        "U": 2.0,
+        "V": 3.0,
+        "eta": 4.0,
+        "delta": 5.0,
     }
     payload["training"] = training_section
 
@@ -304,18 +310,22 @@ def test_load_config_accepts_channel_loss_weights(tmp_path: Path) -> None:
 
     assert cfg.training.channel_loss_weights == {
         "Phi": pytest.approx(1.0),
-        "eta": pytest.approx(2.0),
-        "delta": pytest.approx(3.0),
+        "U": pytest.approx(2.0),
+        "V": pytest.approx(3.0),
+        "eta": pytest.approx(4.0),
+        "delta": pytest.approx(5.0),
     }
 
 
 def test_load_config_rejects_partial_channel_loss_weights(tmp_path: Path) -> None:
-    """Per-channel weights must be explicit for all prognostic fields."""
+    """Per-channel weights must be explicit for all visible state fields."""
     payload = _minimal_config_dict()
     training_section = dict(payload["training"])
     training_section["channel_loss_weights"] = {
         "Phi": 1.0,
-        "eta": 2.0,
+        "U": 2.0,
+        "V": 3.0,
+        "eta": 4.0,
     }
     payload["training"] = training_section
 
@@ -330,8 +340,10 @@ def test_load_config_rejects_nonpositive_channel_loss_weights(tmp_path: Path) ->
     training_section = dict(payload["training"])
     training_section["channel_loss_weights"] = {
         "Phi": 1.0,
+        "U": 2.0,
+        "V": 3.0,
         "eta": 0.0,
-        "delta": 3.0,
+        "delta": 5.0,
     }
     payload["training"] = training_section
 
