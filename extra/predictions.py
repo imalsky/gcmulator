@@ -58,14 +58,13 @@ QUIVER_STRIDE = 8
 QUIVER_COLOR = "#08306b"
 
 # User-editable run settings
-RUN_NAME = "v2"
-RUN_DIR: Path | None = Path("models") / RUN_NAME
+MODEL_DIR: Path | None = Path("models") / "shortstep_0p1d_v1"
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 TEST_SHARD_INDEX = 0
-INPUT_TIME_DAYS = 0.0
-TARGET_TIME_DAYS = 20.0
-ROLLOUT_STEP_DAYS: float | None = 10.0
+INPUT_DAY = 0.0
+TARGET_DAY = 0.1
+ROLLOUT_STEP_DAYS: float | None = 0.1
 DEVICE_MODE = "auto"
 FIGURE_PATH: Path | None = None
 
@@ -92,16 +91,16 @@ def _display_repo_path(path: Path) -> str:
     return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
 
 
-def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -> Path:
+def _resolve_checkpoint_path(*, model_dir: Path | None, checkpoint: Path | None) -> Path:
     """Resolve checkpoint path from top-level run settings."""
     if checkpoint is not None:
         resolved = _resolve_repo_path(checkpoint)
         if not resolved.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(checkpoint)}")
         return resolved
-    if run_dir is None:
-        raise ValueError("Set RUN_DIR or CHECKPOINT_PATH at the top of this file")
-    ckpt_rel_path = Path(run_dir) / "best.pt"
+    if model_dir is None:
+        raise ValueError("Set MODEL_DIR or CHECKPOINT_PATH at the top of this file")
+    ckpt_rel_path = Path(model_dir) / "best.pt"
     ckpt_path = _resolve_repo_path(ckpt_rel_path)
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(ckpt_rel_path)}")
@@ -301,12 +300,12 @@ def _resolve_checkpoint_indices(
     """Map requested day-valued times onto saved checkpoint indices."""
     checkpoint_days = np.asarray(checkpoint_days, dtype=np.float64)
     if input_time_days < 0.0:
-        raise ValueError("INPUT_TIME_DAYS must be >= 0")
+        raise ValueError("INPUT_DAY must be >= 0")
     if target_time_days <= input_time_days:
-        raise ValueError("TARGET_TIME_DAYS must be > INPUT_TIME_DAYS")
+        raise ValueError("TARGET_DAY must be > INPUT_DAY")
     if target_time_days > float(checkpoint_days[-1]):
         raise ValueError(
-            "TARGET_TIME_DAYS exceeds the saved checkpoint horizon: "
+            "TARGET_DAY exceeds the saved checkpoint horizon: "
             f"{target_time_days} > {float(checkpoint_days[-1])}"
         )
 
@@ -318,12 +317,12 @@ def _resolve_checkpoint_indices(
     actual_target_day = float(checkpoint_days[target_index])
     if abs(actual_input_day - float(input_time_days)) > tolerance_days:
         raise ValueError(
-            "INPUT_TIME_DAYS must align with a saved checkpoint within half the checkpoint cadence: "
+            "INPUT_DAY must align with a saved checkpoint within half the checkpoint cadence: "
             f"requested={float(input_time_days):.6f}, realized={actual_input_day:.6f}"
         )
     if abs(actual_target_day - float(target_time_days)) > tolerance_days:
         raise ValueError(
-            "TARGET_TIME_DAYS must align with a saved checkpoint within half the checkpoint cadence: "
+            "TARGET_DAY must align with a saved checkpoint within half the checkpoint cadence: "
             f"requested={float(target_time_days):.6f}, realized={actual_target_day:.6f}"
         )
     if target_index <= input_index:
@@ -529,7 +528,7 @@ def _diagnose_target_winds(
 def main() -> None:
     """Load one held-out case, run the model, and save a plot."""
     _apply_plot_style()
-    ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
+    ckpt_path = _resolve_checkpoint_path(model_dir=MODEL_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
     figure_path = (
         _resolve_repo_path(FIGURE_PATH)
@@ -554,8 +553,8 @@ def main() -> None:
         processed_dir=processed_dir,
         stats=stats,
         test_shard_index=int(TEST_SHARD_INDEX),
-        input_time_days=float(INPUT_TIME_DAYS),
-        target_time_days=float(TARGET_TIME_DAYS),
+        input_time_days=float(INPUT_DAY),
+        target_time_days=float(TARGET_DAY),
     )
 
     model_cfg = _dict_to_namespace(ckpt["model_config"])

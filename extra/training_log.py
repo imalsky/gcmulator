@@ -27,8 +27,7 @@ FIGURE_DPI = 180
 STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
 
 # User-editable run settings
-RUN_NAME = "v1"
-RUN_DIR: Path | None = Path("models") / RUN_NAME
+MODEL_DIR: Path | None = Path("models") / "shortstep_0p1d_v1"
 FIGURE_PATH: Path | None = None
 
 
@@ -124,9 +123,9 @@ def _save_loss_figure(
 def main() -> None:
     """Load a run's history and save the loss plot."""
     _apply_plot_style()
-    if RUN_DIR is None:
-        raise ValueError("Set RUN_DIR at the top of this file")
-    run_dir = _resolve_repo_path(RUN_DIR)
+    if MODEL_DIR is None:
+        raise ValueError("Set MODEL_DIR at the top of this file")
+    run_dir = _resolve_repo_path(MODEL_DIR)
     history_csv_path = (run_dir / HISTORY_CSV_NAME).resolve()
     if not history_csv_path.is_file():
         raise FileNotFoundError(

@@ -164,6 +164,7 @@ class SamplingConfig:
     burn_in_days: float = 0.0
     saved_checkpoint_interval_days: float = 1.0
     saved_snapshots_per_sim: Optional[int] = None
+    fixed_transition_steps: Optional[int] = None
     live_pairs_per_sequence: int = 10
     pairs_per_sim: int = 10
     pair_sampling_policy: PairSamplingPolicy = "inverse_time"
@@ -291,6 +292,7 @@ SAMPLING_KEYS = {
     "burn_in_days",
     "saved_checkpoint_interval_days",
     "saved_snapshots_per_sim",
+    "fixed_transition_steps",
     "live_pairs_per_sequence",
     "pairs_per_sim",
     "pair_sampling_policy",
@@ -379,6 +381,15 @@ def _parse_bool(value: Any, *, field_name: str) -> bool:
     raise ValueError(f"{field_name} must be a boolean, got {value!r}")
 
 
+def _parse_optional_int(value: Any, *, field_name: str) -> Optional[int]:
+    """Parse optional integer config fields without silent coercion."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer or null, got {value!r}")
+    return int(value)
+
+
 def _parse_paths(d: Dict[str, Any]) -> PathsConfig:
     """Parse the ``paths`` section."""
     return PathsConfig(
@@ -465,6 +476,58 @@ def _resolve_saved_checkpoint_interval_days(
     return float(saved_checkpoint_interval_days)
 
 
+def _resolve_checkpoint_interval_steps(
+    *,
+    dt_seconds: float,
+    saved_checkpoint_interval_days: float,
+) -> int:
+    """Resolve the saved checkpoint cadence onto the discrete solver-step grid."""
+    return max(
+        1,
+        int(round(float(saved_checkpoint_interval_days) * SECONDS_PER_DAY / float(dt_seconds))),
+    )
+
+
+def _total_solver_steps(*, time_days: float, dt_seconds: float) -> int:
+    """Resolve the total integration horizon onto the discrete solver-step grid."""
+    return max(
+        1,
+        int(round(float(time_days) * SECONDS_PER_DAY / float(dt_seconds))),
+    )
+
+
+def _max_post_burn_in_gap_steps(
+    *,
+    time_days: float,
+    dt_seconds: float,
+    burn_in_days: float,
+    saved_checkpoint_interval_days: float,
+) -> int:
+    """Return the largest checkpoint-to-checkpoint gap available after burn-in."""
+    interval_steps = _resolve_checkpoint_interval_steps(
+        dt_seconds=float(dt_seconds),
+        saved_checkpoint_interval_days=float(saved_checkpoint_interval_days),
+    )
+    n_steps_total = _total_solver_steps(
+        time_days=float(time_days),
+        dt_seconds=float(dt_seconds),
+    )
+    last_checkpoint_step = (n_steps_total // interval_steps) * interval_steps
+    burn_in_intervals = int(
+        math.ceil(
+            (
+                float(burn_in_days)
+                * SECONDS_PER_DAY
+                / float(dt_seconds)
+                / float(interval_steps)
+            )
+            - 1.0e-12
+        )
+    )
+    first_anchor_checkpoint_step = burn_in_intervals * interval_steps
+    return max(0, int(last_checkpoint_step - first_anchor_checkpoint_step))
+
+
 def _parse_sampling(
     d: Dict[str, Any],
     *,
@@ -484,15 +547,38 @@ def _parse_sampling(
         "saved_snapshots_per_sim" in raw_sampling
         and raw_sampling.get("saved_snapshots_per_sim") is not None
     )
+    raw_has_fixed_transition_steps = (
+        "fixed_transition_steps" in raw_sampling
+        and raw_sampling.get("fixed_transition_steps") is not None
+    )
+    raw_has_live_transition_min = (
+        "live_transition_days_min" in raw_sampling
+        and raw_sampling.get("live_transition_days_min") is not None
+    )
+    raw_has_live_transition_max = (
+        "live_transition_days_max" in raw_sampling
+        and raw_sampling.get("live_transition_days_max") is not None
+    )
     if raw_has_saved_interval and raw_has_saved_snapshots:
         raise ValueError(
             "sampling.saved_checkpoint_interval_days and "
             "sampling.saved_snapshots_per_sim are mutually exclusive"
         )
+    if raw_has_fixed_transition_steps and (
+        raw_has_live_transition_min or raw_has_live_transition_max
+    ):
+        raise ValueError(
+            "sampling.fixed_transition_steps is mutually exclusive with "
+            "sampling.live_transition_days_min/max"
+        )
     saved_snapshots_per_sim = (
         None
         if d.get("saved_snapshots_per_sim") is None
         else int(d.get("saved_snapshots_per_sim"))
+    )
+    fixed_transition_steps = _parse_optional_int(
+        d.get("fixed_transition_steps"),
+        field_name="sampling.fixed_transition_steps",
     )
     resolved_interval_days = _resolve_saved_checkpoint_interval_days(
         time_days=float(solver.default_time_days),
@@ -504,6 +590,15 @@ def _parse_sampling(
         ),
         saved_snapshots_per_sim=saved_snapshots_per_sim,
     )
+    if fixed_transition_steps is None:
+        live_transition_days_min = float(d.get("live_transition_days_min", 0.1))
+        live_transition_days_max = float(d.get("live_transition_days_max", 100.0))
+    else:
+        fixed_transition_days = (
+            float(fixed_transition_steps) * float(solver.dt_seconds) / SECONDS_PER_DAY
+        )
+        live_transition_days_min = fixed_transition_days
+        live_transition_days_max = fixed_transition_days
     return SamplingConfig(
         seed=int(d.get("seed", 0)),
         n_sims=int(d.get("n_sims", 500)),
@@ -511,11 +606,12 @@ def _parse_sampling(
         burn_in_days=float(d.get("burn_in_days", 0.0)),
         saved_checkpoint_interval_days=float(resolved_interval_days),
         saved_snapshots_per_sim=saved_snapshots_per_sim,
+        fixed_transition_steps=fixed_transition_steps,
         live_pairs_per_sequence=int(d.get("live_pairs_per_sequence", 10)),
         pairs_per_sim=int(d.get("pairs_per_sim", d.get("live_pairs_per_sequence", 10))),
         pair_sampling_policy=str(d.get("pair_sampling_policy", "inverse_time")),
-        live_transition_days_min=float(d.get("live_transition_days_min", 0.1)),
-        live_transition_days_max=float(d.get("live_transition_days_max", 100.0)),
+        live_transition_days_min=live_transition_days_min,
+        live_transition_days_max=live_transition_days_max,
         live_transition_tolerance_fraction=float(
             d.get("live_transition_tolerance_fraction", 0.1)
         ),
@@ -719,6 +815,11 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("sampling.saved_snapshots_per_sim must be >= 1")
     if cfg.sampling.saved_checkpoint_interval_days <= 0:
         raise ValueError("sampling.saved_checkpoint_interval_days must be > 0")
+    if (
+        cfg.sampling.fixed_transition_steps is not None
+        and cfg.sampling.fixed_transition_steps < 1
+    ):
+        raise ValueError("sampling.fixed_transition_steps must be >= 1")
     if cfg.sampling.live_pairs_per_sequence < MIN_TRANSITIONS:
         raise ValueError(f"sampling.live_pairs_per_sequence must be >= {MIN_TRANSITIONS}")
     if cfg.sampling.pairs_per_sim < MIN_TRANSITIONS:
@@ -758,6 +859,27 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError(
             "sampling.saved_checkpoint_interval_days must be <= solver.default_time_days"
         )
+    if cfg.sampling.fixed_transition_steps is not None:
+        interval_steps = _resolve_checkpoint_interval_steps(
+            dt_seconds=float(cfg.solver.dt_seconds),
+            saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+        )
+        if int(cfg.sampling.fixed_transition_steps) % int(interval_steps) != 0:
+            raise ValueError(
+                "sampling.fixed_transition_steps must be exactly representable by "
+                "the saved checkpoint cadence"
+            )
+        max_gap_steps = _max_post_burn_in_gap_steps(
+            time_days=float(cfg.solver.default_time_days),
+            dt_seconds=float(cfg.solver.dt_seconds),
+            burn_in_days=float(cfg.sampling.burn_in_days),
+            saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+        )
+        if int(cfg.sampling.fixed_transition_steps) > int(max_gap_steps):
+            raise ValueError(
+                "sampling.fixed_transition_steps must fit inside the post-burn-in "
+                "saved checkpoint window"
+            )
 
     if cfg.normalization.state.zscore_eps <= 0:
         raise ValueError("normalization.state.zscore_eps must be > 0")

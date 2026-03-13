@@ -41,7 +41,7 @@ from gcmulator.modeling import (
 # User-editable export settings
 #
 # In the common case you only need to change:
-# 1. RUN_NAME or CHECKPOINT_PATH
+# 1. MODEL_DIR or CHECKPOINT_PATH
 # 2. DEVICE_MODE ("cpu" or "gpu")
 # 3. OUTPUT_PATH / META_OUTPUT_PATH if you do not want the default run folder
 # ---------------------------------------------------------------------------
@@ -50,8 +50,7 @@ EXPORT_META_NAME = "model_export.meta.json"
 EXAMPLE_BATCH_SIZE = 1
 STRICT_TRACE = True
 SUPPRESS_KNOWN_EXPORT_WARNINGS = True
-RUN_NAME = "v2"
-RUN_DIR: Path | None = Path("models") / RUN_NAME
+MODEL_DIR: Path | None = Path("models") / "shortstep_0p1d_v1"
 CHECKPOINT_PATH: Path | None = None
 
 # Keep the device choice explicit for now. Supported values are only "cpu" and
@@ -89,16 +88,16 @@ def _display_repo_path(path: Path) -> str:
     return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
 
 
-def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -> Path:
+def _resolve_checkpoint_path(*, model_dir: Path | None, checkpoint: Path | None) -> Path:
     """Resolve checkpoint path from top-level run settings."""
     if checkpoint is not None:
         resolved = _resolve_repo_path(checkpoint)
         if not resolved.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(checkpoint)}")
         return resolved
-    if run_dir is None:
-        raise ValueError("Set RUN_DIR or CHECKPOINT_PATH at the top of this file")
-    ckpt_rel_path = Path(run_dir) / "best.pt"
+    if model_dir is None:
+        raise ValueError("Set MODEL_DIR or CHECKPOINT_PATH at the top of this file")
+    ckpt_rel_path = Path(model_dir) / "best.pt"
     ckpt_path = _resolve_repo_path(ckpt_rel_path)
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(ckpt_rel_path)}")
@@ -480,7 +479,7 @@ class PhysicalStateExportModule(nn.Module):
 def main() -> None:
     """Export the selected checkpoint."""
     _setup_warning_filters()
-    ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
+    ckpt_path = _resolve_checkpoint_path(model_dir=MODEL_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
     export_path = (
         _resolve_repo_path(OUTPUT_PATH)

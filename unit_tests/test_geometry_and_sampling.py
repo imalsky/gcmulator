@@ -130,6 +130,31 @@ def test_fixed_live_transition_catalog_picks_exact_gap() -> None:
     assert catalog.burn_in_start_index == 0
 
 
+def test_fixed_72_step_transition_catalog_picks_one_saved_gap() -> None:
+    """A config-resolved 72-step jump should map to one exact saved checkpoint gap."""
+    fixed_transition_days = 72.0 * 120.0 / 86400.0
+    schedule = build_uniform_checkpoint_schedule(
+        time_days=100.0,
+        dt_seconds=120.0,
+        saved_snapshots_per_sim=1000,
+    )
+    catalog = build_live_transition_catalog(
+        checkpoint_days=schedule.checkpoint_days,
+        burn_in_days=0.0,
+        transition_days_min=fixed_transition_days,
+        transition_days_max=fixed_transition_days,
+        tolerance_fraction=0.0,
+    )
+
+    assert np.array_equal(catalog.gap_offsets, np.array([1], dtype=np.int64))
+    assert np.allclose(
+        catalog.transition_days,
+        np.array([fixed_transition_days], dtype=np.float64),
+    )
+    assert np.allclose(catalog.probabilities, np.array([1.0], dtype=np.float64))
+    assert catalog.burn_in_start_index == 0
+
+
 def test_variable_live_transition_catalog_stays_within_saved_gaps() -> None:
     """Variable live jumps should only use feasible saved checkpoint gaps."""
     step_days = 240.0 / 86400.0

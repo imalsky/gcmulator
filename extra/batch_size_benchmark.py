@@ -66,8 +66,7 @@ DEVICE_MARKERS = {
 }
 
 # User-editable run settings
-RUN_NAME = "v1"
-RUN_DIR: Path | None = Path("models") / RUN_NAME
+MODEL_DIR: Path | None = Path("models") / "shortstep_0p1d_v1"
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 DEVICE_MODES: Sequence[str] = ("cpu", "gpu")
@@ -97,16 +96,16 @@ def _display_repo_path(path: Path) -> str:
     return str(Path(os.path.relpath(_resolve_repo_path(path), start=PROJECT_ROOT)))
 
 
-def _resolve_checkpoint_path(*, run_dir: Path | None, checkpoint: Path | None) -> Path:
+def _resolve_checkpoint_path(*, model_dir: Path | None, checkpoint: Path | None) -> Path:
     """Resolve checkpoint path from the top-level run settings."""
     if checkpoint is not None:
         resolved = _resolve_repo_path(checkpoint)
         if not resolved.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(checkpoint)}")
         return resolved
-    if run_dir is None:
-        raise ValueError("Set RUN_DIR or CHECKPOINT_PATH at the top of this file")
-    ckpt_rel_path = Path(run_dir) / "best.pt"
+    if model_dir is None:
+        raise ValueError("Set MODEL_DIR or CHECKPOINT_PATH at the top of this file")
+    ckpt_rel_path = Path(model_dir) / "best.pt"
     ckpt_path = _resolve_repo_path(ckpt_rel_path)
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {_display_repo_path(ckpt_rel_path)}")
@@ -368,7 +367,7 @@ def _save_figure(*, rows: Sequence[Dict[str, Any]], out_path: Path) -> None:
 def main() -> None:
     """Benchmark held-out direct-jump inference latency across batch sizes."""
     _apply_plot_style()
-    ckpt_path = _resolve_checkpoint_path(run_dir=RUN_DIR, checkpoint=CHECKPOINT_PATH)
+    ckpt_path = _resolve_checkpoint_path(model_dir=MODEL_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent
     figure_path = (
         _resolve_repo_path(FIGURE_PATH)

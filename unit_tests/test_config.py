@@ -132,6 +132,31 @@ def test_load_config_accepts_variable_live_transition_range(tmp_path: Path) -> N
     assert cfg.sampling.uses_variable_live_transition() is True
 
 
+def test_load_config_resolves_fixed_transition_steps(tmp_path: Path) -> None:
+    """A fixed solver-step jump should resolve onto the day-valued jump contract."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["dt_seconds"] = 120.0
+    solver_section["default_time_days"] = 100.0
+    payload["solver"] = solver_section
+
+    sampling_section = dict(payload["sampling"])
+    sampling_section.pop("saved_checkpoint_interval_days")
+    sampling_section["saved_snapshots_per_sim"] = 1000
+    sampling_section["fixed_transition_steps"] = 72
+    sampling_section.pop("live_transition_days_min")
+    sampling_section.pop("live_transition_days_max")
+    payload["sampling"] = sampling_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    assert cfg.sampling.fixed_transition_steps == 72
+    assert cfg.sampling.live_transition_days_min == pytest.approx(0.1)
+    assert cfg.sampling.live_transition_days_max == pytest.approx(0.1)
+    assert cfg.sampling.uses_variable_live_transition() is False
+
+
 def test_load_config_rejects_inverted_live_transition_range(tmp_path: Path) -> None:
     """The max live jump must not be smaller than the min live jump."""
     payload = _minimal_config_dict()
@@ -142,6 +167,53 @@ def test_load_config_rejects_inverted_live_transition_range(tmp_path: Path) -> N
 
     config_path = _write_config(tmp_path, payload)
     with pytest.raises(ValueError, match="live_transition_days_min"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_fixed_steps_with_day_range(tmp_path: Path) -> None:
+    """The fixed-step jump knob must not be combined with day-valued jump fields."""
+    payload = _minimal_config_dict()
+    sampling_section = dict(payload["sampling"])
+    sampling_section["fixed_transition_steps"] = 2
+    payload["sampling"] = sampling_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_nonpositive_fixed_transition_steps(tmp_path: Path) -> None:
+    """The fixed-step jump knob must stay strictly positive."""
+    payload = _minimal_config_dict()
+    sampling_section = dict(payload["sampling"])
+    sampling_section["fixed_transition_steps"] = 0
+    sampling_section.pop("live_transition_days_min")
+    sampling_section.pop("live_transition_days_max")
+    payload["sampling"] = sampling_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="fixed_transition_steps"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_unrepresentable_fixed_transition_steps(tmp_path: Path) -> None:
+    """Fixed-step jumps must land exactly on the saved checkpoint cadence."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["dt_seconds"] = 120.0
+    solver_section["default_time_days"] = 100.0
+    payload["solver"] = solver_section
+
+    sampling_section = dict(payload["sampling"])
+    sampling_section.pop("saved_checkpoint_interval_days")
+    sampling_section["saved_snapshots_per_sim"] = 1000
+    sampling_section["fixed_transition_steps"] = 73
+    sampling_section.pop("live_transition_days_min")
+    sampling_section.pop("live_transition_days_max")
+    payload["sampling"] = sampling_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="exactly representable"):
         load_config(config_path)
 
 
