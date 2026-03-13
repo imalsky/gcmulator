@@ -8,7 +8,7 @@
   "solver": {
     "M": 42,
     "dt_seconds": 120.0,
-    "default_time_days": 100.0,
+    "default_time_days": 5.2,
     "starttime_index": 2
   },
   "geometry": {
@@ -18,7 +18,7 @@
   "sampling": {
     "seed": 42,
     "n_sims": 500,
-    "generation_workers": 0,
+    "generation_workers": 1,
     "burn_in_days": 5.0,
     "saved_checkpoint_interval_days": 0.001388888888888889,
     "fixed_transition_steps": 1,
