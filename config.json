@@ -1,14 +1,14 @@
 {
   "paths": {
-    "dataset_dir": "data/raw_v1_like",
-    "processed_dir": "data/processed_v1_like",
-    "model_dir": "models/v1_like",
+    "dataset_dir": "data/raw_v1_like_10day",
+    "processed_dir": "data/processed_v1_like_10day",
+    "model_dir": "models/v1_like_10day",
     "overwrite_dataset": false
   },
   "solver": {
     "M": 42,
     "dt_seconds": 120.0,
-    "default_time_days": 5.2,
+    "default_time_days": 20.0,
     "starttime_index": 2
   },
   "geometry": {
@@ -20,9 +20,9 @@
     "n_sims": 500,
     "generation_workers": 1,
     "burn_in_days": 5.0,
-    "saved_checkpoint_interval_days": 0.001388888888888889,
-    "fixed_transition_steps": 1,
-    "pairs_per_sim": 128,
+    "saved_checkpoint_interval_days": 10.0,
+    "fixed_transition_steps": 7200,
+    "pairs_per_sim": 1,
     "pair_sampling_policy": "uniform_pairs",
     "live_transition_tolerance_fraction": 0.0,
     "parameters": [
