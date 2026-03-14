@@ -11,7 +11,7 @@
 #SBATCH -t 08:00:00
 
 set -euo pipefail
-
+#small change
 # Resolve repository root from script location for reproducible relative paths.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
