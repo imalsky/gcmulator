@@ -49,7 +49,22 @@ Default operator routine:
    `python -m gcmulator --gen --config config.json`
    `python -m gcmulator --train --config config.json`
 8. The checked-in default `config.json` is the unforced brown-dwarf preset.
-   The prior hot-Jupiter preset is preserved in `config_HJ.json`.
+9. The preserved forced hot-Jupiter preset is `config_HJ.json`.
+
+### 1.2 Preset Selection
+The repository now supports two checked-in solver presets:
+1. `config.json`
+   Generic brown-dwarf regime with exact unforced dynamics
+   (`solver.forcing_mode="unforced"`).
+2. `config_HJ.json`
+   Forced hot-Jupiter regime with dayside irradiation
+   (`solver.forcing_mode="forced"`).
+
+Operator rule:
+1. Use `config.json` when you want a non-irradiated, generic brown-dwarf run.
+2. Use `config_HJ.json` when you want the previous irradiated hot-Jupiter run.
+3. For custom experiments, copy one of those configs and then edit the physical
+   parameters and `solver.forcing_mode` explicitly.
 
 Important dependency naming:
 1. the install package is `torch-harmonics==0.8.1`
@@ -127,6 +142,13 @@ In both cases the backend keeps:
 The checked-in default `config.json` targets the modified-Euler,
 diffusion-enabled, unforced brown-dwarf path. The preserved
 `config_HJ.json` preset targets the forced hot-Jupiter path.
+
+Practical interpretation:
+1. `solver.forcing_mode="unforced"` means exact no-irradiation evolution.
+2. `solver.forcing_mode="forced"` means irradiated evolution using the active
+   `DPhieq`, `taurad_s`, and `taudrag_s` values from the config.
+3. Switching between brown-dwarf and hot-Jupiter presets does not change the
+   learned interface shape; it changes the solver regime and physical defaults.
 
 ### 3.2 Prognostic State Variables
 The emulator operates autoregressively on five visible state channels in this
@@ -341,25 +363,56 @@ All commands assume the working directory is the repository root (`gcmulator/`)
 and that the package has been installed once with
 `python -m pip install -e . --no-build-isolation`.
 
-**Generate raw training data:**
+**Generate raw training data with the default brown-dwarf preset:**
 ```bash
 python -m gcmulator --gen --config config.json
 ```
 
-**Train the emulator** (includes preprocessing):
+**Train the emulator with the default brown-dwarf preset** (includes preprocessing):
 ```bash
 python -m gcmulator --train --config config.json
 ```
 
-**Both stages in sequence** (manual equivalent once the environment is active):
+**Generate raw training data with the preserved hot-Jupiter preset:**
+```bash
+python -m gcmulator --gen --config config_HJ.json
+```
+
+**Train the emulator with the preserved hot-Jupiter preset** (includes preprocessing):
+```bash
+python -m gcmulator --train --config config_HJ.json
+```
+
+**Both stages in sequence for the brown-dwarf preset**:
 ```bash
 python -m gcmulator --gen --config config.json
 python -m gcmulator --train --config config.json
+```
+
+**Both stages in sequence for the hot-Jupiter preset**:
+```bash
+python -m gcmulator --gen --config config_HJ.json
+python -m gcmulator --train --config config_HJ.json
 ```
 
 On JPL `gattaca2`, `run.sh` wraps the same generation/training flow for Slurm.
 In a NASA NAS environment, `run.pbs` is the PBS entrypoint for the same
-workflow.
+workflow. Both launcher scripts default to `config.json`, so use
+`CONFIG_PATH=config_HJ.json` when you want the preserved hot-Jupiter flow:
+
+```bash
+CONFIG_PATH=config_HJ.json ./run.sh
+```
+
+```bash
+CONFIG_PATH=config_HJ.json qsub run.pbs
+```
+
+**Custom solver-mode rule**
+1. Set `solver.forcing_mode` to `"unforced"` for exact non-irradiated dynamics.
+2. Set `solver.forcing_mode` to `"forced"` for irradiated dynamics.
+3. Keep the 7 conditioning parameters in the config in either case; unforced
+   runs may keep `DPhieq`, `taurad_s`, and `taudrag_s` fixed for compatibility.
 
 **Utility scripts** (run from the repository root after training):
 ```bash

@@ -128,6 +128,37 @@ def _expected_geometry(cfg: GCMulatorConfig, *, nlon: int) -> Dict[str, Any]:
     }
 
 
+def _raise_nonfinite_raw_array(
+    *,
+    array: np.ndarray,
+    name: str,
+    file_path: Path,
+    checkpoint_days: np.ndarray | None = None,
+) -> None:
+    """Raise a detailed error when one raw numeric payload contains NaNs/Infs."""
+    finite_mask = np.isfinite(array)
+    if bool(np.all(finite_mask)):
+        return
+    first_bad = np.argwhere(~finite_mask)[0]
+    location = ", ".join(
+        f"dim{dim_index}={int(index_value)}"
+        for dim_index, index_value in enumerate(first_bad.tolist())
+    )
+    detail = ""
+    if name == "checkpoint_states" and checkpoint_days is not None and len(first_bad) >= 2:
+        checkpoint_index = int(first_bad[0])
+        channel_index = int(first_bad[1])
+        channel_name = str(PHYSICAL_STATE_FIELDS[channel_index])
+        checkpoint_day = float(checkpoint_days[checkpoint_index])
+        detail = (
+            f", checkpoint_index={checkpoint_index}, day={checkpoint_day:.6f}, "
+            f"channel={channel_name}"
+        )
+    raise ValueError(
+        f"Raw file {file_path} has non-finite {name}{detail} at {location}"
+    )
+
+
 def _list_raw_dataset_files(dataset_dir: Path) -> List[Path]:
     """List raw simulation files and reject unsupported legacy leftovers."""
     legacy_files = sorted(dataset_dir.glob("sim_*.npz"))
@@ -201,6 +232,22 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
         raise ValueError(f"checkpoint_days shape mismatch in {file_path}")
     if params.shape != (len(CONDITIONING_PARAM_NAMES),):
         raise ValueError(f"params shape mismatch in {file_path}: {params.shape}")
+    _raise_nonfinite_raw_array(
+        array=checkpoint_days,
+        name="checkpoint_days",
+        file_path=file_path,
+    )
+    _raise_nonfinite_raw_array(
+        array=params,
+        name="params",
+        file_path=file_path,
+    )
+    _raise_nonfinite_raw_array(
+        array=checkpoint_states,
+        name="checkpoint_states",
+        file_path=file_path,
+        checkpoint_days=checkpoint_days,
+    )
     if int(checkpoint_states.shape[0]) != n_saved_checkpoints:
         raise ValueError(f"n_saved_checkpoints mismatch in {file_path}")
     if int(checkpoint_states.shape[2]) != nlat or int(checkpoint_states.shape[3]) != nlon:

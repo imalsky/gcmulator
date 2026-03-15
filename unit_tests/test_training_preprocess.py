@@ -108,7 +108,13 @@ def _config_dict(*, forcing_mode: str = "forced") -> dict[str, object]:
     }
 
 
-def _write_raw_payload(raw_dir: Path, *, sim_idx: int, forcing_mode: str = "forced") -> None:
+def _write_raw_payload(
+    raw_dir: Path,
+    *,
+    sim_idx: int,
+    forcing_mode: str = "forced",
+    inject_nan: bool = False,
+) -> None:
     """Write one small raw checkpoint-sequence payload."""
     nlat = 2
     nlon = 4
@@ -135,6 +141,8 @@ def _write_raw_payload(raw_dir: Path, *, sim_idx: int, forcing_mode: str = "forc
         ],
         axis=0,
     )
+    if inject_nan:
+        checkpoint_states[3, 1, 0, 0] = np.nan
     params = np.array(
         [
             (7.1492e7 if forcing_mode == "unforced" else 8.2e7) + 1.0e5 * sim_idx,
@@ -254,4 +262,19 @@ def test_preprocess_dataset_rejects_forcing_mode_mismatch(tmp_path: Path) -> Non
 
     cfg = load_config(config_path)
     with pytest.raises(ValueError, match="forcing_mode"):
+        preprocess_dataset(cfg, config_path=config_path)
+
+
+def test_preprocess_dataset_rejects_nonfinite_raw_checkpoint_states(tmp_path: Path) -> None:
+    """Raw checkpoint sequences must fail fast when the solver emitted NaNs/Infs."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_config_dict(forcing_mode="unforced")), encoding="utf-8")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    _write_raw_payload(raw_dir, sim_idx=0, forcing_mode="unforced", inject_nan=True)
+    _write_raw_payload(raw_dir, sim_idx=1, forcing_mode="unforced")
+    _write_raw_payload(raw_dir, sim_idx=2, forcing_mode="unforced")
+
+    cfg = load_config(config_path)
+    with pytest.raises(ValueError, match="non-finite checkpoint_states"):
         preprocess_dataset(cfg, config_path=config_path)

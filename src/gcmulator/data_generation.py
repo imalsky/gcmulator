@@ -34,6 +34,34 @@ LOGGER = logging.getLogger("generate")
 GPU_BACKENDS = {"gpu", "cuda", "rocm", "metal"}
 
 
+def _raise_nonfinite_checkpoint_states(
+    *,
+    checkpoint_states: np.ndarray,
+    checkpoint_days: np.ndarray,
+    sim_idx: int,
+    params_json: Dict[str, float],
+) -> None:
+    """Raise a detailed error when one generated trajectory contains NaNs/Infs."""
+    finite_mask = np.isfinite(checkpoint_states)
+    if bool(np.all(finite_mask)):
+        return
+    first_bad = np.argwhere(~finite_mask)[0]
+    checkpoint_index = int(first_bad[0])
+    channel_index = int(first_bad[1])
+    lat_index = int(first_bad[2])
+    lon_index = int(first_bad[3])
+    checkpoint_day = float(checkpoint_days[checkpoint_index])
+    channel_name = str(PHYSICAL_STATE_FIELDS[channel_index])
+    bad_value = float(checkpoint_states[checkpoint_index, channel_index, lat_index, lon_index])
+    raise RuntimeError(
+        "Generated checkpoint_states contain non-finite values for "
+        f"sim_{sim_idx:06d} at checkpoint_index={checkpoint_index} "
+        f"(day={checkpoint_day:.6f}), channel={channel_name}, "
+        f"lat_index={lat_index}, lon_index={lon_index}, value={bad_value!r}, "
+        f"params={params_json}"
+    )
+
+
 def _list_existing_raw_files(dataset_dir: Path) -> List[Path]:
     """Return generated raw simulation files written by the active contract."""
     return sorted(dataset_dir.glob("sim_*.npy"))
@@ -86,6 +114,12 @@ def _write_sim_record(
         raise ValueError("checkpoint_states and checkpoint_steps must align")
     if int(checkpoint_states.shape[0]) < 2:
         raise RuntimeError("At least two checkpoints are required per trajectory")
+    _raise_nonfinite_checkpoint_states(
+        checkpoint_states=np.asarray(checkpoint_states, dtype=np.float64),
+        checkpoint_days=np.asarray(checkpoint_days, dtype=np.float64),
+        sim_idx=int(sim_idx),
+        params_json=params_json,
+    )
 
     states_geom, geometry_info = apply_geometry_state(
         checkpoint_states.astype(np.float64, copy=True),

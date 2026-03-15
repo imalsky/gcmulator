@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import gcmulator.data_generation as data_generation_mod
@@ -111,4 +112,30 @@ def test_generate_dataset_rejects_legacy_npz_before_backend_setup(
     monkeypatch.setattr(data_generation_mod, "ensure_my_swamp_importable", _unexpected)
 
     with pytest.raises(RuntimeError, match="sim_\\*\\.npz"):
+        data_generation_mod.generate_dataset(cfg, config_path=config_path)
+
+
+def test_generate_dataset_rejects_nonfinite_checkpoint_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generated trajectories with NaNs/Infs should fail before being written to disk."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_config_dict()), encoding="utf-8")
+    cfg = load_config(config_path)
+
+    def _no_op(*args: object, **kwargs: object) -> None:
+        return None
+
+    def _fake_run(*args: object, checkpoint_steps: object, **kwargs: object):
+        n_checkpoints = len(checkpoint_steps)  # type: ignore[arg-type]
+        states = np.zeros((n_checkpoints, 5, 2, 4), dtype=np.float64)
+        states[1, 0, 0, 0] = np.nan
+        return states
+
+    monkeypatch.setattr(data_generation_mod, "ensure_my_swamp_importable", _no_op)
+    monkeypatch.setattr(data_generation_mod, "detect_jax_backend", lambda: "cpu")
+    monkeypatch.setattr(data_generation_mod, "run_trajectory_checkpoints", _fake_run)
+
+    with pytest.raises(RuntimeError, match="non-finite values.*sim_000000"):
         data_generation_mod.generate_dataset(cfg, config_path=config_path)
