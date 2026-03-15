@@ -153,7 +153,7 @@ def test_checked_in_presets_load() -> None:
     hot_jupiter_cfg = load_config(repo_root / "config_HJ.json")
 
     assert brown_dwarf_cfg.solver.forcing_mode == "unforced"
-    assert brown_dwarf_cfg.solver.default_time_days == pytest.approx(0.05)
+    assert brown_dwarf_cfg.solver.default_time_days == pytest.approx(20.0)
     assert hot_jupiter_cfg.solver.forcing_mode == "forced"
 
 
