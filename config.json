@@ -17,7 +17,7 @@
     "roll_longitude_to_0_2pi": true
   },
   "sampling": {
-    "seed": 42,
+    "seed": 43,
     "n_sims": 500,
     "generation_workers": 1,
     "burn_in_days": 0.0,
