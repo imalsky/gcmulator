@@ -1,14 +1,14 @@
 {
   "paths": {
-    "dataset_dir": "data/raw_brown_dwarf_unforced",
-    "processed_dir": "data/processed_brown_dwarf_unforced",
-    "model_dir": "models/brown_dwarf_unforced",
+    "dataset_dir": "data/raw_brown_dwarf_pilot",
+    "processed_dir": "data/processed_brown_dwarf_pilot",
+    "model_dir": "models/brown_dwarf_pilot",
     "overwrite_dataset": false
   },
   "solver": {
     "M": 42,
-    "dt_seconds": 120.0,
-    "default_time_days": 100.0,
+    "dt_seconds": 240.0,
+    "default_time_days": 0.05,
     "starttime_index": 2,
     "forcing_mode": "unforced"
   },
@@ -17,13 +17,13 @@
     "roll_longitude_to_0_2pi": true
   },
   "sampling": {
-    "seed": 43,
-    "n_sims": 500,
+    "seed": 42,
+    "n_sims": 8,
     "generation_workers": 1,
     "burn_in_days": 0.0,
-    "saved_checkpoint_interval_days": 10.0,
-    "fixed_transition_steps": 7200,
-    "pairs_per_sim": 10,
+    "saved_checkpoint_interval_days": 0.005555555555555556,
+    "fixed_transition_steps": 8,
+    "pairs_per_sim": 4,
     "pair_sampling_policy": "uniform_pairs",
     "live_transition_tolerance_fraction": 0.0,
     "parameters": [
@@ -31,8 +31,8 @@
       { "name": "omega_rad_s", "dist": "fixed", "value": 0.0003490658503988659 },
       { "name": "Phibar", "dist": "fixed", "value": 300000.0 },
       { "name": "DPhieq", "dist": "fixed", "value": 0.0 },
-      { "name": "taurad_hours", "dist": "fixed", "value": 10.0},
-      { "name": "taudrag_hours", "dist": "fixed", "value": 6.0},
+      { "name": "taurad_hours", "dist": "fixed", "value": 10.0 },
+      { "name": "taudrag_hours", "dist": "fixed", "value": 6.0 },
       { "name": "g_m_s2", "dist": "fixed", "value": 300.0 }
     ]
   },
@@ -58,9 +58,9 @@
     "grid": "legendre-gauss",
     "grid_internal": "legendre-gauss",
     "scale_factor": 2,
-    "embed_dim": 256,
-    "num_layers": 3,
-    "encoder_layers": 3,
+    "embed_dim": 64,
+    "num_layers": 2,
+    "encoder_layers": 2,
     "activation_function": "gelu",
     "use_mlp": true,
     "mlp_ratio": 2.0,
@@ -78,8 +78,8 @@
     "device": "auto",
     "amp_mode": "none",
     "deterministic": false,
-    "epochs": 100,
-    "batch_size": 32,
+    "epochs": 5,
+    "batch_size": 4,
     "num_workers": 0,
     "shuffle": true,
     "preload_to_gpu": false,
@@ -87,12 +87,12 @@
     "learning_rate": 1e-3,
     "weight_decay": 1e-5,
     "grad_clip_norm": 32.0,
-    "val_fraction": 0.1,
-    "test_fraction": 0.1,
+    "val_fraction": 0.25,
+    "test_fraction": 0.25,
     "split_seed": 42,
     "scheduler": {
       "type": "cosine_warmup",
-      "warmup_epochs": 10,
+      "warmup_epochs": 1,
       "min_lr": 1e-6
     }
   }

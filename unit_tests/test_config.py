@@ -146,13 +146,14 @@ def test_load_config_rejects_invalid_forcing_mode(tmp_path: Path) -> None:
 
 
 def test_checked_in_presets_load() -> None:
-    """Both checked-in experiment presets should remain parseable."""
+    """Checked-in experiment presets should remain parseable."""
     repo_root = Path(__file__).resolve().parents[1]
 
     brown_dwarf_cfg = load_config(repo_root / "config.json")
     hot_jupiter_cfg = load_config(repo_root / "config_HJ.json")
 
     assert brown_dwarf_cfg.solver.forcing_mode == "unforced"
+    assert brown_dwarf_cfg.solver.default_time_days == pytest.approx(0.05)
     assert hot_jupiter_cfg.solver.forcing_mode == "forced"
 
 
