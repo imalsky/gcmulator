@@ -26,6 +26,7 @@ DEFAULT_SCHEDULER_EPS = 1.0e-10
 TransformName = Literal["none", "log10", "signed_log1p"]
 PairSamplingPolicy = Literal["uniform_pairs", "uniform_gaps", "inverse_time"]
 PairIterationMode = Literal["live_sampled_gpu", "resample_from_saved_sequences"]
+ForcingMode = Literal["forced", "unforced"]
 
 PHYSICAL_STATE_FIELDS = ("Phi", "U", "V", "eta", "delta")
 PROGNOSTIC_STATE_FIELDS = ("Phi", "eta", "delta")
@@ -51,6 +52,7 @@ TAUDRAG_ALIASES = ("taudrag_s", "taudrag_hours")
 INTERNAL_FIXED_PARAM_NAMES = ("K6", "K6Phi")
 VALID_PARAM_DISTS = {"uniform", "loguniform", "const", "fixed", "mixture_off_loguniform"}
 TORCH_HARMONICS_REQUIRED_VERSION = "0.8.1"
+VALID_FORCING_MODES = {"forced", "unforced"}
 
 
 def canonicalize_state_field(field_name: str) -> str:
@@ -116,6 +118,7 @@ class SolverConfig:
     dt_seconds: float = 240.0
     default_time_days: float = 100.0
     starttime_index: int = 2
+    forcing_mode: ForcingMode = "forced"
 
 
 @dataclass(frozen=True)
@@ -285,7 +288,7 @@ TOP_LEVEL_CONFIG_KEYS = {
     "training",
 }
 PATHS_KEYS = {"dataset_dir", "processed_dir", "model_dir", "overwrite_dataset"}
-SOLVER_KEYS = {"M", "dt_seconds", "default_time_days", "starttime_index"}
+SOLVER_KEYS = {"M", "dt_seconds", "default_time_days", "starttime_index", "forcing_mode"}
 GEOMETRY_KEYS = {"flip_latitude_to_north_south", "roll_longitude_to_0_2pi"}
 SAMPLING_KEYS = {
     "seed",
@@ -413,6 +416,7 @@ def _parse_solver(d: Dict[str, Any]) -> SolverConfig:
         dt_seconds=float(d.get("dt_seconds", 240.0)),
         default_time_days=float(d.get("default_time_days", 100.0)),
         starttime_index=int(d.get("starttime_index", 2)),
+        forcing_mode=str(d.get("forcing_mode", "forced")),
     )
 
 
@@ -808,6 +812,11 @@ def validate_config(cfg: GCMulatorConfig) -> None:
         raise ValueError("solver.default_time_days must be > 0")
     if cfg.solver.starttime_index < 2:
         raise ValueError("solver.starttime_index must be >= 2")
+    if cfg.solver.forcing_mode not in VALID_FORCING_MODES:
+        raise ValueError(
+            "solver.forcing_mode must be one of "
+            "['forced','unforced']"
+        )
 
     if cfg.sampling.n_sims < 1:
         raise ValueError("sampling.n_sims must be >= 1")

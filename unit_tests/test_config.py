@@ -117,6 +117,43 @@ def test_load_config_allows_zero_burn_in(tmp_path: Path) -> None:
     assert cfg.sampling.burn_in_days == pytest.approx(0.0)
     assert cfg.sampling.generation_workers == 2
     assert cfg.sampling.uses_variable_live_transition() is False
+    assert cfg.solver.forcing_mode == "forced"
+
+
+def test_load_config_accepts_unforced_solver_mode(tmp_path: Path) -> None:
+    """The solver config should expose exact unforced MY_SWAMP evolution."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["forcing_mode"] = "unforced"
+    payload["solver"] = solver_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    assert cfg.solver.forcing_mode == "unforced"
+
+
+def test_load_config_rejects_invalid_forcing_mode(tmp_path: Path) -> None:
+    """Unsupported forcing-mode names should fail validation."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["forcing_mode"] = "brown_dwarf"
+    payload["solver"] = solver_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="solver.forcing_mode"):
+        load_config(config_path)
+
+
+def test_checked_in_presets_load() -> None:
+    """Both checked-in experiment presets should remain parseable."""
+    repo_root = Path(__file__).resolve().parents[1]
+
+    brown_dwarf_cfg = load_config(repo_root / "config.json")
+    hot_jupiter_cfg = load_config(repo_root / "config_HJ.json")
+
+    assert brown_dwarf_cfg.solver.forcing_mode == "unforced"
+    assert hot_jupiter_cfg.solver.forcing_mode == "forced"
 
 
 def test_load_config_accepts_variable_live_transition_range(tmp_path: Path) -> None:

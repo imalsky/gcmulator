@@ -79,7 +79,7 @@ def test_batched_checkpoint_sequences_match_serial() -> None:
 
 
 def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None:
-    """A minimal generation run should write checkpoint sequences with batch size > 1."""
+    """A minimal unforced generation run should write checkpoint sequences with batch size > 1."""
     step_days = 240.0 / 86400.0
     saved_interval_days = 2.0 * step_days
     cfg_dict = {
@@ -94,6 +94,7 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "dt_seconds": 240.0,
             "default_time_days": 0.05,
             "starttime_index": 2,
+            "forcing_mode": "unforced",
         },
         "geometry": {
             "flip_latitude_to_north_south": True,
@@ -110,13 +111,13 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
             "live_transition_days_max": 2.0 * saved_interval_days,
             "live_transition_tolerance_fraction": 0.1,
             "parameters": [
-                {"name": "a_m", "dist": "fixed", "value": 8.2e7},
-                {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
+                {"name": "a_m", "dist": "fixed", "value": 7.1492e7},
+                {"name": "omega_rad_s", "dist": "fixed", "value": 0.0003490658503988659},
                 {"name": "Phibar", "dist": "fixed", "value": 3.0e5},
-                {"name": "DPhieq", "dist": "fixed", "value": 1.0e6},
+                {"name": "DPhieq", "dist": "fixed", "value": 0.0},
                 {"name": "taurad_hours", "dist": "fixed", "value": 10.0},
                 {"name": "taudrag_hours", "dist": "fixed", "value": 6.0},
-                {"name": "g_m_s2", "dist": "fixed", "value": 9.8},
+                {"name": "g_m_s2", "dist": "fixed", "value": 300.0},
             ],
         },
         "normalization": {
@@ -179,16 +180,20 @@ def test_generate_dataset_supports_zero_burn_in_and_batched_generation() -> None
     assert manifest["sampling"]["generation_workers"] == 2
     assert manifest["sampling"]["resolved_generation_batch_size"] == 2
     assert manifest["sampling"]["uses_variable_live_transition"] is True
+    assert manifest["solver"]["forcing_mode"] == "unforced"
     assert manifest["n_saved_checkpoints"] == int(expected_schedule.checkpoint_steps.shape[0])
     assert np.allclose(manifest["checkpoint_days"], expected_schedule.checkpoint_days)
     for payload in raw_payloads:
         checkpoint_states = np.asarray(payload["checkpoint_states"], dtype=np.float64)
         checkpoint_steps = np.asarray(payload["checkpoint_steps"], dtype=np.int64)
         checkpoint_days = np.asarray(payload["checkpoint_days"], dtype=np.float64)
+        forcing_mode = str(np.asarray(payload["forcing_mode"], dtype=object).item())
         assert "transition_days" not in payload
         assert "anchor_steps" not in payload
         assert checkpoint_states.ndim == 4
         assert checkpoint_states.shape[0] == expected_schedule.checkpoint_steps.shape[0]
         assert checkpoint_states.shape[1] == len(PHYSICAL_STATE_FIELDS)
+        assert forcing_mode == "unforced"
+        assert np.all(np.isfinite(checkpoint_states))
         assert np.array_equal(checkpoint_steps, expected_schedule.checkpoint_steps)
         assert np.allclose(checkpoint_days, expected_schedule.checkpoint_days)

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from gcmulator.config import (
     CONDITIONING_PARAM_NAMES,
@@ -18,10 +19,11 @@ from gcmulator.sampling import build_uniform_checkpoint_schedule
 from gcmulator.training import preprocess_dataset
 
 
-def _config_dict() -> dict[str, object]:
+def _config_dict(*, forcing_mode: str = "forced") -> dict[str, object]:
     """Return a small preprocessing-only config."""
     step_days = 240.0 / 86400.0
     fixed_jump_days = 2.0 * step_days
+    is_unforced = forcing_mode == "unforced"
     return {
         "paths": {
             "dataset_dir": "raw",
@@ -34,6 +36,7 @@ def _config_dict() -> dict[str, object]:
             "dt_seconds": 240.0,
             "default_time_days": 0.05,
             "starttime_index": 2,
+            "forcing_mode": forcing_mode,
         },
         "geometry": {
             "flip_latitude_to_north_south": True,
@@ -50,13 +53,17 @@ def _config_dict() -> dict[str, object]:
             "live_transition_days_max": fixed_jump_days,
             "live_transition_tolerance_fraction": 0.1,
             "parameters": [
-                {"name": "a_m", "dist": "fixed", "value": 8.2e7},
-                {"name": "omega_rad_s", "dist": "fixed", "value": 3.2e-5},
+                {"name": "a_m", "dist": "fixed", "value": 7.1492e7 if is_unforced else 8.2e7},
+                {
+                    "name": "omega_rad_s",
+                    "dist": "fixed",
+                    "value": 0.0003490658503988659 if is_unforced else 3.2e-5,
+                },
                 {"name": "Phibar", "dist": "fixed", "value": 3.0e5},
-                {"name": "DPhieq", "dist": "fixed", "value": 1.0e6},
+                {"name": "DPhieq", "dist": "fixed", "value": 0.0 if is_unforced else 1.0e6},
                 {"name": "taurad_hours", "dist": "fixed", "value": 10.0},
                 {"name": "taudrag_hours", "dist": "fixed", "value": 6.0},
-                {"name": "g_m_s2", "dist": "fixed", "value": 9.8},
+                {"name": "g_m_s2", "dist": "fixed", "value": 300.0 if is_unforced else 9.8},
             ],
         },
         "normalization": {
@@ -101,7 +108,7 @@ def _config_dict() -> dict[str, object]:
     }
 
 
-def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
+def _write_raw_payload(raw_dir: Path, *, sim_idx: int, forcing_mode: str = "forced") -> None:
     """Write one small raw checkpoint-sequence payload."""
     nlat = 2
     nlon = 4
@@ -130,13 +137,13 @@ def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
     )
     params = np.array(
         [
-            8.2e7 + 1.0e5 * sim_idx,
-            3.2e-5,
+            (7.1492e7 if forcing_mode == "unforced" else 8.2e7) + 1.0e5 * sim_idx,
+            0.0003490658503988659 if forcing_mode == "unforced" else 3.2e-5,
             3.0e5,
-            1.0e6,
+            0.0 if forcing_mode == "unforced" else 1.0e6,
             10.0 * 3600.0,
             6.0 * 3600.0,
-            9.8,
+            300.0 if forcing_mode == "unforced" else 9.8,
         ],
         dtype=np.float64,
     )
@@ -151,6 +158,7 @@ def _write_raw_payload(raw_dir: Path, *, sim_idx: int) -> None:
         "burn_in_days": np.asarray(0.0, dtype=np.float64),
         "dt_seconds": np.asarray(240.0, dtype=np.float64),
         "starttime_index": np.asarray(2, dtype=np.int64),
+        "forcing_mode": np.asarray(forcing_mode, dtype=object),
         "saved_checkpoint_interval_days": np.asarray(schedule.interval_days, dtype=np.float64),
         "n_saved_checkpoints": np.asarray(int(schedule.checkpoint_steps.shape[0]), dtype=np.int64),
         "M": np.asarray(42, dtype=np.int64),
@@ -212,3 +220,38 @@ def test_preprocess_dataset_fits_state_stats_from_train_checkpoints(tmp_path: Pa
     train_channel_means = train_states_norm.mean(axis=(0, 2, 3))
 
     assert np.allclose(train_channel_means, 0.0, atol=1.0e-6)
+
+
+def test_preprocess_dataset_preserves_unforced_conditioning_shape(tmp_path: Path) -> None:
+    """Unforced datasets should keep the full conditioning vector with constant channels zeroed."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_config_dict(forcing_mode="unforced")), encoding="utf-8")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for sim_idx in range(3):
+        _write_raw_payload(raw_dir, sim_idx=sim_idx, forcing_mode="unforced")
+
+    cfg = load_config(config_path)
+    meta = preprocess_dataset(cfg, config_path=config_path)
+
+    train_shard_path = tmp_path / "processed" / meta["splits"]["train"][0]["file"]
+    with np.load(train_shard_path, allow_pickle=False) as npz:
+        params_norm = np.asarray(npz["params_norm"], dtype=np.float32)
+
+    assert params_norm.shape == (len(CONDITIONING_PARAM_NAMES),)
+    assert params_norm[3] == pytest.approx(0.0)
+    assert params_norm[4] == pytest.approx(0.0)
+    assert params_norm[5] == pytest.approx(0.0)
+
+
+def test_preprocess_dataset_rejects_forcing_mode_mismatch(tmp_path: Path) -> None:
+    """Raw datasets from one solver mode must not preprocess under the other mode."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_config_dict(forcing_mode="unforced")), encoding="utf-8")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    _write_raw_payload(raw_dir, sim_idx=0, forcing_mode="forced")
+
+    cfg = load_config(config_path)
+    with pytest.raises(ValueError, match="forcing_mode"):
+        preprocess_dataset(cfg, config_path=config_path)

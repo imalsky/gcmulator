@@ -1,4 +1,4 @@
-"""Visualize one held-out direct-jump prediction from the test split."""
+"""Visualize one held-out direct-jump prediction: true, predicted, and fractional error."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
+import matplotlib.ticker as mticker
 import numpy as np
 import torch
 
@@ -49,21 +50,41 @@ from gcmulator.sampling import to_extended9
 
 
 FIGURE_DPI = 180
-DEFAULT_FIGURE_NAME = "test_direct_jump_true_vs_pred.png"
+DEFAULT_FIGURE_NAME = "test_direct_jump_true_vs_pred_v2.png"
 STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
 PHI_CHANNEL_INDEX = 0
 FIELD_NAME = "Phi"
 COLOR_MAP = "Blues"
+ERROR_COLOR_MAP = "PRGn"
+ERROR_COLOR_MAP_ALPHA = 0.60  # blend toward white; lower = softer
 QUIVER_STRIDE = 8
 QUIVER_COLOR = "#08306b"
+
+# Human-readable display names and SI units for the colorbar label
+_FIELD_DISPLAY_NAMES: dict[str, str] = {
+    "Phi": "Geopotential",
+    "phi": "Geopotential",
+    "T": "Temperature",
+    "eta": "Vorticity",
+    "delta": "Divergence",
+    "U": "Zonal Wind",
+    "V": "Meridional Wind",
+}
+_FIELD_UNITS: dict[str, str] = {
+    "Phi": "m\u00b2 s\u207b\u00b2",
+    "phi": "m\u00b2 s\u207b\u00b2",
+    "T": "K",
+    "eta": "s\u207b\u00b9",
+    "delta": "s\u207b\u00b9",
+    "U": "m s\u207b\u00b9",
+    "V": "m s\u207b\u00b9",
+}
 
 # User-editable run settings
 MODEL_DIR: Path | None = Path("models") / "v1_like_10day"
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 TEST_SHARD_INDEX = 0
-# This trained run only stores checkpoints at 0, 10, and 20 days, and the
-# fixed 10-day jump with 5-day burn-in makes 10 -> 20 the in-distribution pair.
 INPUT_DAY = 10.0
 TARGET_DAY = 20.0
 ROLLOUT_STEP_DAYS: float | None = None
@@ -167,12 +188,34 @@ def _denormalize_params(params_norm: np.ndarray, stats: Any) -> Dict[str, float]
     }
 
 
+def _make_soft_cmap(base: str, alpha: float) -> mcolors.LinearSegmentedColormap:
+    """Return a softened colormap by blending base colors toward white."""
+    rgba = plt.get_cmap(base)(np.linspace(0, 1, 256))
+    rgba[:, :3] = rgba[:, :3] * alpha + (1.0 - alpha)
+    return mcolors.LinearSegmentedColormap.from_list(f"{base}_soft", rgba)
+
+
+_FONT_SIZE_BUMP = 2  # points added on top of whatever the style sets
+
 def _apply_plot_style() -> None:
     """Load the shared plotting style."""
     if not STYLE_PATH.is_file():
         raise FileNotFoundError(f"Plot style not found: {_display_repo_path(STYLE_PATH)}")
     plt.style.use(str(STYLE_PATH))
     plt.rcParams["savefig.dpi"] = int(FIGURE_DPI)
+    for key in (
+        "font.size",
+        "axes.titlesize",
+        "axes.labelsize",
+        "xtick.labelsize",
+        "ytick.labelsize",
+        "legend.fontsize",
+        "figure.titlesize",
+    ):
+        try:
+            plt.rcParams[key] = float(plt.rcParams[key]) + _FONT_SIZE_BUMP
+        except (ValueError, TypeError):
+            pass
 
 
 def _color_limits(true_field: np.ndarray, pred_field: np.ndarray) -> tuple[float, float]:
@@ -192,23 +235,64 @@ def _color_limits(true_field: np.ndarray, pred_field: np.ndarray) -> tuple[float
     return vmin, vmax
 
 
+def _error_color_limits(frac_err: np.ndarray) -> tuple[float, float]:
+    """Compute symmetric robust color limits for fractional error."""
+    values = frac_err.reshape(-1).astype(np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return -1.0, 1.0
+    half = float(np.quantile(np.abs(values), 0.99))
+    if not np.isfinite(half) or half == 0.0:
+        half = 1.0
+    return -half, half
+
+
 def _add_quiver(ax: Any, u_field: np.ndarray, v_field: np.ndarray) -> None:
-    """Overlay a sparse wind quiver on one axis."""
+    """Overlay a sparse, direction-normalized wind quiver on one axis."""
     y_idx = np.arange(0, int(u_field.shape[0]), int(QUIVER_STRIDE))
     x_idx = np.arange(0, int(u_field.shape[1]), int(QUIVER_STRIDE))
     x_grid, y_grid = np.meshgrid(x_idx, y_idx)
     u_sub = np.asarray(u_field[np.ix_(y_idx, x_idx)], dtype=np.float64)
     v_sub = np.asarray(v_field[np.ix_(y_idx, x_idx)], dtype=np.float64)
+
+    # Normalize to unit length so arrows show direction with uniform size
+    mag = np.hypot(u_sub, v_sub)
+    mag = np.where(mag < 1e-10, 1.0, mag)
+    u_norm = u_sub / mag
+    v_norm = v_sub / mag
+
     ax.quiver(
         x_grid,
         y_grid,
-        u_sub,
-        v_sub,
+        u_norm,
+        v_norm,
         color=QUIVER_COLOR,
         pivot="mid",
-        alpha=0.8,
-        width=0.0022,
+        alpha=0.75,
+        width=0.003,
+        headwidth=4.0,
+        headlength=4.5,
+        headaxislength=4.0,
+        minshaft=1.5,
     )
+
+
+def _set_latlon_ticks(ax: Any, field_shape: tuple[int, int]) -> None:
+    """Replace pixel-index ticks with latitude/longitude degree labels."""
+    H, W = field_shape
+
+    lon_deg = np.arange(0, 360, 60)
+    lon_idx = lon_deg / 360.0 * W
+    ax.set_xticks(lon_idx)
+    ax.set_xticklabels([f"{d}\u00b0" for d in lon_deg])
+    ax.set_xlabel("Longitude")
+
+    lat_deg = np.arange(-90, 91, 30)
+    # origin="lower" => row 0 = -90 deg, row H-1 = +90 deg
+    lat_idx = (lat_deg + 90.0) / 180.0 * H
+    ax.set_yticks(lat_idx)
+    ax.set_yticklabels([f"{d}\u00b0" for d in lat_deg])
+    ax.set_ylabel("Latitude")
 
 
 def _save_figure(
@@ -225,19 +309,34 @@ def _save_figure(
     n_rollout_steps: int,
     out_path: Path,
 ) -> None:
-    """Save a 1x2 Phi comparison figure for one prediction."""
-    fig, axes = plt.subplots(
-        1,
-        2,
-        figsize=(10.0, 4.5),
+    """Save a 1x3 figure: true field, predicted field, percent error."""
+    # "." is an empty spacer column — creates a wider gap between the geo
+    # colorbar and the third panel without affecting the gap between panels 0/1.
+    fig, axd = plt.subplot_mosaic(
+        [["A", "B", ".", "C"]],
+        figsize=(16.0, 5.0),
         dpi=int(FIGURE_DPI),
         constrained_layout=True,
+        gridspec_kw={"width_ratios": [1, 1, 0.1, 1]},
     )
+    axes = [axd["A"], axd["B"], axd["C"]]
+
     true_field = np.asarray(true_state[PHI_CHANNEL_INDEX], dtype=np.float64)
     pred_field = np.asarray(pred_state[PHI_CHANNEL_INDEX], dtype=np.float64)
+    field_shape = true_field.shape
+
+    # --- Percent error: 100 * (pred - true) / |true| ---
+    eps = 1e-30
+    frac_err = 100.0 * (pred_field - true_field) / (np.abs(true_field) + eps)
+
     vmin, vmax = _color_limits(true_field, pred_field)
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
+    field_label = _FIELD_DISPLAY_NAMES.get(FIELD_NAME, FIELD_NAME)
+    field_units = _FIELD_UNITS.get(FIELD_NAME, "")
+    geo_colorbar_label = f"{field_label} ({field_units})" if field_units else field_label
+
+    # Panel 0: True atmosphere
     im_true = axes[0].imshow(
         true_field,
         origin="lower",
@@ -246,6 +345,12 @@ def _save_figure(
         interpolation="bicubic",
         aspect="auto",
     )
+    axes[0].set_box_aspect(1)
+    axes[0].set_title("True 2D Atmospheric Structure")
+    _set_latlon_ticks(axes[0], field_shape)
+    _add_quiver(axes[0], true_winds[0], true_winds[1])
+
+    # Panel 1: Predicted atmosphere
     axes[1].imshow(
         pred_field,
         origin="lower",
@@ -254,28 +359,40 @@ def _save_figure(
         interpolation="bicubic",
         aspect="auto",
     )
-    axes[0].set_title(f"True {FIELD_NAME}")
-    axes[1].set_title(f"Predicted {FIELD_NAME}")
-    axes[0].set_xlabel("Longitude Index")
-    axes[1].set_xlabel("Longitude Index")
-    axes[0].set_ylabel("Latitude Index")
-    axes[1].set_ylabel("Latitude Index")
-    _add_quiver(axes[0], true_winds[0], true_winds[1])
+    axes[1].set_box_aspect(1)
+    axes[1].set_title("Predicted 2D Atmospheric Structure")
+    _set_latlon_ticks(axes[1], field_shape)
+    axes[1].set_yticks([])
+    axes[1].set_ylabel("")
     _add_quiver(axes[1], pred_winds[0], pred_winds[1])
-    fig.colorbar(im_true, ax=axes, shrink=0.9)
 
-    rmse = float(np.sqrt(np.mean((pred_field - true_field) ** 2)))
-    rollout_suffix = ""
-    if rollout_step_days is not None:
-        rollout_suffix = (
-            f" | rollout_step_days={float(rollout_step_days):.6f}"
-            f" | rollout_steps={int(n_rollout_steps)}"
-        )
-    fig.suptitle(
-        f"{shard_name} | input_day={input_day:.6f} | target_day={target_day:.6f} | "
-        f"transition_days={transition_days:.6f}{rollout_suffix} | "
-        f"{FIELD_NAME} RMSE={rmse:.3e}"
+    # Shared colorbar for the two geopotential panels
+    geo_fmt = mticker.ScalarFormatter(useMathText=True)
+    geo_fmt.set_powerlimits((0, 0))
+    cb_geo = fig.colorbar(im_true, ax=[axes[0], axes[1]], shrink=0.72, pad=0.02, label=geo_colorbar_label, format=geo_fmt)
+    cb_geo.ax.yaxis.set_major_formatter(geo_fmt)
+
+    # Panel 2: Percent error
+    err_vmin, err_vmax = _error_color_limits(frac_err)
+    err_norm = mcolors.Normalize(vmin=err_vmin, vmax=err_vmax)
+    err_cmap = _make_soft_cmap(ERROR_COLOR_MAP, ERROR_COLOR_MAP_ALPHA)
+    im_err = axes[2].imshow(
+        frac_err,
+        origin="lower",
+        cmap=err_cmap,
+        norm=err_norm,
+        interpolation="bicubic",
+        aspect="auto",
     )
+    axes[2].set_box_aspect(1)
+    axes[2].set_title("Percent Error")
+    _set_latlon_ticks(axes[2], field_shape)
+
+    err_fmt = mticker.ScalarFormatter(useMathText=True)
+    err_fmt.set_powerlimits((0, 0))
+    cb_err = fig.colorbar(im_err, ax=axes[2], shrink=0.72, label="% Error", format=err_fmt)
+    cb_err.ax.yaxis.set_major_formatter(err_fmt)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)
@@ -340,24 +457,7 @@ def _load_test_direct_jump_case(
     input_time_days: float,
     target_time_days: float,
 ) -> tuple[Any, np.ndarray, np.ndarray, str, float, float, float]:
-    """Load one held-out direct-jump case.
-
-    Returns:
-        params:
-            Physical conditioning parameters as ``Extended9Params``.
-        initial_state_phys:
-            Physical visible state with shape ``[5, H, W]``.
-        true_target_phys:
-            Physical visible target with shape ``[5, H, W]``.
-        shard_name:
-            Test-shard filename from ``processed_meta.json``.
-        actual_input_day:
-            Physical day represented by the resolved input step.
-        actual_target_day:
-            Physical day represented by the resolved target step.
-        transition_days:
-            Direct-jump horizon in physical days.
-    """
+    """Load one held-out direct-jump case."""
     test_entries = _load_test_split_entries(processed_dir)
     if test_shard_index < 0 or test_shard_index >= len(test_entries):
         raise IndexError(
@@ -410,17 +510,7 @@ def _predict_direct_jump(
     transition_days: float,
     device: torch.device,
 ) -> np.ndarray:
-    """Run one direct-jump model call and return a physical visible-state target.
-
-    Args:
-        initial_state_phys:
-            Physical visible state with shape ``[5, H, W]``.
-        transition_days:
-            Requested direct-jump horizon in physical days.
-
-    Returns:
-        Physical visible-state prediction with shape ``[5, H, W]``.
-    """
+    """Run one direct-jump model call and return a physical visible-state target."""
     params_vector = params_to_conditioning_vector(params)
     input_state_norm = normalize_state_tensor(
         initial_state_phys[None, ...],
@@ -534,7 +624,7 @@ def _extract_target_winds(
 
 
 def main() -> None:
-    """Load one held-out case, run the model, and save a plot."""
+    """Load one held-out case, run the model, and save a 3-panel plot."""
     _apply_plot_style()
     ckpt_path = _resolve_checkpoint_path(model_dir=MODEL_DIR, checkpoint=CHECKPOINT_PATH)
     run_dir = ckpt_path.parent

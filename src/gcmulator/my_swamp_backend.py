@@ -119,6 +119,24 @@ def _snapshot_from_last_state(last_state: object) -> ReducedCarrySnapshot:
     )
 
 
+def _forcing_mode_enabled(forcing_mode: str) -> bool:
+    """Return whether the configured solver mode applies external forcing."""
+    mode = str(forcing_mode)
+    if mode == "forced":
+        return True
+    if mode == "unforced":
+        return False
+    raise ValueError(
+        "forcing_mode must be one of ['forced','unforced'], "
+        f"got {forcing_mode!r}"
+    )
+
+
+def _forcing_mode_dphieq(forcing_mode: str, DPhieq: Any) -> Any:
+    """Return the effective equilibrium-contrast amplitude for one solver mode."""
+    return DPhieq if _forcing_mode_enabled(forcing_mode) else 0.0
+
+
 def _stack_reduced_carry_state_jax(state: object) -> Any:
     """Pack the reduced carry fields into one stacked JAX tensor."""
     import jax.numpy as jnp
@@ -138,12 +156,12 @@ def _stack_reduced_carry_state_jax(state: object) -> Any:
     )
 
 
-def _build_run_flags(*, diagnostics: bool) -> Any:
+def _build_run_flags(*, diagnostics: bool, forcing_mode: str) -> Any:
     """Build the fixed MY_SWAMP runtime flags used by the emulator pipeline."""
     from my_swamp.model import RunFlags
 
     return RunFlags(
-        forcflag=True,
+        forcflag=_forcing_mode_enabled(forcing_mode),
         diffflag=True,
         expflag=False,
         modalflag=True,
@@ -166,10 +184,13 @@ def _initialize_trajectory_state(
     M: int,
     dt_seconds: float,
     starttime_index: int,
+    forcing_mode: str,
 ) -> tuple[Any, Any, Any, Any]:
     """Build static operators and the initial two-level MY_SWAMP state."""
     import jax.numpy as jnp
     from my_swamp.model import run_model_scan
+
+    forcing_enabled = _forcing_mode_enabled(forcing_mode)
 
     init_out = run_model_scan(
         M=int(M),
@@ -179,10 +200,10 @@ def _initialize_trajectory_state(
         a=float(params.a_m),
         test=None,
         g=float(params.g_m_s2),
-        forcflag=True,
+        forcflag=forcing_enabled,
         taurad=float(params.taurad_s),
         taudrag=float(params.taudrag_s),
-        DPhieq=float(params.DPhieq),
+        DPhieq=_forcing_mode_dphieq(forcing_mode, float(params.DPhieq)),
         diffflag=True,
         modalflag=True,
         expflag=False,
@@ -212,6 +233,7 @@ def _initialize_trajectory_state_from_vector(
     starttime_index: int,
     k6: float,
     k6phi: float | None,
+    forcing_mode: str,
 ) -> tuple[Any, Any, Any, Any]:
     """Build static operators and initial state from a conditioning vector."""
     import jax.numpy as jnp
@@ -226,6 +248,7 @@ def _initialize_trajectory_state_from_vector(
         taudrag_s,
         g_m_s2,
     ) = param_vector
+    forcing_enabled = _forcing_mode_enabled(forcing_mode)
 
     init_out = run_model_scan(
         M=int(M),
@@ -235,10 +258,10 @@ def _initialize_trajectory_state_from_vector(
         a=a_m,
         test=None,
         g=g_m_s2,
-        forcflag=True,
+        forcflag=forcing_enabled,
         taurad=taurad_s,
         taudrag=taudrag_s,
-        DPhieq=DPhieq,
+        DPhieq=_forcing_mode_dphieq(forcing_mode, DPhieq),
         diffflag=True,
         modalflag=True,
         expflag=False,
@@ -295,6 +318,7 @@ def _get_batched_trajectory_initializer(
     starttime_index: int,
     k6: float,
     k6phi: float | None,
+    forcing_mode: str,
 ) -> Any:
     """Return a cached batched initializer for trajectory extraction."""
     import jax
@@ -307,6 +331,7 @@ def _get_batched_trajectory_initializer(
             starttime_index=starttime_index,
             k6=k6,
             k6phi=k6phi,
+            forcing_mode=forcing_mode,
         )
     )
 
@@ -317,13 +342,14 @@ def _get_batched_checkpoint_runner(
     n_steps_total: int,
     starttime_index: int,
     n_checkpoints: int,
+    forcing_mode: str,
 ) -> Any:
     """Return a cached batched rollout runner for uniform checkpoint sequences."""
     import jax
     import jax.numpy as jnp
     from my_swamp.model import _step_once_state_only
 
-    flags = _build_run_flags(diagnostics=False)
+    flags = _build_run_flags(diagnostics=False, forcing_mode=forcing_mode)
     rel_steps = jnp.arange(1, int(n_steps_total) + 1, dtype=jnp.int32)
     current_field_indices = jnp.asarray(CURRENT_FIELD_INDICES, dtype=jnp.int32)
 
@@ -432,6 +458,7 @@ def run_trajectory_checkpoints_batched(
     checkpoint_steps_batch: np.ndarray,
     k6: float,
     k6phi: float | None,
+    forcing_mode: str = "forced",
 ) -> np.ndarray:
     """Extract many checkpoint sequences in parallel using one vectorized JAX rollout."""
     import jax
@@ -474,12 +501,14 @@ def run_trajectory_checkpoints_batched(
         starttime_index=int(starttime_index),
         k6=float(k6),
         k6phi=k6phi,
+        forcing_mode=str(forcing_mode),
     )
     static_batch, state_batch, Uic_batch, Vic_batch = initializer(param_batch_jax)
     runner = _get_batched_checkpoint_runner(
         n_steps_total=int(n_steps_total),
         starttime_index=int(starttime_index),
         n_checkpoints=int(checkpoint_steps_batch.shape[1]),
+        forcing_mode=str(forcing_mode),
     )
     checkpoint_states = runner(
         static_batch,
@@ -499,6 +528,7 @@ def run_trajectory_checkpoints(
     time_days: float,
     starttime_index: int,
     checkpoint_steps: np.ndarray,
+    forcing_mode: str = "forced",
 ) -> np.ndarray:
     """Extract visible-state checkpoints from one MY_SWAMP rollout."""
     import jax.numpy as jnp
@@ -533,8 +563,9 @@ def run_trajectory_checkpoints(
         M=int(M),
         dt_seconds=float(dt_seconds),
         starttime_index=int(starttime_index),
+        forcing_mode=str(forcing_mode),
     )
-    flags = _build_run_flags(diagnostics=False)
+    flags = _build_run_flags(diagnostics=False, forcing_mode=str(forcing_mode))
     states_by_step: Dict[int, np.ndarray] = {
         0: _snapshot_from_last_state(current_state_full).as_array().astype(
             np.float64, copy=False
@@ -603,6 +634,7 @@ def _get_diagnostic_static(
     g_m_s2: float,
     K6: float,
     K6Phi: float | None,
+    forcing_mode: str,
 ) -> Any:
     """Cache MY_SWAMP static spectral operators for deterministic wind diagnosis."""
     from my_swamp.model import build_static
@@ -616,7 +648,7 @@ def _get_diagnostic_static(
         Phibar=float(Phibar),
         taurad=float(taurad_s),
         taudrag=float(taudrag_s),
-        DPhieq=float(DPhieq),
+        DPhieq=_forcing_mode_dphieq(forcing_mode, float(DPhieq)),
         K6=float(K6),
         K6Phi=K6Phi,
         test=None,
@@ -630,6 +662,7 @@ def diagnose_winds(
     params: Extended9Params,
     M: int,
     dt_seconds: float,
+    forcing_mode: str = "forced",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Diagnose physical-space ``U,V`` from physical-space ``eta,delta``.
 
@@ -658,6 +691,7 @@ def diagnose_winds(
         g_m_s2=float(params.g_m_s2),
         K6=float(params.K6),
         K6Phi=params.K6Phi,
+        forcing_mode=str(forcing_mode),
     )
     eta_j = jnp.asarray(eta)
     delta_j = jnp.asarray(delta)
@@ -691,6 +725,7 @@ def reconstruct_full_state_from_prognostics(
     params: Extended9Params,
     M: int,
     dt_seconds: float,
+    forcing_mode: str = "forced",
 ) -> np.ndarray:
     """Reconstruct a full physical 5-field state from prognostic ``Phi,eta,delta``.
 
@@ -713,7 +748,12 @@ def reconstruct_full_state_from_prognostics(
     eta = np.asarray(prognostics[1], dtype=np.float64)
     delta = np.asarray(prognostics[2], dtype=np.float64)
     u_field, v_field = diagnose_winds(
-        eta, delta, params=params, M=M, dt_seconds=dt_seconds
+        eta,
+        delta,
+        params=params,
+        M=M,
+        dt_seconds=dt_seconds,
+        forcing_mode=forcing_mode,
     )
     return np.stack([phi, u_field, v_field, eta, delta], axis=0)
 

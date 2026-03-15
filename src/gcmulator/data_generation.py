@@ -108,6 +108,7 @@ def _write_sim_record(
         "burn_in_days": np.asarray(float(cfg.sampling.burn_in_days), dtype=np.float64),
         "dt_seconds": np.asarray(float(cfg.solver.dt_seconds), dtype=np.float64),
         "starttime_index": np.asarray(int(cfg.solver.starttime_index), dtype=np.int64),
+        "forcing_mode": np.asarray(str(cfg.solver.forcing_mode), dtype=object),
         "saved_checkpoint_interval_days": np.asarray(
             float(resolved_checkpoint_interval_days),
             dtype=np.float64,
@@ -132,6 +133,7 @@ def _write_sim_record(
         "burn_in_days": float(cfg.sampling.burn_in_days),
         "dt_seconds": float(cfg.solver.dt_seconds),
         "starttime_index": int(cfg.solver.starttime_index),
+        "forcing_mode": str(cfg.solver.forcing_mode),
         "saved_checkpoint_interval_days": float(resolved_checkpoint_interval_days),
         "n_saved_checkpoints": int(states_geom.shape[0]),
         "checkpoint_day_start": float(checkpoint_days[0]),
@@ -284,6 +286,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
                 time_days=float(cfg.solver.default_time_days),
                 starttime_index=int(cfg.solver.starttime_index),
                 checkpoint_steps=checkpoint_schedule.checkpoint_steps,
+                forcing_mode=str(cfg.solver.forcing_mode),
             )
             batch_checkpoint_states = np.asarray(checkpoint_states, dtype=np.float64)[None, ...]
         else:
@@ -309,6 +312,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
                 checkpoint_steps_batch=checkpoint_steps_batch,
                 k6=float(next(iter(k6_values))),
                 k6phi=next(iter(k6phi_values)),
+                forcing_mode=str(cfg.solver.forcing_mode),
             )
 
         for batch_index, entry in enumerate(batch):
@@ -342,6 +346,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             "dt_seconds": float(cfg.solver.dt_seconds),
             "default_time_days": float(cfg.solver.default_time_days),
             "starttime_index": int(cfg.solver.starttime_index),
+            "forcing_mode": str(cfg.solver.forcing_mode),
         },
         "sampling": {
             "seed": int(cfg.sampling.seed),

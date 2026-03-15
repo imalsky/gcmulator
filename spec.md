@@ -48,6 +48,8 @@ Default operator routine:
 7. Use the main entrypoints from the same environment:
    `python -m gcmulator --gen --config config.json`
    `python -m gcmulator --train --config config.json`
+8. The checked-in default `config.json` is the unforced brown-dwarf preset.
+   The prior hot-Jupiter preset is preserved in `config_HJ.json`.
 
 Important dependency naming:
 1. the install package is `torch-harmonics==0.8.1`
@@ -110,16 +112,21 @@ Key preserved numerical ideas:
 5. prognostic evolution in spectral space
 6. diagnostic reconstruction of winds from vorticity/divergence
 
-`gcmulator` uses `MY_SWAMP` in forced mode with:
-1. `forcflag=True`
-2. `diffflag=True`
-3. `expflag=False`
-4. `modalflag=True`
-5. `diagnostics=False`
-6. `alpha=0.01`
+`gcmulator` uses `MY_SWAMP` in one of two solver modes configured via
+`solver.forcing_mode`:
+1. `"forced"` maps to `test=None`, `forcflag=True`
+2. `"unforced"` maps to `test=None`, `forcflag=False`
 
-That means the checked-in surrogate is aligned to the modified-Euler,
-diffusion-enabled, forced MY_SWAMP path, not to every possible solver mode.
+In both cases the backend keeps:
+1. `diffflag=True`
+2. `expflag=False`
+3. `modalflag=True`
+4. `diagnostics=False`
+5. `alpha=0.01`
+
+The checked-in default `config.json` targets the modified-Euler,
+diffusion-enabled, unforced brown-dwarf path. The preserved
+`config_HJ.json` preset targets the forced hot-Jupiter path.
 
 ### 3.2 Prognostic State Variables
 The emulator operates autoregressively on five visible state channels in this
@@ -206,8 +213,10 @@ Active forced-mode formulas:
 3. velocity forcing applies the SWAMPE drag logic and keeps the original
    `Q < 0` handling
 
-This matters because the surrogate is learning trajectories generated under
-forced, damped shallow-water dynamics, not free decay and not unforced test cases.
+When `solver.forcing_mode="unforced"`, the backend instead runs exact
+unforced evolution with `forcflag=False`. The conditioning vector still keeps
+`DPhieq`, `taurad_s`, and `taudrag_s` for compatibility, but those channels
+can be constant across an unforced dataset.
 
 ### 3.6 Spectral Diagnosis Of Winds
 The repository reconstructs winds using MY_SWAMP spectral transforms:
@@ -416,12 +425,14 @@ No spectral loss term is part of the training objective contract.
 ## 6. File Responsibilities
 ### 6.1 Repository Root
 1. `config.json`
-   Default experiment config.
-2. `spec.md`
+   Default unforced brown-dwarf experiment config.
+2. `config_HJ.json`
+   Preserved forced hot-Jupiter experiment config.
+3. `spec.md`
    This repository contract.
-3. `run.sh`
+4. `run.sh`
    Slurm entrypoint for JPL `gattaca2`.
-4. `run.pbs`
+5. `run.pbs`
    PBS entrypoint for a NASA NAS environment.
 
 ### 6.2 Source Files

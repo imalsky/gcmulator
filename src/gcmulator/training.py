@@ -65,7 +65,7 @@ from .sampling import (
 LOGGER = logging.getLogger("train")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-PREPROCESS_FINGERPRINT_VERSION = 16
+PREPROCESS_FINGERPRINT_VERSION = 17
 RAW_REQUIRED_KEYS = (
     "checkpoint_states",
     "checkpoint_steps",
@@ -77,6 +77,7 @@ RAW_REQUIRED_KEYS = (
     "burn_in_days",
     "dt_seconds",
     "starttime_index",
+    "forcing_mode",
     "saved_checkpoint_interval_days",
     "n_saved_checkpoints",
     "M",
@@ -178,6 +179,7 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
     burn_in_days = float(np.asarray(payload["burn_in_days"], dtype=np.float64).item())
     dt_seconds = float(np.asarray(payload["dt_seconds"], dtype=np.float64).item())
     starttime_index = int(np.asarray(payload["starttime_index"], dtype=np.int64).item())
+    forcing_mode = str(np.asarray(payload["forcing_mode"], dtype=object).item())
     saved_checkpoint_interval_days = float(
         np.asarray(payload["saved_checkpoint_interval_days"], dtype=np.float64).item()
     )
@@ -239,6 +241,11 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
             f"Raw file {file_path} has starttime_index={starttime_index}, "
             f"expected {cfg.solver.starttime_index}"
         )
+    if forcing_mode != str(cfg.solver.forcing_mode):
+        raise ValueError(
+            f"Raw file {file_path} has forcing_mode={forcing_mode!r}, "
+            f"expected {cfg.solver.forcing_mode!r}"
+        )
 
     expected_schedule = build_uniform_checkpoint_schedule(
         time_days=float(cfg.solver.default_time_days),
@@ -295,6 +302,7 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
         "burn_in_days": burn_in_days,
         "dt_seconds": dt_seconds,
         "starttime_index": starttime_index,
+        "forcing_mode": forcing_mode,
         "saved_checkpoint_interval_days": saved_checkpoint_interval_days,
         "n_saved_checkpoints": n_saved_checkpoints,
         "M": M,
@@ -320,6 +328,7 @@ def _raw_file_signature(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str, A
         "burn_in_days": float(metadata["burn_in_days"]),
         "dt_seconds": float(metadata["dt_seconds"]),
         "starttime_index": int(metadata["starttime_index"]),
+        "forcing_mode": str(metadata["forcing_mode"]),
         "saved_checkpoint_interval_days": float(metadata["saved_checkpoint_interval_days"]),
         "n_saved_checkpoints": int(metadata["n_saved_checkpoints"]),
         "nlat": int(metadata["nlat"]),

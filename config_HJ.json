@@ -1,8 +1,8 @@
 {
   "paths": {
-    "dataset_dir": "data/raw_brown_dwarf_unforced",
-    "processed_dir": "data/processed_brown_dwarf_unforced",
-    "model_dir": "models/brown_dwarf_unforced",
+    "dataset_dir": "data/raw_v1_like_10day_100day",
+    "processed_dir": "data/processed_v1_like_10day_100day",
+    "model_dir": "models/v1_like_10day_100day",
     "overwrite_dataset": false
   },
   "solver": {
@@ -10,7 +10,7 @@
     "dt_seconds": 120.0,
     "default_time_days": 100.0,
     "starttime_index": 2,
-    "forcing_mode": "unforced"
+    "forcing_mode": "forced"
   },
   "geometry": {
     "flip_latitude_to_north_south": true,
@@ -27,13 +27,13 @@
     "pair_sampling_policy": "uniform_pairs",
     "live_transition_tolerance_fraction": 0.0,
     "parameters": [
-      { "name": "a_m", "dist": "fixed", "value": 71492000.0 },
-      { "name": "omega_rad_s", "dist": "fixed", "value": 0.0003490658503988659 },
+      { "name": "a_m", "dist": "fixed", "value": 82000000.0 },
+      { "name": "omega_rad_s", "dist": "fixed", "value": 0.000032 },
       { "name": "Phibar", "dist": "fixed", "value": 300000.0 },
-      { "name": "DPhieq", "dist": "fixed", "value": 0.0 },
-      { "name": "taurad_hours", "dist": "fixed", "value": 10.0},
-      { "name": "taudrag_hours", "dist": "fixed", "value": 6.0},
-      { "name": "g_m_s2", "dist": "fixed", "value": 300.0 }
+      { "name": "DPhieq", "dist": "fixed", "value": 1000000.0 },
+      { "name": "taurad_hours", "dist": "uniform", "min": 5.0, "max": 20.0},
+      { "name": "taudrag_hours", "dist": "uniform", "min": 5.0, "max": 20.0},
+      { "name": "g_m_s2", "dist": "fixed", "value": 9.8 }
     ]
   },
   "normalization": {
