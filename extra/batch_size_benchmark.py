@@ -66,7 +66,7 @@ DEVICE_MARKERS = {
 }
 
 # User-editable run settings
-MODEL_DIR: Path | None = Path("models") / "shortstep_0p1d_v1"
+MODEL_DIR: Path | None = Path("models") / "v1_like_10day"
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 DEVICE_MODES: Sequence[str] = ("cpu", "gpu")
@@ -200,7 +200,7 @@ def _load_direct_jump_batch(
             Conditioning matrix with shape ``[N, P]`` where ``P`` includes the
             physical parameters plus ``log10_transition_days``.
         state_inputs_norm:
-            Normalized prognostic states with shape ``[N, 3, H, W]``.
+            Normalized visible states with shape ``[N, 5, H, W]``.
         shard_name:
             Processed shard filename used for the benchmark.
     """

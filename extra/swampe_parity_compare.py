@@ -51,7 +51,7 @@ from gcmulator.my_swamp_backend import ensure_my_swamp_importable
 # User-editable run settings
 # ---------------------------------------------------------------------------
 M = 42
-DT_SECONDS = 1200.0
+DT_SECONDS = 120.0
 TIME_DAYS = 5.0
 STARTTIME_INDEX = 2
 

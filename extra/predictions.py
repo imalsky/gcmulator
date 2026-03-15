@@ -1,4 +1,4 @@
-"""Visualize one held-out prognostic prediction from the test split."""
+"""Visualize one held-out direct-jump prediction from the test split."""
 
 from __future__ import annotations
 
@@ -58,13 +58,15 @@ QUIVER_STRIDE = 8
 QUIVER_COLOR = "#08306b"
 
 # User-editable run settings
-MODEL_DIR: Path | None = Path("models") / "shortstep_0p1d_v1"
+MODEL_DIR: Path | None = Path("models") / "v1_like_10day"
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 TEST_SHARD_INDEX = 0
-INPUT_DAY = 0.0
-TARGET_DAY = 0.1
-ROLLOUT_STEP_DAYS: float | None = 0.1
+# This trained run only stores checkpoints at 0, 10, and 20 days, and the
+# fixed 10-day jump with 5-day burn-in makes 10 -> 20 the in-distribution pair.
+INPUT_DAY = 10.0
+TARGET_DAY = 20.0
+ROLLOUT_STEP_DAYS: float | None = None
 DEVICE_MODE = "auto"
 FIGURE_PATH: Path | None = None
 
@@ -344,9 +346,9 @@ def _load_test_direct_jump_case(
         params:
             Physical conditioning parameters as ``Extended9Params``.
         initial_state_phys:
-            Physical prognostic state with shape ``[3, H, W]``.
+            Physical visible state with shape ``[5, H, W]``.
         true_target_phys:
-            Physical prognostic target with shape ``[3, H, W]``.
+            Physical visible target with shape ``[5, H, W]``.
         shard_name:
             Test-shard filename from ``processed_meta.json``.
         actual_input_day:
@@ -408,16 +410,16 @@ def _predict_direct_jump(
     transition_days: float,
     device: torch.device,
 ) -> np.ndarray:
-    """Run one direct-jump model call and return a physical prognostic target.
+    """Run one direct-jump model call and return a physical visible-state target.
 
     Args:
         initial_state_phys:
-            Physical prognostic state with shape ``[3, H, W]``.
+            Physical visible state with shape ``[5, H, W]``.
         transition_days:
             Requested direct-jump horizon in physical days.
 
     Returns:
-        Physical prognostic prediction with shape ``[3, H, W]``.
+        Physical visible-state prediction with shape ``[5, H, W]``.
     """
     params_vector = params_to_conditioning_vector(params)
     input_state_norm = normalize_state_tensor(

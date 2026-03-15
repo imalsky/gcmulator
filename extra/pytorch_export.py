@@ -50,7 +50,7 @@ EXPORT_META_NAME = "model_export.meta.json"
 EXAMPLE_BATCH_SIZE = 1
 STRICT_TRACE = True
 SUPPRESS_KNOWN_EXPORT_WARNINGS = True
-MODEL_DIR: Path | None = Path("models") / "shortstep_0p1d_v1"
+MODEL_DIR: Path | None = Path("models") / "v1_like_10day"
 CHECKPOINT_PATH: Path | None = None
 
 # Keep the device choice explicit for now. Supported values are only "cpu" and
