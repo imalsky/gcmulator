@@ -13,6 +13,8 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+import numpy as np
+
 # -----------------------------------------------------------------------------
 # Global constants and schema enums
 # -----------------------------------------------------------------------------
@@ -535,6 +537,59 @@ def _max_post_burn_in_gap_steps(
     return max(0, int(last_checkpoint_step - first_anchor_checkpoint_step))
 
 
+def _saved_sequence_total_candidate_pairs(
+    *,
+    time_days: float,
+    dt_seconds: float,
+    burn_in_days: float,
+    saved_checkpoint_interval_days: float,
+    live_transition_days_min: float,
+    live_transition_days_max: float,
+    fixed_transition_steps: int | None,
+) -> int:
+    """Return the total number of valid saved-sequence pairs for one trajectory."""
+    interval_steps = _resolve_checkpoint_interval_steps(
+        dt_seconds=float(dt_seconds),
+        saved_checkpoint_interval_days=float(saved_checkpoint_interval_days),
+    )
+    n_steps_total = _total_solver_steps(
+        time_days=float(time_days),
+        dt_seconds=float(dt_seconds),
+    )
+    checkpoint_steps = np.arange(0, n_steps_total + 1, interval_steps, dtype=np.int64)
+    checkpoint_days = checkpoint_steps.astype(np.float64) * float(dt_seconds) / SECONDS_PER_DAY
+    burn_in_start_index = int(
+        np.searchsorted(checkpoint_days, float(burn_in_days), side="left")
+    )
+    max_gap_offset = int(checkpoint_days.shape[0] - 1 - burn_in_start_index)
+    if max_gap_offset < 1:
+        return 0
+
+    candidate_offsets = np.arange(1, max_gap_offset + 1, dtype=np.int64)
+    if fixed_transition_steps is not None:
+        selected_offsets = np.asarray(
+            [int(fixed_transition_steps) // int(interval_steps)],
+            dtype=np.int64,
+        )
+    else:
+        candidate_days = checkpoint_days[candidate_offsets] - checkpoint_days[0]
+        offset_mask = (
+            candidate_days >= float(live_transition_days_min)
+        ) & (
+            candidate_days <= float(live_transition_days_max)
+        )
+        selected_offsets = candidate_offsets[offset_mask]
+    if selected_offsets.size == 0:
+        return 0
+
+    valid_anchor_counts = (
+        int(checkpoint_days.shape[0])
+        - int(burn_in_start_index)
+        - selected_offsets.astype(np.int64)
+    )
+    return int(np.sum(valid_anchor_counts, dtype=np.int64))
+
+
 def _parse_sampling(
     d: Dict[str, Any],
     *,
@@ -896,6 +951,31 @@ def validate_config(cfg: GCMulatorConfig) -> None:
                 "sampling.fixed_transition_steps must fit inside the post-burn-in "
                 "saved checkpoint window"
             )
+    total_saved_candidates = _saved_sequence_total_candidate_pairs(
+        time_days=float(cfg.solver.default_time_days),
+        dt_seconds=float(cfg.solver.dt_seconds),
+        burn_in_days=float(cfg.sampling.burn_in_days),
+        saved_checkpoint_interval_days=float(cfg.sampling.saved_checkpoint_interval_days),
+        live_transition_days_min=float(cfg.sampling.live_transition_days_min),
+        live_transition_days_max=float(cfg.sampling.live_transition_days_max),
+        fixed_transition_steps=cfg.sampling.fixed_transition_steps,
+    )
+    if total_saved_candidates < 1:
+        raise ValueError(
+            "No valid saved-sequence candidate pairs exist for the configured "
+            "rollout horizon and jump settings"
+        )
+    if (
+        cfg.training.pair_iteration_mode == "resample_from_saved_sequences"
+        and int(cfg.sampling.pairs_per_sim) > int(total_saved_candidates)
+    ):
+        raise ValueError(
+            "sampling.pairs_per_sim must be <= the number of valid saved-sequence "
+            f"candidate pairs per trajectory for "
+            f"`training.pair_iteration_mode='resample_from_saved_sequences'`; "
+            f"got pairs_per_sim={cfg.sampling.pairs_per_sim}, "
+            f"total_candidates={total_saved_candidates}"
+        )
 
     if cfg.normalization.state.zscore_eps <= 0:
         raise ValueError("normalization.state.zscore_eps must be > 0")

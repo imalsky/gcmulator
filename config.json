@@ -23,7 +23,7 @@
     "burn_in_days": 0.0,
     "saved_checkpoint_interval_days": 2.0,
     "fixed_transition_steps": 3600,
-    "pairs_per_sim": 10,
+    "pairs_per_sim": 6,
     "pair_sampling_policy": "uniform_pairs",
     "live_transition_tolerance_fraction": 0.0,
     "parameters": [

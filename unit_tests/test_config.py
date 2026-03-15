@@ -145,6 +145,30 @@ def test_load_config_rejects_invalid_forcing_mode(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_load_config_rejects_pairs_per_sim_exceeding_saved_candidates(tmp_path: Path) -> None:
+    """Saved-sequence training must reject impossible per-sequence pair counts."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["default_time_days"] = 20.0
+    payload["solver"] = solver_section
+
+    sampling_section = dict(payload["sampling"])
+    sampling_section["saved_checkpoint_interval_days"] = 2.0
+    sampling_section.pop("live_transition_days_min")
+    sampling_section.pop("live_transition_days_max")
+    sampling_section["fixed_transition_steps"] = 3600
+    sampling_section["pairs_per_sim"] = 10
+    payload["sampling"] = sampling_section
+
+    training_section = dict(payload["training"])
+    training_section["pair_iteration_mode"] = "resample_from_saved_sequences"
+    payload["training"] = training_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="pairs_per_sim"):
+        load_config(config_path)
+
+
 def test_checked_in_presets_load() -> None:
     """Checked-in experiment presets should remain parseable."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -444,6 +468,9 @@ def test_load_config_rejects_saved_interval_and_snapshot_count_together(tmp_path
 def test_load_config_allows_preload_to_gpu_for_resampled_mode(tmp_path: Path) -> None:
     """Resampled mode may preload full sequence splits when VRAM is sufficient."""
     payload = _minimal_config_dict()
+    sampling_section = dict(payload["sampling"])
+    sampling_section["pairs_per_sim"] = 9
+    payload["sampling"] = sampling_section
     training_section = dict(payload["training"])
     training_section["pair_iteration_mode"] = "resample_from_saved_sequences"
     training_section["preload_to_gpu"] = True
