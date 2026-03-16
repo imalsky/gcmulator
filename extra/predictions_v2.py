@@ -52,8 +52,8 @@ from gcmulator.sampling import to_extended9
 FIGURE_DPI = 180
 DEFAULT_FIGURE_NAME = "test_direct_jump_true_vs_pred_v2.png"
 STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
-PHI_CHANNEL_INDEX = 0
-FIELD_NAME = "Phi"
+FIELD_NAME = "T"
+TEMPERATURE_SOURCE_FIELD = "Phi"
 COLOR_MAP = "Blues"
 ERROR_COLOR_MAP = "PRGn"
 ERROR_COLOR_MAP_ALPHA = 0.60  # blend toward white; lower = softer
@@ -81,7 +81,7 @@ _FIELD_UNITS: dict[str, str] = {
 }
 
 # User-editable run settings
-MODEL_DIR: Path | None = Path("models") / "v1_like_10day"
+MODEL_DIR: Path | None = Path("models") / "brown_dwarf_lt_transition_unforced"
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 TEST_SHARD_INDEX = 0
@@ -235,6 +235,52 @@ def _color_limits(true_field: np.ndarray, pred_field: np.ndarray) -> tuple[float
     return vmin, vmax
 
 
+def _extract_plot_field(
+    *,
+    state: np.ndarray,
+    params: Any,
+    r_specific_j_per_kg_k: float,
+    target_field_names: Sequence[str],
+) -> np.ndarray:
+    """Return the plotted field, deriving temperature from Phi when needed."""
+    field_index = {str(name): idx for idx, name in enumerate(target_field_names)}
+    if FIELD_NAME == "T":
+        if "T" in field_index:
+            return np.asarray(state[field_index["T"]], dtype=np.float64)
+        if TEMPERATURE_SOURCE_FIELD not in field_index:
+            raise KeyError(
+                f"Could not derive temperature: missing `{TEMPERATURE_SOURCE_FIELD}` in "
+                f"target_field_names={list(target_field_names)!r}"
+            )
+        phi_total = np.asarray(
+            state[field_index[TEMPERATURE_SOURCE_FIELD]], dtype=np.float64
+        ) + float(params.Phibar)
+        return phi_total / float(r_specific_j_per_kg_k)
+    if FIELD_NAME not in field_index:
+        raise KeyError(
+            f"Plot field `{FIELD_NAME}` is not present in "
+            f"target_field_names={list(target_field_names)!r}"
+        )
+    return np.asarray(state[field_index[FIELD_NAME]], dtype=np.float64)
+
+
+def _resolve_r_specific_j_per_kg_k(solver_cfg: Dict[str, Any]) -> float:
+    """Require the specific gas constant used to interpret Phi as temperature."""
+    value = solver_cfg.get("r_specific_j_per_kg_k")
+    if value is None:
+        raise ValueError(
+            "Checkpoint solver metadata is missing `r_specific_j_per_kg_k`, so "
+            "temperature cannot be derived consistently from `Phi + Phibar`"
+        )
+    value_f = float(value)
+    if not np.isfinite(value_f) or value_f <= 0.0:
+        raise ValueError(
+            "Checkpoint solver metadata has invalid `r_specific_j_per_kg_k`: "
+            f"{value!r}"
+        )
+    return value_f
+
+
 def _error_color_limits(frac_err: np.ndarray) -> tuple[float, float]:
     """Compute symmetric robust color limits for fractional error."""
     values = frac_err.reshape(-1).astype(np.float64)
@@ -301,6 +347,9 @@ def _save_figure(
     pred_state: np.ndarray,
     true_winds: tuple[np.ndarray, np.ndarray],
     pred_winds: tuple[np.ndarray, np.ndarray],
+    params: Any,
+    r_specific_j_per_kg_k: float,
+    target_field_names: Sequence[str],
     shard_name: str,
     input_day: float,
     target_day: float,
@@ -321,8 +370,18 @@ def _save_figure(
     )
     axes = [axd["A"], axd["B"], axd["C"]]
 
-    true_field = np.asarray(true_state[PHI_CHANNEL_INDEX], dtype=np.float64)
-    pred_field = np.asarray(pred_state[PHI_CHANNEL_INDEX], dtype=np.float64)
+    true_field = _extract_plot_field(
+        state=true_state,
+        params=params,
+        r_specific_j_per_kg_k=r_specific_j_per_kg_k,
+        target_field_names=target_field_names,
+    )
+    pred_field = _extract_plot_field(
+        state=pred_state,
+        params=params,
+        r_specific_j_per_kg_k=r_specific_j_per_kg_k,
+        target_field_names=target_field_names,
+    )
     field_shape = true_field.shape
 
     # --- Percent error: 100 * (pred - true) / |true| ---
@@ -346,7 +405,7 @@ def _save_figure(
         aspect="auto",
     )
     axes[0].set_box_aspect(1)
-    axes[0].set_title("True 2D Atmospheric Structure")
+    axes[0].set_title(f"True {field_label}")
     _set_latlon_ticks(axes[0], field_shape)
     _add_quiver(axes[0], true_winds[0], true_winds[1])
 
@@ -360,15 +419,16 @@ def _save_figure(
         aspect="auto",
     )
     axes[1].set_box_aspect(1)
-    axes[1].set_title("Predicted 2D Atmospheric Structure")
+    axes[1].set_title(f"Predicted {field_label}")
     _set_latlon_ticks(axes[1], field_shape)
     axes[1].set_yticks([])
     axes[1].set_ylabel("")
     _add_quiver(axes[1], pred_winds[0], pred_winds[1])
 
     # Shared colorbar for the two geopotential panels
-    geo_fmt = mticker.ScalarFormatter(useMathText=True)
-    geo_fmt.set_powerlimits((0, 0))
+    geo_fmt = mticker.ScalarFormatter(useMathText=False)
+    geo_fmt.set_scientific(False)
+    geo_fmt.set_useOffset(False)
     cb_geo = fig.colorbar(im_true, ax=[axes[0], axes[1]], shrink=0.72, pad=0.02, label=geo_colorbar_label, format=geo_fmt)
     cb_geo.ax.yaxis.set_major_formatter(geo_fmt)
 
@@ -388,8 +448,9 @@ def _save_figure(
     axes[2].set_title("Percent Error")
     _set_latlon_ticks(axes[2], field_shape)
 
-    err_fmt = mticker.ScalarFormatter(useMathText=True)
-    err_fmt.set_powerlimits((0, 0))
+    err_fmt = mticker.ScalarFormatter(useMathText=False)
+    err_fmt.set_scientific(False)
+    err_fmt.set_useOffset(False)
     cb_err = fig.colorbar(im_err, ax=axes[2], shrink=0.72, label="% Error", format=err_fmt)
     cb_err.ax.yaxis.set_major_formatter(err_fmt)
 
@@ -679,6 +740,7 @@ def main() -> None:
         device=device,
     )
     solver_cfg = dict(ckpt["solver"])
+    r_specific_j_per_kg_k = _resolve_r_specific_j_per_kg_k(solver_cfg)
     true_winds = _extract_target_winds(
         true_target_phys,
         target_field_names=stats.state.field_names,
@@ -696,6 +758,9 @@ def main() -> None:
         pred_state=pred_target_phys,
         true_winds=true_winds,
         pred_winds=pred_winds,
+        params=params,
+        r_specific_j_per_kg_k=r_specific_j_per_kg_k,
+        target_field_names=stats.state.field_names,
         shard_name=shard_name,
         input_day=actual_input_day,
         target_day=actual_target_day,

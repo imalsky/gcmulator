@@ -58,12 +58,12 @@ QUIVER_STRIDE = 8
 QUIVER_COLOR = "#08306b"
 
 # User-editable run settings
-MODEL_DIR: Path | None = Path("models") / "v1_like_10day"
+MODEL_DIR: Path | None = Path("models") / "brown_dwarf_lt_transition_unforced"
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 TEST_SHARD_INDEX = 0
-# This trained run only stores checkpoints at 0, 10, and 20 days, and the
-# fixed 10-day jump with 5-day burn-in makes 10 -> 20 the in-distribution pair.
+# This preset stores checkpoints every 2 days over a 20-day trajectory, and
+# the fixed 10-day jump makes 10 -> 20 the exact in-distribution pair.
 INPUT_DAY = 10.0
 TARGET_DAY = 20.0
 ROLLOUT_STEP_DAYS: float | None = None

@@ -27,7 +27,7 @@ FIGURE_DPI = 180
 STYLE_PATH = Path(__file__).resolve().with_name("science.mplstyle")
 
 # User-editable run settings
-MODEL_DIR: Path | None = Path("models") / "v1_like_10day"
+MODEL_DIR: Path | None = Path("models") / "brown_dwarf_lt_transition_unforced"
 FIGURE_PATH: Path | None = None
 
 

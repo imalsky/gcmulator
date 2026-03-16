@@ -66,7 +66,7 @@ DEVICE_MARKERS = {
 }
 
 # User-editable run settings
-MODEL_DIR: Path | None = Path("models") / "v1_like_10day"
+MODEL_DIR: Path | None = Path("models") / "brown_dwarf_lt_transition_unforced"
 CHECKPOINT_PATH: Path | None = None
 PROCESSED_DIR: Path | None = None
 DEVICE_MODES: Sequence[str] = ("cpu", "gpu")

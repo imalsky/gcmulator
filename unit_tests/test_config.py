@@ -118,6 +118,7 @@ def test_load_config_allows_zero_burn_in(tmp_path: Path) -> None:
     assert cfg.sampling.generation_workers == 2
     assert cfg.sampling.uses_variable_live_transition() is False
     assert cfg.solver.forcing_mode == "forced"
+    assert cfg.solver.r_specific_j_per_kg_k == pytest.approx(3900.0)
 
 
 def test_load_config_accepts_unforced_solver_mode(tmp_path: Path) -> None:
@@ -142,6 +143,18 @@ def test_load_config_rejects_invalid_forcing_mode(tmp_path: Path) -> None:
 
     config_path = _write_config(tmp_path, payload)
     with pytest.raises(ValueError, match="solver.forcing_mode"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_nonpositive_r_specific(tmp_path: Path) -> None:
+    """The temperature-interpretation gas constant must stay strictly positive."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["r_specific_j_per_kg_k"] = 0.0
+    payload["solver"] = solver_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="r_specific_j_per_kg_k"):
         load_config(config_path)
 
 
@@ -178,6 +191,9 @@ def test_checked_in_presets_load() -> None:
 
     assert brown_dwarf_cfg.solver.forcing_mode == "unforced"
     assert brown_dwarf_cfg.solver.default_time_days == pytest.approx(20.0)
+    assert brown_dwarf_cfg.solver.dt_seconds == pytest.approx(30.0)
+    assert brown_dwarf_cfg.solver.r_specific_j_per_kg_k == pytest.approx(3600.0)
+    assert brown_dwarf_cfg.sampling.fixed_transition_steps == 28800
     assert hot_jupiter_cfg.solver.forcing_mode == "forced"
 
 

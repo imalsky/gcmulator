@@ -121,6 +121,7 @@ class SolverConfig:
     default_time_days: float = 100.0
     starttime_index: int = 2
     forcing_mode: ForcingMode = "forced"
+    r_specific_j_per_kg_k: float = 3900.0
 
 
 @dataclass(frozen=True)
@@ -290,7 +291,14 @@ TOP_LEVEL_CONFIG_KEYS = {
     "training",
 }
 PATHS_KEYS = {"dataset_dir", "processed_dir", "model_dir", "overwrite_dataset"}
-SOLVER_KEYS = {"M", "dt_seconds", "default_time_days", "starttime_index", "forcing_mode"}
+SOLVER_KEYS = {
+    "M",
+    "dt_seconds",
+    "default_time_days",
+    "starttime_index",
+    "forcing_mode",
+    "r_specific_j_per_kg_k",
+}
 GEOMETRY_KEYS = {"flip_latitude_to_north_south", "roll_longitude_to_0_2pi"}
 SAMPLING_KEYS = {
     "seed",
@@ -419,6 +427,7 @@ def _parse_solver(d: Dict[str, Any]) -> SolverConfig:
         default_time_days=float(d.get("default_time_days", 100.0)),
         starttime_index=int(d.get("starttime_index", 2)),
         forcing_mode=str(d.get("forcing_mode", "forced")),
+        r_specific_j_per_kg_k=float(d.get("r_specific_j_per_kg_k", 3900.0)),
     )
 
 
@@ -872,6 +881,10 @@ def validate_config(cfg: GCMulatorConfig) -> None:
             "solver.forcing_mode must be one of "
             "['forced','unforced']"
         )
+    if not math.isfinite(float(cfg.solver.r_specific_j_per_kg_k)):
+        raise ValueError("solver.r_specific_j_per_kg_k must be finite")
+    if cfg.solver.r_specific_j_per_kg_k <= 0:
+        raise ValueError("solver.r_specific_j_per_kg_k must be > 0")
 
     if cfg.sampling.n_sims < 1:
         raise ValueError("sampling.n_sims must be >= 1")
