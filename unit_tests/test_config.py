@@ -118,6 +118,14 @@ def test_load_config_allows_zero_burn_in(tmp_path: Path) -> None:
     assert cfg.sampling.generation_workers == 2
     assert cfg.sampling.uses_variable_live_transition() is False
     assert cfg.solver.forcing_mode == "forced"
+    assert cfg.solver.initial_condition_mode == "legacy"
+    assert cfg.solver.convective_forcing_mode == "none"
+    assert cfg.solver.convective_forcing_seed == 0
+    assert cfg.solver.initial_phi_noise_temperature_k == pytest.approx(0.0)
+    assert cfg.solver.storm_radius_degrees == pytest.approx(2.0)
+    assert cfg.solver.storm_nondim_lifetime == pytest.approx(20.0)
+    assert cfg.solver.storm_nondim_interval == pytest.approx(20.0)
+    assert cfg.solver.storm_strength_fraction == pytest.approx(0.1)
     assert cfg.solver.r_specific_j_per_kg_k == pytest.approx(3900.0)
 
 
@@ -134,6 +142,31 @@ def test_load_config_accepts_unforced_solver_mode(tmp_path: Path) -> None:
     assert cfg.solver.forcing_mode == "unforced"
 
 
+def test_load_config_accepts_rest_initial_condition_mode(tmp_path: Path) -> None:
+    """The solver config should expose the explicit rest-state initialization mode."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["initial_condition_mode"] = "rest"
+    payload["solver"] = solver_section
+
+    config_path = _write_config(tmp_path, payload)
+    cfg = load_config(config_path)
+
+    assert cfg.solver.initial_condition_mode == "rest"
+
+
+def test_load_config_rejects_invalid_initial_condition_mode(tmp_path: Path) -> None:
+    """Unsupported initialization-mode names should fail validation."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["initial_condition_mode"] = "quiescent"
+    payload["solver"] = solver_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="solver.initial_condition_mode"):
+        load_config(config_path)
+
+
 def test_load_config_rejects_invalid_forcing_mode(tmp_path: Path) -> None:
     """Unsupported forcing-mode names should fail validation."""
     payload = _minimal_config_dict()
@@ -143,6 +176,18 @@ def test_load_config_rejects_invalid_forcing_mode(tmp_path: Path) -> None:
 
     config_path = _write_config(tmp_path, payload)
     with pytest.raises(ValueError, match="solver.forcing_mode"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_convective_forcing_mode(tmp_path: Path) -> None:
+    """Unsupported convective-forcing names should fail validation."""
+    payload = _minimal_config_dict()
+    solver_section = dict(payload["solver"])
+    solver_section["convective_forcing_mode"] = "storms"
+    payload["solver"] = solver_section
+
+    config_path = _write_config(tmp_path, payload)
+    with pytest.raises(ValueError, match="solver.convective_forcing_mode"):
         load_config(config_path)
 
 
@@ -187,14 +232,27 @@ def test_checked_in_presets_load() -> None:
     repo_root = Path(__file__).resolve().parents[1]
 
     brown_dwarf_cfg = load_config(repo_root / "config.json")
+    legacy_brown_dwarf_cfg = load_config(repo_root / "config_BD_legacy.json")
     hot_jupiter_cfg = load_config(repo_root / "config_HJ.json")
 
     assert brown_dwarf_cfg.solver.forcing_mode == "unforced"
+    assert brown_dwarf_cfg.solver.initial_condition_mode == "rest"
+    assert brown_dwarf_cfg.solver.convective_forcing_mode == "localized_random_storms"
+    assert brown_dwarf_cfg.solver.convective_forcing_seed == 42
+    assert brown_dwarf_cfg.solver.initial_phi_noise_temperature_k == pytest.approx(10.0)
+    assert brown_dwarf_cfg.solver.storm_radius_degrees == pytest.approx(2.0)
+    assert brown_dwarf_cfg.solver.storm_nondim_lifetime == pytest.approx(20.0)
+    assert brown_dwarf_cfg.solver.storm_nondim_interval == pytest.approx(20.0)
+    assert brown_dwarf_cfg.solver.storm_strength_fraction == pytest.approx(0.1)
     assert brown_dwarf_cfg.solver.default_time_days == pytest.approx(20.0)
     assert brown_dwarf_cfg.solver.dt_seconds == pytest.approx(30.0)
     assert brown_dwarf_cfg.solver.r_specific_j_per_kg_k == pytest.approx(3600.0)
     assert brown_dwarf_cfg.sampling.fixed_transition_steps == 28800
+    assert legacy_brown_dwarf_cfg.solver.forcing_mode == "unforced"
+    assert legacy_brown_dwarf_cfg.solver.initial_condition_mode == "legacy"
+    assert legacy_brown_dwarf_cfg.solver.convective_forcing_mode == "none"
     assert hot_jupiter_cfg.solver.forcing_mode == "forced"
+    assert hot_jupiter_cfg.solver.initial_condition_mode == "legacy"
 
 
 def test_load_config_accepts_variable_live_transition_range(tmp_path: Path) -> None:

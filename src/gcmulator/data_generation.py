@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import logging
 import os
@@ -100,6 +101,7 @@ def _write_sim_record(
     cfg: GCMulatorConfig,
     dataset_dir: Path,
     resolved_checkpoint_interval_days: float,
+    trajectory_seed: int,
 ) -> Dict[str, Any]:
     """Write one checkpoint-sequence simulation into a raw ``sim_XXXXXX.npy`` record."""
     if checkpoint_states.ndim != 4:
@@ -143,6 +145,36 @@ def _write_sim_record(
         "dt_seconds": np.asarray(float(cfg.solver.dt_seconds), dtype=np.float64),
         "starttime_index": np.asarray(int(cfg.solver.starttime_index), dtype=np.int64),
         "forcing_mode": np.asarray(str(cfg.solver.forcing_mode), dtype=object),
+        "initial_condition_mode": np.asarray(
+            str(cfg.solver.initial_condition_mode), dtype=object
+        ),
+        "convective_forcing_mode": np.asarray(
+            str(cfg.solver.convective_forcing_mode), dtype=object
+        ),
+        "convective_forcing_seed": np.asarray(
+            int(cfg.solver.convective_forcing_seed), dtype=np.int64
+        ),
+        "trajectory_seed": np.asarray(int(trajectory_seed), dtype=np.int64),
+        "initial_phi_noise_temperature_k": np.asarray(
+            float(cfg.solver.initial_phi_noise_temperature_k),
+            dtype=np.float64,
+        ),
+        "storm_radius_degrees": np.asarray(
+            float(cfg.solver.storm_radius_degrees),
+            dtype=np.float64,
+        ),
+        "storm_nondim_lifetime": np.asarray(
+            float(cfg.solver.storm_nondim_lifetime),
+            dtype=np.float64,
+        ),
+        "storm_nondim_interval": np.asarray(
+            float(cfg.solver.storm_nondim_interval),
+            dtype=np.float64,
+        ),
+        "storm_strength_fraction": np.asarray(
+            float(cfg.solver.storm_strength_fraction),
+            dtype=np.float64,
+        ),
         "saved_checkpoint_interval_days": np.asarray(
             float(resolved_checkpoint_interval_days),
             dtype=np.float64,
@@ -168,6 +200,17 @@ def _write_sim_record(
         "dt_seconds": float(cfg.solver.dt_seconds),
         "starttime_index": int(cfg.solver.starttime_index),
         "forcing_mode": str(cfg.solver.forcing_mode),
+        "initial_condition_mode": str(cfg.solver.initial_condition_mode),
+        "convective_forcing_mode": str(cfg.solver.convective_forcing_mode),
+        "convective_forcing_seed": int(cfg.solver.convective_forcing_seed),
+        "trajectory_seed": int(trajectory_seed),
+        "initial_phi_noise_temperature_k": float(
+            cfg.solver.initial_phi_noise_temperature_k
+        ),
+        "storm_radius_degrees": float(cfg.solver.storm_radius_degrees),
+        "storm_nondim_lifetime": float(cfg.solver.storm_nondim_lifetime),
+        "storm_nondim_interval": float(cfg.solver.storm_nondim_interval),
+        "storm_strength_fraction": float(cfg.solver.storm_strength_fraction),
         "saved_checkpoint_interval_days": float(resolved_checkpoint_interval_days),
         "n_saved_checkpoints": int(states_geom.shape[0]),
         "checkpoint_day_start": float(checkpoint_days[0]),
@@ -301,6 +344,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
             {
                 "sim_idx": int(sim_idx),
                 "params": params,
+                "trajectory_seed": int(cfg.solver.convective_forcing_seed) + int(sim_idx),
             }
         )
 
@@ -321,6 +365,17 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
                 starttime_index=int(cfg.solver.starttime_index),
                 checkpoint_steps=checkpoint_schedule.checkpoint_steps,
                 forcing_mode=str(cfg.solver.forcing_mode),
+                initial_condition_mode=str(cfg.solver.initial_condition_mode),
+                convective_forcing_mode=str(cfg.solver.convective_forcing_mode),
+                trajectory_seed=int(entry["trajectory_seed"]),
+                initial_phi_noise_temperature_k=float(
+                    cfg.solver.initial_phi_noise_temperature_k
+                ),
+                r_specific_j_per_kg_k=float(cfg.solver.r_specific_j_per_kg_k),
+                storm_radius_degrees=float(cfg.solver.storm_radius_degrees),
+                storm_nondim_lifetime=float(cfg.solver.storm_nondim_lifetime),
+                storm_nondim_interval=float(cfg.solver.storm_nondim_interval),
+                storm_strength_fraction=float(cfg.solver.storm_strength_fraction),
             )
             batch_checkpoint_states = np.asarray(checkpoint_states, dtype=np.float64)[None, ...]
         else:
@@ -347,6 +402,20 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
                 k6=float(next(iter(k6_values))),
                 k6phi=next(iter(k6phi_values)),
                 forcing_mode=str(cfg.solver.forcing_mode),
+                initial_condition_mode=str(cfg.solver.initial_condition_mode),
+                convective_forcing_mode=str(cfg.solver.convective_forcing_mode),
+                trajectory_seeds=np.asarray(
+                    [entry["trajectory_seed"] for entry in batch],
+                    dtype=np.int64,
+                ),
+                initial_phi_noise_temperature_k=float(
+                    cfg.solver.initial_phi_noise_temperature_k
+                ),
+                r_specific_j_per_kg_k=float(cfg.solver.r_specific_j_per_kg_k),
+                storm_radius_degrees=float(cfg.solver.storm_radius_degrees),
+                storm_nondim_lifetime=float(cfg.solver.storm_nondim_lifetime),
+                storm_nondim_interval=float(cfg.solver.storm_nondim_interval),
+                storm_strength_fraction=float(cfg.solver.storm_strength_fraction),
             )
 
         for batch_index, entry in enumerate(batch):
@@ -360,6 +429,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
                 cfg=cfg,
                 dataset_dir=dataset_dir,
                 resolved_checkpoint_interval_days=float(checkpoint_schedule.interval_days),
+                trajectory_seed=int(entry["trajectory_seed"]),
             )
             items.append(item)
 
@@ -375,13 +445,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
         "state_fields": list(PHYSICAL_STATE_FIELDS),
         "param_names": list(conditioning_param_names()),
         "dataset_dir": str(dataset_dir),
-        "solver": {
-            "M": int(cfg.solver.M),
-            "dt_seconds": float(cfg.solver.dt_seconds),
-            "default_time_days": float(cfg.solver.default_time_days),
-            "starttime_index": int(cfg.solver.starttime_index),
-            "forcing_mode": str(cfg.solver.forcing_mode),
-        },
+        "solver": asdict(cfg.solver),
         "sampling": {
             "seed": int(cfg.sampling.seed),
             "n_sims": int(cfg.sampling.n_sims),

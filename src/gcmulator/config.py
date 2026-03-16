@@ -29,6 +29,8 @@ TransformName = Literal["none", "log10", "signed_log1p"]
 PairSamplingPolicy = Literal["uniform_pairs", "uniform_gaps", "inverse_time"]
 PairIterationMode = Literal["live_sampled_gpu", "resample_from_saved_sequences"]
 ForcingMode = Literal["forced", "unforced"]
+InitialConditionMode = Literal["legacy", "rest"]
+ConvectiveForcingMode = Literal["none", "localized_random_storms"]
 
 PHYSICAL_STATE_FIELDS = ("Phi", "U", "V", "eta", "delta")
 PROGNOSTIC_STATE_FIELDS = ("Phi", "eta", "delta")
@@ -55,6 +57,8 @@ INTERNAL_FIXED_PARAM_NAMES = ("K6", "K6Phi")
 VALID_PARAM_DISTS = {"uniform", "loguniform", "const", "fixed", "mixture_off_loguniform"}
 TORCH_HARMONICS_REQUIRED_VERSION = "0.8.1"
 VALID_FORCING_MODES = {"forced", "unforced"}
+VALID_INITIAL_CONDITION_MODES = {"legacy", "rest"}
+VALID_CONVECTIVE_FORCING_MODES = {"none", "localized_random_storms"}
 
 
 def canonicalize_state_field(field_name: str) -> str:
@@ -121,6 +125,14 @@ class SolverConfig:
     default_time_days: float = 100.0
     starttime_index: int = 2
     forcing_mode: ForcingMode = "forced"
+    initial_condition_mode: InitialConditionMode = "legacy"
+    convective_forcing_mode: ConvectiveForcingMode = "none"
+    convective_forcing_seed: int = 0
+    initial_phi_noise_temperature_k: float = 0.0
+    storm_radius_degrees: float = 2.0
+    storm_nondim_lifetime: float = 20.0
+    storm_nondim_interval: float = 20.0
+    storm_strength_fraction: float = 0.1
     r_specific_j_per_kg_k: float = 3900.0
 
 
@@ -297,6 +309,14 @@ SOLVER_KEYS = {
     "default_time_days",
     "starttime_index",
     "forcing_mode",
+    "initial_condition_mode",
+    "convective_forcing_mode",
+    "convective_forcing_seed",
+    "initial_phi_noise_temperature_k",
+    "storm_radius_degrees",
+    "storm_nondim_lifetime",
+    "storm_nondim_interval",
+    "storm_strength_fraction",
     "r_specific_j_per_kg_k",
 }
 GEOMETRY_KEYS = {"flip_latitude_to_north_south", "roll_longitude_to_0_2pi"}
@@ -427,6 +447,16 @@ def _parse_solver(d: Dict[str, Any]) -> SolverConfig:
         default_time_days=float(d.get("default_time_days", 100.0)),
         starttime_index=int(d.get("starttime_index", 2)),
         forcing_mode=str(d.get("forcing_mode", "forced")),
+        initial_condition_mode=str(d.get("initial_condition_mode", "legacy")),
+        convective_forcing_mode=str(d.get("convective_forcing_mode", "none")),
+        convective_forcing_seed=int(d.get("convective_forcing_seed", 0)),
+        initial_phi_noise_temperature_k=float(
+            d.get("initial_phi_noise_temperature_k", 0.0)
+        ),
+        storm_radius_degrees=float(d.get("storm_radius_degrees", 2.0)),
+        storm_nondim_lifetime=float(d.get("storm_nondim_lifetime", 20.0)),
+        storm_nondim_interval=float(d.get("storm_nondim_interval", 20.0)),
+        storm_strength_fraction=float(d.get("storm_strength_fraction", 0.1)),
         r_specific_j_per_kg_k=float(d.get("r_specific_j_per_kg_k", 3900.0)),
     )
 
@@ -881,6 +911,38 @@ def validate_config(cfg: GCMulatorConfig) -> None:
             "solver.forcing_mode must be one of "
             "['forced','unforced']"
         )
+    if cfg.solver.initial_condition_mode not in VALID_INITIAL_CONDITION_MODES:
+        raise ValueError(
+            "solver.initial_condition_mode must be one of "
+            "['legacy','rest']"
+        )
+    if cfg.solver.convective_forcing_mode not in VALID_CONVECTIVE_FORCING_MODES:
+        raise ValueError(
+            "solver.convective_forcing_mode must be one of "
+            "['localized_random_storms','none']"
+        )
+    if cfg.solver.convective_forcing_seed < 0:
+        raise ValueError("solver.convective_forcing_seed must be >= 0")
+    if not math.isfinite(float(cfg.solver.initial_phi_noise_temperature_k)):
+        raise ValueError("solver.initial_phi_noise_temperature_k must be finite")
+    if cfg.solver.initial_phi_noise_temperature_k < 0:
+        raise ValueError("solver.initial_phi_noise_temperature_k must be >= 0")
+    if not math.isfinite(float(cfg.solver.storm_radius_degrees)):
+        raise ValueError("solver.storm_radius_degrees must be finite")
+    if cfg.solver.storm_radius_degrees <= 0:
+        raise ValueError("solver.storm_radius_degrees must be > 0")
+    if not math.isfinite(float(cfg.solver.storm_nondim_lifetime)):
+        raise ValueError("solver.storm_nondim_lifetime must be finite")
+    if cfg.solver.storm_nondim_lifetime <= 0:
+        raise ValueError("solver.storm_nondim_lifetime must be > 0")
+    if not math.isfinite(float(cfg.solver.storm_nondim_interval)):
+        raise ValueError("solver.storm_nondim_interval must be finite")
+    if cfg.solver.storm_nondim_interval <= 0:
+        raise ValueError("solver.storm_nondim_interval must be > 0")
+    if not math.isfinite(float(cfg.solver.storm_strength_fraction)):
+        raise ValueError("solver.storm_strength_fraction must be finite")
+    if cfg.solver.storm_strength_fraction < 0:
+        raise ValueError("solver.storm_strength_fraction must be >= 0")
     if not math.isfinite(float(cfg.solver.r_specific_j_per_kg_k)):
         raise ValueError("solver.r_specific_j_per_kg_k must be finite")
     if cfg.solver.r_specific_j_per_kg_k <= 0:

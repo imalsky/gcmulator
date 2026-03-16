@@ -19,7 +19,18 @@ from gcmulator.sampling import build_uniform_checkpoint_schedule
 from gcmulator.training import preprocess_dataset
 
 
-def _config_dict(*, forcing_mode: str = "forced") -> dict[str, object]:
+def _config_dict(
+    *,
+    forcing_mode: str = "forced",
+    initial_condition_mode: str = "legacy",
+    convective_forcing_mode: str = "none",
+    convective_forcing_seed: int = 0,
+    initial_phi_noise_temperature_k: float = 0.0,
+    storm_radius_degrees: float = 2.0,
+    storm_nondim_lifetime: float = 20.0,
+    storm_nondim_interval: float = 20.0,
+    storm_strength_fraction: float = 0.1,
+) -> dict[str, object]:
     """Return a small preprocessing-only config."""
     step_days = 240.0 / 86400.0
     fixed_jump_days = 2.0 * step_days
@@ -37,6 +48,14 @@ def _config_dict(*, forcing_mode: str = "forced") -> dict[str, object]:
             "default_time_days": 0.05,
             "starttime_index": 2,
             "forcing_mode": forcing_mode,
+            "initial_condition_mode": initial_condition_mode,
+            "convective_forcing_mode": convective_forcing_mode,
+            "convective_forcing_seed": convective_forcing_seed,
+            "initial_phi_noise_temperature_k": initial_phi_noise_temperature_k,
+            "storm_radius_degrees": storm_radius_degrees,
+            "storm_nondim_lifetime": storm_nondim_lifetime,
+            "storm_nondim_interval": storm_nondim_interval,
+            "storm_strength_fraction": storm_strength_fraction,
         },
         "geometry": {
             "flip_latitude_to_north_south": True,
@@ -113,6 +132,15 @@ def _write_raw_payload(
     *,
     sim_idx: int,
     forcing_mode: str = "forced",
+    initial_condition_mode: str = "legacy",
+    convective_forcing_mode: str = "none",
+    convective_forcing_seed: int = 0,
+    trajectory_seed: int | None = None,
+    initial_phi_noise_temperature_k: float = 0.0,
+    storm_radius_degrees: float = 2.0,
+    storm_nondim_lifetime: float = 20.0,
+    storm_nondim_interval: float = 20.0,
+    storm_strength_fraction: float = 0.1,
     inject_nan: bool = False,
 ) -> None:
     """Write one small raw checkpoint-sequence payload."""
@@ -167,6 +195,21 @@ def _write_raw_payload(
         "dt_seconds": np.asarray(240.0, dtype=np.float64),
         "starttime_index": np.asarray(2, dtype=np.int64),
         "forcing_mode": np.asarray(forcing_mode, dtype=object),
+        "initial_condition_mode": np.asarray(initial_condition_mode, dtype=object),
+        "convective_forcing_mode": np.asarray(convective_forcing_mode, dtype=object),
+        "convective_forcing_seed": np.asarray(convective_forcing_seed, dtype=np.int64),
+        "trajectory_seed": np.asarray(
+            sim_idx if trajectory_seed is None else trajectory_seed,
+            dtype=np.int64,
+        ),
+        "initial_phi_noise_temperature_k": np.asarray(
+            initial_phi_noise_temperature_k,
+            dtype=np.float64,
+        ),
+        "storm_radius_degrees": np.asarray(storm_radius_degrees, dtype=np.float64),
+        "storm_nondim_lifetime": np.asarray(storm_nondim_lifetime, dtype=np.float64),
+        "storm_nondim_interval": np.asarray(storm_nondim_interval, dtype=np.float64),
+        "storm_strength_fraction": np.asarray(storm_strength_fraction, dtype=np.float64),
         "saved_checkpoint_interval_days": np.asarray(schedule.interval_days, dtype=np.float64),
         "n_saved_checkpoints": np.asarray(int(schedule.checkpoint_steps.shape[0]), dtype=np.int64),
         "M": np.asarray(42, dtype=np.int64),
@@ -194,6 +237,8 @@ def test_preprocess_dataset_writes_sequence_shards(tmp_path: Path) -> None:
     assert meta["task"] == "checkpoint_sequence_transition"
     assert meta["conditioning_names"] == list(CONDITIONING_PARAM_NAMES) + [TRANSITION_TIME_NAME]
     assert meta["sequence_length"] == 10
+    assert meta["solver"]["initial_condition_mode"] == "legacy"
+    assert meta["solver"]["convective_forcing_mode"] == "none"
 
     train_shard_path = tmp_path / "processed" / meta["splits"]["train"][0]["file"]
     with np.load(train_shard_path, allow_pickle=False) as npz:
@@ -262,6 +307,83 @@ def test_preprocess_dataset_rejects_forcing_mode_mismatch(tmp_path: Path) -> Non
 
     cfg = load_config(config_path)
     with pytest.raises(ValueError, match="forcing_mode"):
+        preprocess_dataset(cfg, config_path=config_path)
+
+
+def test_preprocess_dataset_rejects_initial_condition_mode_mismatch(tmp_path: Path) -> None:
+    """Raw datasets must preserve the configured initialization contract."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(_config_dict(forcing_mode="unforced", initial_condition_mode="rest")),
+        encoding="utf-8",
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    _write_raw_payload(
+        raw_dir,
+        sim_idx=0,
+        forcing_mode="unforced",
+        initial_condition_mode="legacy",
+    )
+
+    cfg = load_config(config_path)
+    with pytest.raises(ValueError, match="initial_condition_mode"):
+        preprocess_dataset(cfg, config_path=config_path)
+
+
+def test_preprocess_dataset_rejects_convective_forcing_mode_mismatch(tmp_path: Path) -> None:
+    """Raw datasets must preserve the configured convective-forcing mode."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            _config_dict(
+                forcing_mode="unforced",
+                initial_condition_mode="rest",
+                convective_forcing_mode="localized_random_storms",
+            )
+        ),
+        encoding="utf-8",
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    _write_raw_payload(
+        raw_dir,
+        sim_idx=0,
+        forcing_mode="unforced",
+        initial_condition_mode="rest",
+        convective_forcing_mode="none",
+    )
+
+    cfg = load_config(config_path)
+    with pytest.raises(ValueError, match="convective_forcing_mode"):
+        preprocess_dataset(cfg, config_path=config_path)
+
+
+def test_preprocess_dataset_rejects_initial_noise_metadata_mismatch(tmp_path: Path) -> None:
+    """Raw datasets must preserve the configured noisy-start contract."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            _config_dict(
+                forcing_mode="unforced",
+                initial_condition_mode="rest",
+                initial_phi_noise_temperature_k=10.0,
+            )
+        ),
+        encoding="utf-8",
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    _write_raw_payload(
+        raw_dir,
+        sim_idx=0,
+        forcing_mode="unforced",
+        initial_condition_mode="rest",
+        initial_phi_noise_temperature_k=0.0,
+    )
+
+    cfg = load_config(config_path)
+    with pytest.raises(ValueError, match="initial_phi_noise_temperature_k"):
         preprocess_dataset(cfg, config_path=config_path)
 
 

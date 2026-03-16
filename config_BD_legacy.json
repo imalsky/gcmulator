@@ -1,8 +1,8 @@
 {
   "paths": {
-    "dataset_dir": "data/raw_brown_dwarf_stochastic_unforced",
-    "processed_dir": "data/processed_brown_dwarf_stochastic_unforced",
-    "model_dir": "models/brown_dwarf_stochastic_unforced",
+    "dataset_dir": "data/raw_brown_dwarf_lt_transition_unforced",
+    "processed_dir": "data/processed_brown_dwarf_lt_transition_unforced",
+    "model_dir": "models/brown_dwarf_lt_transition_unforced",
     "overwrite_dataset": false
   },
   "solver": {
@@ -11,14 +11,7 @@
     "default_time_days": 20.0,
     "starttime_index": 2,
     "forcing_mode": "unforced",
-    "initial_condition_mode": "rest",
-    "convective_forcing_mode": "localized_random_storms",
-    "convective_forcing_seed": 42,
-    "initial_phi_noise_temperature_k": 10.0,
-    "storm_radius_degrees": 2.0,
-    "storm_nondim_lifetime": 20.0,
-    "storm_nondim_interval": 20.0,
-    "storm_strength_fraction": 0.1,
+    "initial_condition_mode": "legacy",
     "r_specific_j_per_kg_k": 3600.0
   },
   "geometry": {

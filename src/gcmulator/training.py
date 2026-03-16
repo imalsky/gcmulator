@@ -65,7 +65,7 @@ from .sampling import (
 LOGGER = logging.getLogger("train")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-PREPROCESS_FINGERPRINT_VERSION = 17
+PREPROCESS_FINGERPRINT_VERSION = 19
 RAW_REQUIRED_KEYS = (
     "checkpoint_states",
     "checkpoint_steps",
@@ -78,6 +78,15 @@ RAW_REQUIRED_KEYS = (
     "dt_seconds",
     "starttime_index",
     "forcing_mode",
+    "initial_condition_mode",
+    "convective_forcing_mode",
+    "convective_forcing_seed",
+    "trajectory_seed",
+    "initial_phi_noise_temperature_k",
+    "storm_radius_degrees",
+    "storm_nondim_lifetime",
+    "storm_nondim_interval",
+    "storm_strength_fraction",
     "saved_checkpoint_interval_days",
     "n_saved_checkpoints",
     "M",
@@ -211,6 +220,31 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
     dt_seconds = float(np.asarray(payload["dt_seconds"], dtype=np.float64).item())
     starttime_index = int(np.asarray(payload["starttime_index"], dtype=np.int64).item())
     forcing_mode = str(np.asarray(payload["forcing_mode"], dtype=object).item())
+    initial_condition_mode = str(
+        np.asarray(payload["initial_condition_mode"], dtype=object).item()
+    )
+    convective_forcing_mode = str(
+        np.asarray(payload["convective_forcing_mode"], dtype=object).item()
+    )
+    convective_forcing_seed = int(
+        np.asarray(payload["convective_forcing_seed"], dtype=np.int64).item()
+    )
+    trajectory_seed = int(np.asarray(payload["trajectory_seed"], dtype=np.int64).item())
+    initial_phi_noise_temperature_k = float(
+        np.asarray(payload["initial_phi_noise_temperature_k"], dtype=np.float64).item()
+    )
+    storm_radius_degrees = float(
+        np.asarray(payload["storm_radius_degrees"], dtype=np.float64).item()
+    )
+    storm_nondim_lifetime = float(
+        np.asarray(payload["storm_nondim_lifetime"], dtype=np.float64).item()
+    )
+    storm_nondim_interval = float(
+        np.asarray(payload["storm_nondim_interval"], dtype=np.float64).item()
+    )
+    storm_strength_fraction = float(
+        np.asarray(payload["storm_strength_fraction"], dtype=np.float64).item()
+    )
     saved_checkpoint_interval_days = float(
         np.asarray(payload["saved_checkpoint_interval_days"], dtype=np.float64).item()
     )
@@ -293,6 +327,78 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
             f"Raw file {file_path} has forcing_mode={forcing_mode!r}, "
             f"expected {cfg.solver.forcing_mode!r}"
         )
+    if initial_condition_mode != str(cfg.solver.initial_condition_mode):
+        raise ValueError(
+            "Raw file "
+            f"{file_path} has initial_condition_mode={initial_condition_mode!r}, "
+            f"expected {cfg.solver.initial_condition_mode!r}"
+        )
+    if convective_forcing_mode != str(cfg.solver.convective_forcing_mode):
+        raise ValueError(
+            "Raw file "
+            f"{file_path} has convective_forcing_mode={convective_forcing_mode!r}, "
+            f"expected {cfg.solver.convective_forcing_mode!r}"
+        )
+    if convective_forcing_seed != int(cfg.solver.convective_forcing_seed):
+        raise ValueError(
+            "Raw file "
+            f"{file_path} has convective_forcing_seed={convective_forcing_seed}, "
+            f"expected {cfg.solver.convective_forcing_seed}"
+        )
+    if trajectory_seed < 0:
+        raise ValueError(f"Raw file {file_path} has trajectory_seed={trajectory_seed}, expected >= 0")
+    if not math.isclose(
+        initial_phi_noise_temperature_k,
+        float(cfg.solver.initial_phi_noise_temperature_k),
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            "Raw file "
+            f"{file_path} has initial_phi_noise_temperature_k="
+            f"{initial_phi_noise_temperature_k}, "
+            f"expected {cfg.solver.initial_phi_noise_temperature_k}"
+        )
+    if not math.isclose(
+        storm_radius_degrees,
+        float(cfg.solver.storm_radius_degrees),
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            f"Raw file {file_path} has storm_radius_degrees={storm_radius_degrees}, "
+            f"expected {cfg.solver.storm_radius_degrees}"
+        )
+    if not math.isclose(
+        storm_nondim_lifetime,
+        float(cfg.solver.storm_nondim_lifetime),
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            f"Raw file {file_path} has storm_nondim_lifetime={storm_nondim_lifetime}, "
+            f"expected {cfg.solver.storm_nondim_lifetime}"
+        )
+    if not math.isclose(
+        storm_nondim_interval,
+        float(cfg.solver.storm_nondim_interval),
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            f"Raw file {file_path} has storm_nondim_interval={storm_nondim_interval}, "
+            f"expected {cfg.solver.storm_nondim_interval}"
+        )
+    if not math.isclose(
+        storm_strength_fraction,
+        float(cfg.solver.storm_strength_fraction),
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            f"Raw file {file_path} has storm_strength_fraction={storm_strength_fraction}, "
+            f"expected {cfg.solver.storm_strength_fraction}"
+        )
 
     expected_schedule = build_uniform_checkpoint_schedule(
         time_days=float(cfg.solver.default_time_days),
@@ -350,6 +456,15 @@ def _validated_raw_payload(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str
         "dt_seconds": dt_seconds,
         "starttime_index": starttime_index,
         "forcing_mode": forcing_mode,
+        "initial_condition_mode": initial_condition_mode,
+        "convective_forcing_mode": convective_forcing_mode,
+        "convective_forcing_seed": convective_forcing_seed,
+        "trajectory_seed": trajectory_seed,
+        "initial_phi_noise_temperature_k": initial_phi_noise_temperature_k,
+        "storm_radius_degrees": storm_radius_degrees,
+        "storm_nondim_lifetime": storm_nondim_lifetime,
+        "storm_nondim_interval": storm_nondim_interval,
+        "storm_strength_fraction": storm_strength_fraction,
         "saved_checkpoint_interval_days": saved_checkpoint_interval_days,
         "n_saved_checkpoints": n_saved_checkpoints,
         "M": M,
@@ -376,6 +491,17 @@ def _raw_file_signature(file_path: Path, *, cfg: GCMulatorConfig) -> Dict[str, A
         "dt_seconds": float(metadata["dt_seconds"]),
         "starttime_index": int(metadata["starttime_index"]),
         "forcing_mode": str(metadata["forcing_mode"]),
+        "initial_condition_mode": str(metadata["initial_condition_mode"]),
+        "convective_forcing_mode": str(metadata["convective_forcing_mode"]),
+        "convective_forcing_seed": int(metadata["convective_forcing_seed"]),
+        "trajectory_seed": int(metadata["trajectory_seed"]),
+        "initial_phi_noise_temperature_k": float(
+            metadata["initial_phi_noise_temperature_k"]
+        ),
+        "storm_radius_degrees": float(metadata["storm_radius_degrees"]),
+        "storm_nondim_lifetime": float(metadata["storm_nondim_lifetime"]),
+        "storm_nondim_interval": float(metadata["storm_nondim_interval"]),
+        "storm_strength_fraction": float(metadata["storm_strength_fraction"]),
         "saved_checkpoint_interval_days": float(metadata["saved_checkpoint_interval_days"]),
         "n_saved_checkpoints": int(metadata["n_saved_checkpoints"]),
         "nlat": int(metadata["nlat"]),

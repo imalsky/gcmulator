@@ -48,23 +48,40 @@ Default operator routine:
 7. Use the main entrypoints from the same environment:
    `python -m gcmulator --gen --config config.json`
    `python -m gcmulator --train --config config.json`
-8. The checked-in default `config.json` is the unforced brown-dwarf preset.
-9. The preserved forced hot-Jupiter preset is `config_HJ.json`.
+8. The checked-in default stochastic internally heated brown-dwarf preset is
+   `config.json`.
+9. The checked-in legacy unforced brown-dwarf preset is
+   `config_BD_legacy.json`.
+10. The preserved forced hot-Jupiter preset is `config_HJ.json`.
 
 ### 1.2 Preset Selection
-The repository now supports two checked-in solver presets:
+The repository now supports three checked-in solver presets:
 1. `config.json`
-   Generic brown-dwarf regime with exact unforced dynamics
-   (`solver.forcing_mode="unforced"`).
-2. `config_HJ.json`
+   Stochastic brown-dwarf regime with exact unforced MY_SWAMP dynamics, an
+   explicit rest-state initialization supplied by `gcmulator`, and
+   `gcmulator`-side localized random storm forcing
+   (`solver.forcing_mode="unforced"`,
+   `solver.initial_condition_mode="rest"`,
+   `solver.convective_forcing_mode="localized_random_storms"`).
+2. `config_BD_legacy.json`
+   Generic brown-dwarf regime with exact unforced dynamics and the legacy
+   MY_SWAMP analytic initialization
+   (`solver.forcing_mode="unforced"`,
+   `solver.initial_condition_mode="legacy"`).
+3. `config_HJ.json`
    Forced hot-Jupiter regime with dayside irradiation
    (`solver.forcing_mode="forced"`).
 
 Operator rule:
-1. Use `config.json` when you want a non-irradiated, generic brown-dwarf run.
-2. Use `config_HJ.json` when you want the previous irradiated hot-Jupiter run.
-3. For custom experiments, copy one of those configs and then edit the physical
-   parameters and `solver.forcing_mode` explicitly.
+1. Use `config.json` when you want the default non-irradiated stochastic
+   internally heated brown-dwarf template with a rest-state base
+   initialization and noisy perturbations.
+2. Use `config_BD_legacy.json` when you want the legacy unforced brown-dwarf
+   dynamics.
+3. Use `config_HJ.json` when you want the previous irradiated hot-Jupiter run.
+4. For custom experiments, copy one of those configs and then edit the physical
+   parameters, `solver.forcing_mode`, `solver.initial_condition_mode`, and
+   `solver.convective_forcing_mode` explicitly.
 
 Important dependency naming:
 1. the install package is `torch-harmonics==0.8.1`
@@ -132,6 +149,33 @@ Key preserved numerical ideas:
 1. `"forced"` maps to `test=None`, `forcflag=True`
 2. `"unforced"` maps to `test=None`, `forcflag=False`
 
+Initialization is configured independently via `solver.initial_condition_mode`:
+1. `"legacy"` lets MY_SWAMP use its built-in `test=None` initialization
+2. `"rest"` passes explicit rest-state initial conditions from `gcmulator`
+   with `eta = 2 * omega * mu`, `delta = 0`, `Phi = 0`, and `U = V = 0`
+
+Optional `gcmulator`-side stochastic forcing is configured via
+`solver.convective_forcing_mode`:
+1. `"none"` applies no post-step `Phi` correction in `gcmulator`
+2. `"localized_random_storms"` applies localized random geopotential storm
+   tendencies plus uniform relaxation of `Phi` toward zero anomaly in
+   `gcmulator`, without modifying MY_SWAMP
+
+Related solver controls:
+1. `solver.convective_forcing_seed`
+   Base deterministic seed used to derive one `trajectory_seed` per rollout
+2. `solver.initial_phi_noise_temperature_k`
+   RMS amplitude of the initial `Phi` perturbation interpreted in Kelvin via
+   `solver.r_specific_j_per_kg_k`
+3. `solver.storm_radius_degrees`
+   Angular radius used by the Gaussian storm shape
+4. `solver.storm_nondim_lifetime`
+   Nondimensional storm lifetime converted as `tau_s = lifetime / (2 * omega)`
+5. `solver.storm_nondim_interval`
+   Nondimensional storm spacing converted as `tau_int = interval / (2 * omega)`
+6. `solver.storm_strength_fraction`
+   Storm amplitude factor used in `S0 = fraction * Phibar / tau_s`
+
 In both cases the backend keeps:
 1. `diffflag=True`
 2. `expflag=False`
@@ -139,15 +183,31 @@ In both cases the backend keeps:
 4. `diagnostics=False`
 5. `alpha=0.01`
 
-The checked-in default `config.json` targets the modified-Euler,
-diffusion-enabled, unforced brown-dwarf path. The preserved
-`config_HJ.json` preset targets the forced hot-Jupiter path.
+The checked-in `config.json` preset targets the modified-Euler,
+diffusion-enabled, unforced brown-dwarf path with an explicit rest-state
+initialization, a noisy start, and `gcmulator`-side localized random storms.
+The preserved `config_HJ.json` preset targets the forced hot-Jupiter path. The
+checked-in `config_BD_legacy.json` preset preserves the legacy unforced
+brown-dwarf initialization.
 
 Practical interpretation:
-1. `solver.forcing_mode="unforced"` means exact no-irradiation evolution.
+1. `solver.forcing_mode="unforced"` means exact no-irradiation MY_SWAMP
+   evolution.
 2. `solver.forcing_mode="forced"` means irradiated evolution using the active
    `DPhieq`, `taurad_s`, and `taudrag_s` values from the config.
-3. Switching between brown-dwarf and hot-Jupiter presets does not change the
+3. `solver.initial_condition_mode="legacy"` is not a quiescent rest state for
+   `test=None`; it preserves MY_SWAMP's original analytic initialization.
+4. `solver.initial_condition_mode="rest"` uses explicit rest-state initial
+   conditions supplied by `gcmulator` without modifying MY_SWAMP.
+5. `solver.convective_forcing_mode="localized_random_storms"` approximates the
+   stochastic storm forcing of Hammond et al. (2023) in `gcmulator`, not in
+   MY_SWAMP.
+6. In that stochastic mode, `taurad_s` is reused as a uniform relaxation
+   timescale for `Phi` anomalies even though MY_SWAMP still runs with
+   `forcflag=False`.
+7. `taudrag_s` and `DPhieq` remain inactive in that stochastic unforced mode
+   unless `solver.forcing_mode="forced"` is also enabled.
+8. Switching between brown-dwarf and hot-Jupiter presets does not change the
    learned interface shape; it changes the solver regime and physical defaults.
 
 ### 3.2 Prognostic State Variables
@@ -239,6 +299,17 @@ When `solver.forcing_mode="unforced"`, the backend instead runs exact
 unforced evolution with `forcflag=False`. The conditioning vector still keeps
 `DPhieq`, `taurad_s`, and `taudrag_s` for compatibility, but those channels
 can be constant across an unforced dataset.
+
+`solver.initial_condition_mode` does not alter MY_SWAMP's forcing/drag
+coupling. It only changes how the initial state is supplied.
+
+When `solver.convective_forcing_mode="localized_random_storms"`, `gcmulator`
+applies an additional post-step `Phi` correction outside MY_SWAMP:
+1. localized random storm tendencies in physical space
+2. area-mean removal of the storm tendency
+3. uniform relaxation `dPhi/dt = -Phi / taurad_s`
+4. recomputation of the `Phi`-dependent carry terms before the next MY_SWAMP
+   step
 
 ### 3.6 Spectral Diagnosis Of Winds
 The repository reconstructs winds using MY_SWAMP spectral transforms:
@@ -363,14 +434,24 @@ All commands assume the working directory is the repository root (`gcmulator/`)
 and that the package has been installed once with
 `python -m pip install -e . --no-build-isolation`.
 
-**Generate raw training data with the default brown-dwarf preset:**
+**Generate raw training data with the default stochastic brown-dwarf preset:**
 ```bash
 python -m gcmulator --gen --config config.json
 ```
 
-**Train the emulator with the default brown-dwarf preset** (includes preprocessing):
+**Train the emulator with the default stochastic brown-dwarf preset** (includes preprocessing):
 ```bash
 python -m gcmulator --train --config config.json
+```
+
+**Generate raw training data with the preserved legacy brown-dwarf preset:**
+```bash
+python -m gcmulator --gen --config config_BD_legacy.json
+```
+
+**Train the emulator with the preserved legacy brown-dwarf preset** (includes preprocessing):
+```bash
+python -m gcmulator --train --config config_BD_legacy.json
 ```
 
 **Generate raw training data with the preserved hot-Jupiter preset:**
@@ -383,10 +464,16 @@ python -m gcmulator --gen --config config_HJ.json
 python -m gcmulator --train --config config_HJ.json
 ```
 
-**Both stages in sequence for the brown-dwarf preset**:
+**Both stages in sequence for the default stochastic brown-dwarf preset**:
 ```bash
 python -m gcmulator --gen --config config.json
 python -m gcmulator --train --config config.json
+```
+
+**Both stages in sequence for the preserved legacy brown-dwarf preset**:
+```bash
+python -m gcmulator --gen --config config_BD_legacy.json
+python -m gcmulator --train --config config_BD_legacy.json
 ```
 
 **Both stages in sequence for the hot-Jupiter preset**:
@@ -398,10 +485,19 @@ python -m gcmulator --train --config config_HJ.json
 On JPL `gattaca2`, `run.sh` wraps the same generation/training flow for Slurm.
 In a NASA NAS environment, `run.pbs` is the PBS entrypoint for the same
 workflow. Both launcher scripts default to `config.json`, so use
-`CONFIG_PATH=config_HJ.json` when you want the preserved hot-Jupiter flow:
+`CONFIG_PATH=config_BD_legacy.json` for the preserved legacy brown-dwarf preset or
+`CONFIG_PATH=config_HJ.json` for the preserved hot-Jupiter flow:
+
+```bash
+CONFIG_PATH=config_BD_legacy.json ./run.sh
+```
 
 ```bash
 CONFIG_PATH=config_HJ.json ./run.sh
+```
+
+```bash
+CONFIG_PATH=config_BD_legacy.json qsub run.pbs
 ```
 
 ```bash
@@ -411,7 +507,14 @@ CONFIG_PATH=config_HJ.json qsub run.pbs
 **Custom solver-mode rule**
 1. Set `solver.forcing_mode` to `"unforced"` for exact non-irradiated dynamics.
 2. Set `solver.forcing_mode` to `"forced"` for irradiated dynamics.
-3. Keep the 7 conditioning parameters in the config in either case; unforced
+3. Set `solver.initial_condition_mode` to `"legacy"` for the original
+   MY_SWAMP `test=None` initialization.
+4. Set `solver.initial_condition_mode` to `"rest"` for a rest-state base
+   supplied by `gcmulator`; keep `initial_phi_noise_temperature_k=0` when you
+   want an exact-rest initial state.
+5. Set `solver.convective_forcing_mode` to `"localized_random_storms"` for the
+   paper-like stochastic internally heated brown-dwarf approximation.
+6. Keep the 7 conditioning parameters in the config in either case; unforced
    runs may keep `DPhieq`, `taurad_s`, and `taudrag_s` fixed for compatibility.
 
 **Utility scripts** (run from the repository root after training):
@@ -478,14 +581,17 @@ No spectral loss term is part of the training objective contract.
 ## 6. File Responsibilities
 ### 6.1 Repository Root
 1. `config.json`
-   Default unforced brown-dwarf experiment config.
-2. `config_HJ.json`
+   Default stochastic unforced brown-dwarf experiment config with a rest-state
+   base initialization and noisy perturbations.
+2. `config_BD_legacy.json`
+   Preserved legacy unforced brown-dwarf experiment config.
+3. `config_HJ.json`
    Preserved forced hot-Jupiter experiment config.
-3. `spec.md`
+4. `spec.md`
    This repository contract.
-4. `run.sh`
+5. `run.sh`
    Slurm entrypoint for JPL `gattaca2`.
-5. `run.pbs`
+6. `run.pbs`
    PBS entrypoint for a NASA NAS environment.
 
 ### 6.2 Source Files
