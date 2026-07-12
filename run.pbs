@@ -51,8 +51,8 @@ export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
 export GCMULATOR_JAX_SIM_BATCH="${GCMULATOR_JAX_SIM_BATCH:-1}"
 export GCMULATOR_JAX_SIM_BATCH_AUTO_GPU="${GCMULATOR_JAX_SIM_BATCH_AUTO_GPU:-1}"
-export SWAMPE_JAX_ENABLE_X64="${SWAMPE_JAX_ENABLE_X64:-1}"
-export JAX_ENABLE_X64="${JAX_ENABLE_X64:-${SWAMPE_JAX_ENABLE_X64}}"
+export MY_SWAMPE_ENABLE_X64="${MY_SWAMPE_ENABLE_X64:-1}"
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-${MY_SWAMPE_ENABLE_X64}}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export REQUIRE_TORCH_CUDA
 export REQUIRE_JAX_GPU
@@ -77,20 +77,20 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: GCMULATOR_JAX_SIM_BATCH=${GCMULATOR_JAX_SIM_BATCH} GCMULATOR_JAX_SIM_BATCH_AUTO_GPU=${GCMULATOR_JAX_SIM_BATCH_AUTO_GPU} SWAMPE_JAX_ENABLE_X64=${SWAMPE_JAX_ENABLE_X64} JAX_ENABLE_X64=${JAX_ENABLE_X64}"
+echo "Launcher defaults: GCMULATOR_JAX_SIM_BATCH=${GCMULATOR_JAX_SIM_BATCH} GCMULATOR_JAX_SIM_BATCH_AUTO_GPU=${GCMULATOR_JAX_SIM_BATCH_AUTO_GPU} MY_SWAMPE_ENABLE_X64=${MY_SWAMPE_ENABLE_X64} JAX_ENABLE_X64=${JAX_ENABLE_X64}"
 if [ ! -d "${PROJECT_ROOT}/src/gcmulator" ]; then
   echo "ERROR: package directory not found: ${PROJECT_ROOT}/src/gcmulator"
   exit 1
 fi
 
 if ! python - <<'PY'
-import my_swamp
+import my_swampe
 import sys
-print(f"my_swamp import OK from: {getattr(my_swamp, '__file__', '<namespace>')}")
+print(f"my_swampe import OK from: {getattr(my_swampe, '__file__', '<namespace>')}")
 print(f"python executable: {sys.executable}")
 PY
 then
-  echo "ERROR: my_swamp import failed from the existing environment/package path."
+  echo "ERROR: my_swampe import failed from the existing environment/package path."
   exit 1
 fi
 

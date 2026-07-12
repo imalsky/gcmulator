@@ -8,9 +8,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
-MY_SWAMP_SRC = ROOT.parent / "MY_SWAMP" / "src"
+MY_SWAMPE_SRC = ROOT.parent / "MY_SWAMPE" / "src"
 
-for candidate in (SRC_ROOT, MY_SWAMP_SRC):
+for candidate in (SRC_ROOT, MY_SWAMPE_SRC):
     if candidate.is_dir():
         candidate_str = str(candidate)
         if candidate_str not in sys.path:

@@ -1,4 +1,4 @@
-"""Parity utility comparing terminal SWAMPE and MY_SWAMP trajectories."""
+"""Parity utility comparing terminal SWAMPE and MY_SWAMPE trajectories."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 # Force CPU-only execution and preserve float64 parity behavior.
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["JAX_PLATFORM_NAME"] = "cpu"
-os.environ.setdefault("SWAMPE_JAX_ENABLE_X64", "1")
+os.environ.setdefault("MY_SWAMPE_ENABLE_X64", "1")
 
 try:
     import matplotlib.pyplot as plt
@@ -45,7 +45,7 @@ except Exception as exc:  # pragma: no cover
     ) from exc
 
 from gcmulator.config import Extended9Params
-from gcmulator.my_swamp_backend import ensure_my_swamp_importable
+from gcmulator.my_swampe_backend import ensure_my_swampe_importable
 
 # ---------------------------------------------------------------------------
 # User-editable run settings
@@ -77,8 +77,8 @@ JIT_SCAN = True
 
 OUT_DIR = Path("extra") / "parity_outputs"
 _time_tag = f"{TIME_DAYS:.3f}".rstrip("0").rstrip(".").replace(".", "p")
-FIGURE_NAME = f"phi_swampe_vs_my_swamp_{_time_tag}d.png"
-REPORT_NAME = f"swampe_vs_my_swamp_{_time_tag}d_metrics.json"
+FIGURE_NAME = f"phi_swampe_vs_my_swampe_{_time_tag}d.png"
+REPORT_NAME = f"swampe_vs_my_swampe_{_time_tag}d_metrics.json"
 
 ATOL_BY_FIELD: Dict[str, float] = {
     "Phi": 5.0e-8,
@@ -168,13 +168,13 @@ def _robust_phi_signed_limit(phi_a: np.ndarray, phi_b: np.ndarray) -> float:
 def _save_phi_figure(
     *,
     swampe_phi: np.ndarray,
-    my_swamp_phi: np.ndarray,
+    my_swampe_phi: np.ndarray,
     out_path: Path,
     steps: int,
     compared_time_days: float,
 ) -> None:
-    """Save side-by-side SWAMPE/MY_SWAMP Phi comparison figure."""
-    vmax = _robust_phi_signed_limit(swampe_phi, my_swamp_phi)
+    """Save side-by-side SWAMPE/MY_SWAMPE Phi comparison figure."""
+    vmax = _robust_phi_signed_limit(swampe_phi, my_swampe_phi)
     linthresh = max(float(vmax) * float(PHI_SYMLOG_LIN_FRAC), np.finfo(np.float64).tiny)
     norm = mcolors.SymLogNorm(
         linthresh=linthresh,
@@ -211,14 +211,14 @@ def _save_phi_figure(
     ax_ref.set_ylabel("Latitude Index")
 
     im_new = ax_new.imshow(
-        my_swamp_phi,
+        my_swampe_phi,
         origin="lower",
         cmap=PHI_COLOR_MAP,
         norm=norm,
         interpolation="bicubic",
         aspect="auto",
     )
-    ax_new.set_title("MY_SWAMP Phi")
+    ax_new.set_title("MY_SWAMPE Phi")
     ax_new.set_xlabel("Longitude Index")
     ax_new.set_ylabel("Latitude Index")
 
@@ -227,11 +227,11 @@ def _save_phi_figure(
     cbar.locator = mticker.MaxNLocator(nbins=6)
     cbar.update_ticks()
 
-    diff = np.asarray(my_swamp_phi, dtype=np.float64) - np.asarray(swampe_phi, dtype=np.float64)
+    diff = np.asarray(my_swampe_phi, dtype=np.float64) - np.asarray(swampe_phi, dtype=np.float64)
     rmse = float(np.sqrt(np.mean(diff**2)))
     max_abs = float(np.max(np.abs(diff)))
     fig.suptitle(
-        f"SWAMPE vs MY_SWAMP | time_days={compared_time_days:.3f} | steps={steps} | CPU | "
+        f"SWAMPE vs MY_SWAMPE | time_days={compared_time_days:.3f} | steps={steps} | CPU | "
         f"Phi RMSE={rmse:.3e} | max_abs={max_abs:.3e}"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,10 +333,10 @@ def _run_swampe(*, tmax: int) -> Dict[str, object]:
         }
 
 
-def _run_my_swamp(*, tmax: int) -> Dict[str, np.ndarray]:
-    """Run MY_SWAMP with matched settings and return terminal fields."""
-    ensure_my_swamp_importable(PROJECT_ROOT)
-    from my_swamp.model import run_model_scan_final
+def _run_my_swampe(*, tmax: int) -> Dict[str, np.ndarray]:
+    """Run MY_SWAMPE with matched settings and return terminal fields."""
+    ensure_my_swampe_importable(PROJECT_ROOT)
+    from my_swampe.model import run_model_scan_final
 
     out = run_model_scan_final(
         M=int(M),
@@ -374,11 +374,11 @@ def _run_my_swamp(*, tmax: int) -> Dict[str, np.ndarray]:
 def _metric_dict(
     *,
     swampe_field: np.ndarray,
-    my_swamp_field: np.ndarray,
+    my_swampe_field: np.ndarray,
     atol: float,
 ) -> Dict[str, float | bool]:
     """Compute per-field parity metrics and tolerance pass/fail flag."""
-    diff = my_swamp_field - swampe_field
+    diff = my_swampe_field - swampe_field
     max_abs = float(np.max(np.abs(diff)))
     rmse = float(np.sqrt(np.mean(diff**2)))
     mean_abs = float(np.mean(np.abs(diff)))
@@ -393,7 +393,7 @@ def _metric_dict(
         "rel_l2": float(rel_l2),
         "allclose_rtol0": bool(
             np.allclose(
-                my_swamp_field,
+                my_swampe_field,
                 swampe_field,
                 rtol=0.0,
                 atol=float(atol),
@@ -442,21 +442,21 @@ def main() -> None:
         )
     compared_time_days = float(compared_steps * DT_SECONDS / 86400.0)
     compared_tmax = int(swampe_terminal_step + 1)
-    my_swamp = _run_my_swamp(tmax=compared_tmax)
+    my_swampe = _run_my_swampe(tmax=compared_tmax)
     swampe = {field: np.asarray(swampe_run[field], dtype=np.float64) for field in fields}
 
     metrics: Dict[str, Dict[str, float | bool]] = {}
     failed: list[str] = []
     for field in fields:
-        if swampe[field].shape != my_swamp[field].shape:
+        if swampe[field].shape != my_swampe[field].shape:
             raise ValueError(
                 f"Shape mismatch for {field}: "
                 f"SWAMPE={swampe[field].shape} "
-                f"vs MY_SWAMP={my_swamp[field].shape}"
+                f"vs MY_SWAMPE={my_swampe[field].shape}"
             )
         m = _metric_dict(
             swampe_field=swampe[field],
-            my_swamp_field=my_swamp[field],
+            my_swampe_field=my_swampe[field],
             atol=float(ATOL_BY_FIELD[field]),
         )
         metrics[field] = m
@@ -466,14 +466,14 @@ def main() -> None:
     fig_path = (out_dir / FIGURE_NAME).resolve()
     _save_phi_figure(
         swampe_phi=swampe["Phi"],
-        my_swamp_phi=my_swamp["Phi"],
+        my_swampe_phi=my_swampe["Phi"],
         out_path=fig_path,
         steps=compared_steps,
         compared_time_days=compared_time_days,
     )
 
     report = {
-        "comparison": "SWAMPE vs MY_SWAMP terminal state parity",
+        "comparison": "SWAMPE vs MY_SWAMPE terminal state parity",
         "cpu_only": True,
         "jax_backend": _current_jax_backend(),
         "solver": {

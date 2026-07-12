@@ -63,7 +63,7 @@ def canonicalize_state_field(field_name: str) -> str:
 
 @dataclass(frozen=True)
 class Extended9Params:
-    """MY_SWAMP run parameters (7 user-facing conditioning + 2 internal controls)."""
+    """MY_SWAMPE run parameters (7 user-facing conditioning + 2 internal controls)."""
 
     a_m: float
     omega_rad_s: float
@@ -110,7 +110,7 @@ class PathsConfig:
 
 @dataclass(frozen=True)
 class SolverConfig:
-    """MY_SWAMP integration controls used for data generation."""
+    """MY_SWAMPE integration controls used for data generation."""
 
     M: int = 42
     dt_seconds: float = 240.0

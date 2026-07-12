@@ -16,17 +16,17 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
-CONDA_ENV="${CONDA_ENV:-swamp_compare}"
+CONDA_ENV="${CONDA_ENV:-swampe_compare}"
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
 MAIN_MODULE="${MAIN_MODULE:-gcmulator}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
-MY_SWAMP_PACKAGE_SPEC="${MY_SWAMP_PACKAGE_SPEC:-my-swamp}"
-MY_SWAMP_PIP_ARGS="${MY_SWAMP_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
+MY_SWAMPE_PACKAGE_SPEC="${MY_SWAMPE_PACKAGE_SPEC:-my-swampe}"
+MY_SWAMPE_PIP_ARGS="${MY_SWAMPE_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
 TORCH_HARMONICS_PACKAGE_SPEC="${TORCH_HARMONICS_PACKAGE_SPEC:-torch-harmonics==0.8.1}"
 TORCH_HARMONICS_PIP_ARGS="${TORCH_HARMONICS_PIP_ARGS:---no-deps --no-build-isolation}"
 TORCH_HARMONICS_FORCE_CPU_BUILD="${TORCH_HARMONICS_FORCE_CPU_BUILD:-1}"
 TORCH_HARMONICS_FORCE_REINSTALL="${TORCH_HARMONICS_FORCE_REINSTALL:-0}"
-read -r -a MY_SWAMP_PIP_ARGS_ARR <<< "${MY_SWAMP_PIP_ARGS}"
+read -r -a MY_SWAMPE_PIP_ARGS_ARR <<< "${MY_SWAMPE_PIP_ARGS}"
 read -r -a TORCH_HARMONICS_PIP_ARGS_ARR <<< "${TORCH_HARMONICS_PIP_ARGS}"
 
 if ! command -v conda >/dev/null 2>&1; then
@@ -41,8 +41,8 @@ export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT:${PYTHONPATH:-}"
 export GCMULATOR_SUPPRESS_KNOWN_WARNINGS="${GCMULATOR_SUPPRESS_KNOWN_WARNINGS:-1}"
 export GCMULATOR_JAX_SIM_BATCH="${GCMULATOR_JAX_SIM_BATCH:-1}"
 export GCMULATOR_JAX_SIM_BATCH_AUTO_GPU="${GCMULATOR_JAX_SIM_BATCH_AUTO_GPU:-1}"
-export SWAMPE_JAX_ENABLE_X64="${SWAMPE_JAX_ENABLE_X64:-1}"
-export JAX_ENABLE_X64="${JAX_ENABLE_X64:-${SWAMPE_JAX_ENABLE_X64}}"
+export MY_SWAMPE_ENABLE_X64="${MY_SWAMPE_ENABLE_X64:-1}"
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-${MY_SWAMPE_ENABLE_X64}}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
@@ -68,21 +68,21 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )"
-echo "Launcher defaults: GCMULATOR_JAX_SIM_BATCH=${GCMULATOR_JAX_SIM_BATCH} GCMULATOR_JAX_SIM_BATCH_AUTO_GPU=${GCMULATOR_JAX_SIM_BATCH_AUTO_GPU} SWAMPE_JAX_ENABLE_X64=${SWAMPE_JAX_ENABLE_X64} JAX_ENABLE_X64=${JAX_ENABLE_X64}"
+echo "Launcher defaults: GCMULATOR_JAX_SIM_BATCH=${GCMULATOR_JAX_SIM_BATCH} GCMULATOR_JAX_SIM_BATCH_AUTO_GPU=${GCMULATOR_JAX_SIM_BATCH_AUTO_GPU} MY_SWAMPE_ENABLE_X64=${MY_SWAMPE_ENABLE_X64} JAX_ENABLE_X64=${JAX_ENABLE_X64}"
 if [ ! -d "$PROJECT_ROOT/src/gcmulator" ]; then
   echo "ERROR: package directory not found: $PROJECT_ROOT/src/gcmulator"
   exit 1
 fi
 
-# Always refresh my_swamp from package source.
-echo "Reinstalling my_swamp package: ${MY_SWAMP_PACKAGE_SPEC}"
-python -m pip uninstall -y my_swamp my-swamp >/dev/null 2>&1 || true
-python -m pip install --upgrade --no-deps "${MY_SWAMP_PIP_ARGS_ARR[@]}" "${MY_SWAMP_PACKAGE_SPEC}"
+# Always refresh my_swampe from package source.
+echo "Reinstalling my_swampe package: ${MY_SWAMPE_PACKAGE_SPEC}"
+python -m pip uninstall -y my_swampe my-swampe >/dev/null 2>&1 || true
+python -m pip install --upgrade --no-deps "${MY_SWAMPE_PIP_ARGS_ARR[@]}" "${MY_SWAMPE_PACKAGE_SPEC}"
 if ! python - <<'PY' >/dev/null 2>&1
-import my_swamp  # noqa: F401
+import my_swampe  # noqa: F401
 PY
 then
-  echo "ERROR: my_swamp import failed after package install (${MY_SWAMP_PACKAGE_SPEC})"
+  echo "ERROR: my_swampe import failed after package install (${MY_SWAMPE_PACKAGE_SPEC})"
   exit 1
 fi
 

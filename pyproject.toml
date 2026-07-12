@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gcmulator"
 version = "0.1.0"
-description = "Direct-jump spherical surrogate training package for MY_SWAMP data."
+description = "Direct-jump spherical surrogate training package for MY_SWAMPE data."
 readme = "spec.md"
 requires-python = ">=3.10"
 dependencies = [

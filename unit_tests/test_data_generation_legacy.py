@@ -108,7 +108,7 @@ def test_generate_dataset_rejects_legacy_npz_before_backend_setup(
     def _unexpected(*args: object, **kwargs: object) -> None:
         raise AssertionError("legacy raw-file validation should run before backend setup")
 
-    monkeypatch.setattr(data_generation_mod, "ensure_my_swamp_importable", _unexpected)
+    monkeypatch.setattr(data_generation_mod, "ensure_my_swampe_importable", _unexpected)
 
     with pytest.raises(RuntimeError, match="sim_\\*\\.npz"):
         data_generation_mod.generate_dataset(cfg, config_path=config_path)

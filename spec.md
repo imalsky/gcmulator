@@ -2,11 +2,11 @@
 
 ## 1. Purpose And Scope
 `gcmulator` trains a direct-jump spherical surrogate for the visible flow
-produced by `MY_SWAMP`.
+produced by `MY_SWAMPE`.
 
 The canonical task is:
 1. Sample physical parameters.
-2. Run `MY_SWAMP` on a Legendre-Gauss spherical grid.
+2. Run `MY_SWAMPE` on a Legendre-Gauss spherical grid.
 3. Save uniformly spaced checkpoint sequences from each simulated trajectory.
 4. Train a state-conditioned SFNO surrogate on
    `(state_t, params, transition_days) -> target_{t+Δ}`.
@@ -38,7 +38,7 @@ Default operator routine:
 3. Install the local package into the active environment:
    `python -m pip install -e . --no-build-isolation`
 4. Confirm the required imports before debugging repository code:
-   `python -c "import torch, torch_harmonics, my_swamp; print(torch.__version__, getattr(torch_harmonics, '__version__', 'unknown'))"`
+   `python -c "import torch, torch_harmonics, my_swampe; print(torch.__version__, getattr(torch_harmonics, '__version__', 'unknown'))"`
 5. Run the minimum integrity checks:
    `python -m pytest unit_tests`
    `python -m compileall src extra unit_tests`
@@ -91,15 +91,15 @@ If a dependency or artifact is wrong, fail immediately with a concrete error.
 Numerical code should prefer:
 1. batch tensor operations over Python loops
 2. `numpy` vectorization for CPU-side preprocessing
-3. `jax.vmap` + `jax.lax.scan` for batched MY_SWAMP rollouts
+3. `jax.vmap` + `jax.lax.scan` for batched MY_SWAMPE rollouts
 4. batched `torch` operations for model inference and loss evaluation
 
 `sampling.generation_workers` is not an OS worker pool. In the active
 implementation it is a JAX trajectory batch size for vectorized generation.
 
 ## 3. Scientific And Physics Contract
-### 3.1 MY_SWAMP Overview
-According to the local `MY_SWAMP` code and README, `my_swamp` is a JAX rewrite
+### 3.1 MY_SWAMPE Overview
+According to the local `MY_SWAMPE` code and README, `my_swampe` is a JAX rewrite
 of the SWAMPE spectral shallow-water model on the sphere.
 
 Key preserved numerical ideas:
@@ -110,7 +110,7 @@ Key preserved numerical ideas:
 5. prognostic evolution in spectral space
 6. diagnostic reconstruction of winds from vorticity/divergence
 
-`gcmulator` uses `MY_SWAMP` in forced mode with:
+`gcmulator` uses `MY_SWAMPE` in forced mode with:
 1. `forcflag=True`
 2. `diffflag=True`
 3. `expflag=False`
@@ -119,7 +119,7 @@ Key preserved numerical ideas:
 6. `alpha=0.01`
 
 That means the checked-in surrogate is aligned to the modified-Euler,
-diffusion-enabled, forced MY_SWAMP path, not to every possible solver mode.
+diffusion-enabled, forced MY_SWAMPE path, not to every possible solver mode.
 
 ### 3.2 Prognostic State Variables
 The emulator operates autoregressively on five visible state channels in this
@@ -132,22 +132,22 @@ exact order:
 
 Definitions:
 1. `Phi`
-   Perturbation geopotential-like field. In MY_SWAMP, the total geopotential-like
+   Perturbation geopotential-like field. In MY_SWAMPE, the total geopotential-like
    quantity is `Phi + Phibar`.
 2. `U`
    Zonal physical-space wind component.
 3. `V`
    Meridional physical-space wind component.
 4. `eta`
-   The vorticity-like prognostic channel named `eta`. The MY_SWAMP README
+   The vorticity-like prognostic channel named `eta`. The MY_SWAMPE README
    describes this as absolute vorticity.
 5. `delta`
    Horizontal divergence.
 
 `U` and `V` are still diagnostically tied to `eta` and `delta` through
-MY_SWAMP's spectral `invrsUV` transform, but the checked-in emulator now
+MY_SWAMPE's spectral `invrsUV` transform, but the checked-in emulator now
 stores and predicts the full visible five-field state directly. Diagnostic
-wind reconstruction via `my_swamp_backend.diagnose_winds()` remains available
+wind reconstruction via `my_swampe_backend.diagnose_winds()` remains available
 for validation and compatibility tooling.
 
 ### 3.4 Conditioning Parameters
@@ -166,7 +166,7 @@ Definitions:
 2. `omega_rad_s`
    Rotation rate in radians per second.
 3. `Phibar`
-   Mean background geopotential-like offset added back to `Phi` inside MY_SWAMP.
+   Mean background geopotential-like offset added back to `Phi` inside MY_SWAMPE.
 4. `DPhieq`
    Amplitude of the equilibrium geopotential contrast used in the dayside forcing.
 5. `taurad_s`
@@ -181,7 +181,7 @@ Internally fixed but not part of the learned conditioning vector:
    Sixth-order diffusion coefficient for vorticity/divergence.
 2. `K6Phi`
    Geopotential diffusion control. `None` disables the dedicated Phi diffusion
-   path in some MY_SWAMP builds.
+   path in some MY_SWAMPE builds.
 
 The config may specify `taurad_hours` and `taudrag_hours`, but they are converted
 to canonical second-valued parameters before entering the model pipeline.
@@ -191,7 +191,7 @@ Model-conditioning adds one explicit time feature:
    The requested direct-jump horizon in physical days.
 
 ### 3.5 Forcing Physics
-The local `MY_SWAMP/src/my_swamp/forcing.py` code defines:
+The local `MY_SWAMPE/src/my_swampe/forcing.py` code defines:
 1. `Phieq`
    Equilibrium geopotential field
 2. `Q`
@@ -210,18 +210,18 @@ This matters because the surrogate is learning trajectories generated under
 forced, damped shallow-water dynamics, not free decay and not unforced test cases.
 
 ### 3.6 Spectral Diagnosis Of Winds
-The repository reconstructs winds using MY_SWAMP spectral transforms:
+The repository reconstructs winds using MY_SWAMPE spectral transforms:
 1. transform `eta` and `delta` into spectral coefficients
 2. apply inverse wind reconstruction with `invrsUV`
 3. return real-valued physical-space `U,V`
 
 That diagnosis is implemented in
-`src/gcmulator/my_swamp_backend.py::diagnose_winds`.
+`src/gcmulator/my_swampe_backend.py::diagnose_winds`.
 
 ### 3.7 Time Variables
 Definitions:
 1. `dt_seconds`
-   Solver time step for one MY_SWAMP advance.
+   Solver time step for one MY_SWAMPE advance.
 2. `default_time_days`
    Physical integration horizon for one raw simulation.
 3. `burn_in_days`
@@ -241,11 +241,11 @@ Definitions:
 8. `transition_days`
    Physical duration of one live-sampled jump derived from saved checkpoint gaps.
 9. `starttime_index`
-   MY_SWAMP initial time index. The active config requires `>= 2`, matching the
+   MY_SWAMPE initial time index. The active config requires `>= 2`, matching the
    two-level solver initialization constraints enforced by the code.
 
 Important distinction:
-`gcmulator` does not learn a variable internal MY_SWAMP solver `dt_seconds`.
+`gcmulator` does not learn a variable internal MY_SWAMPE solver `dt_seconds`.
 The solver step remains fixed inside data generation. The learned variable-time
 behavior is the direct-jump horizon `transition_days`.
 
@@ -277,7 +277,7 @@ Training performs preprocessing internally before optimization.
 
 ### 4.2 Generation
 `src/gcmulator/data_generation.py`:
-1. validates importability of `my_swamp`
+1. validates importability of `my_swampe`
 2. samples parameter sets
 3. builds a uniform saved-checkpoint schedule for every simulation
 4. runs serial extraction for single-item batches and vmapped JAX trajectory
@@ -325,7 +325,7 @@ The `extra/` scripts provide:
 2. TorchScript export with baked normalization
 3. training-curve plots
 4. batch-size timing benchmarks for held-out direct-jump inference
-5. SWAMPE vs MY_SWAMP parity diagnostics
+5. SWAMPE vs MY_SWAMPE parity diagnostics
 
 ### 4.6 How To Run
 All commands assume the working directory is the repository root (`gcmulator/`)
@@ -437,8 +437,8 @@ No spectral loss term is part of the training objective contract.
    Canonical latitude/longitude orientation helpers.
 7. `src/gcmulator/data_generation.py`
    Raw simulation generation and raw-file writing.
-8. `src/gcmulator/my_swamp_backend.py`
-   MY_SWAMP interface layer: initialization, checkpoint extraction, batched JAX
+8. `src/gcmulator/my_swampe_backend.py`
+   MY_SWAMPE interface layer: initialization, checkpoint extraction, batched JAX
    checkpoint extraction, wind diagnosis, and full-state reconstruction.
 9. `src/gcmulator/normalization.py`
    State/parameter normalization, inverse normalization, and JSON metadata
@@ -463,7 +463,7 @@ No spectral loss term is part of the training objective contract.
    Benchmark held-out test-split direct-jump inference latency across batch
    sizes.
 5. `extra/swampe_parity_compare.py`
-   Compare SWAMPE and MY_SWAMP outputs for parity/debugging.
+   Compare SWAMPE and MY_SWAMPE outputs for parity/debugging.
 6. `extra/science.mplstyle`
    Shared plotting style for utility scripts.
 
@@ -508,17 +508,17 @@ No spectral loss term is part of the training objective contract.
 ### 7.2 `solver`
 1. `M`
    Spectral truncation. The active config validation accepts the supported
-   MY_SWAMP resolutions only.
+   MY_SWAMPE resolutions only.
 2. `dt_seconds`
    Solver time step.
 3. `default_time_days`
    One raw simulation horizon.
 4. `starttime_index`
-   Initial MY_SWAMP time index.
+   Initial MY_SWAMPE time index.
 
-Internal MY_SWAMP geometry terms derived from `M`:
+Internal MY_SWAMPE geometry terms derived from `M`:
 1. `N`
-   Triangular truncation degree. In the SWAMPE-JAX docs, `M = N`.
+   Triangular truncation degree. In the MY_SWAMPE docs, `M = N`.
 2. `I`
    Longitude count, equivalent to `nlon`.
 3. `J`
@@ -608,7 +608,7 @@ Dense saved snapshots with CPU-side pair resampling:
 ```
 
 Interpretation:
-1. `dt_seconds` remains the fixed MY_SWAMP solver step
+1. `dt_seconds` remains the fixed MY_SWAMPE solver step
 2. the sampled direct-jump horizon varies over the inclusive physical-day range
    `[live_transition_days_min, live_transition_days_max]`
 3. the learned conditioning feature is the corresponding normalized
@@ -789,7 +789,7 @@ These names recur across raw files, processed metadata, checkpoints, and code:
     Stored longitude-origin convention string. Active canonical value is `0_to_2pi`.
 14. `lon_shift`
     Integer roll applied to longitude indices when converting from the native
-    MY_SWAMP layout into the stored canonical layout.
+    MY_SWAMPE layout into the stored canonical layout.
 15. `build_fingerprint`
     Preprocessing cache signature used to determine whether processed data is
     still valid for the current config and raw dataset.
@@ -1151,7 +1151,7 @@ Required core dependencies:
    `torch_harmonics`
 
 Required generation/physics dependency:
-1. `my_swamp`
+1. `my_swampe`
 
 Optional plotting dependency:
 1. `matplotlib`
@@ -1160,7 +1160,7 @@ The contract assumes these packages are importable in the active
 `nn` environment.
 
 ## 13. Exactness Statement
-This repository intentionally models the visible MY_SWAMP flow map, not the
+This repository intentionally models the visible MY_SWAMPE flow map, not the
 exact discrete solver carry.
 
 That means:
@@ -1172,4 +1172,4 @@ That means:
 4. approximate surrogate behavior rather than solver identity
 
 The emulator should be evaluated as a physically informed surrogate, not as an
-exact symbolic replacement for MY_SWAMP internals.
+exact symbolic replacement for MY_SWAMPE internals.

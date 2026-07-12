@@ -1,6 +1,6 @@
-"""Integration helpers for MY_SWAMP runtime execution and state extraction.
+"""Integration helpers for MY_SWAMPE runtime execution and state extraction.
 
-The emulator never trains directly on the full internal MY_SWAMP carry, but it
+The emulator never trains directly on the full internal MY_SWAMPE carry, but it
 does need a reproducible way to extract visible states and to reconstruct winds
 from prognostic channels during evaluation.
 """
@@ -35,7 +35,7 @@ CURRENT_FIELD_INDICES = (0, 1, 2, 3, 4)
 
 @dataclass(frozen=True)
 class ReducedCarrySnapshot:
-    """Minimal MY_SWAMP carry stored internally for extracting visible states."""
+    """Minimal MY_SWAMPE carry stored internally for extracting visible states."""
 
     Phi_curr: np.ndarray
     U_curr: np.ndarray
@@ -65,7 +65,7 @@ class ReducedCarrySnapshot:
 
 def enforce_no_tpu_backend() -> None:
     """Force JAX backend selection to exclude TPU and keep parity-grade defaults."""
-    os.environ.setdefault("SWAMPE_JAX_ENABLE_X64", "1")
+    os.environ.setdefault("MY_SWAMPE_ENABLE_X64", "1")
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
     raw_platforms = os.environ.get("JAX_PLATFORMS", "")
@@ -93,20 +93,20 @@ def detect_jax_backend() -> str:
     return str(jax.default_backend()).lower()
 
 
-def ensure_my_swamp_importable(_: Path | None = None) -> None:
-    """Require an importable ``my_swamp`` installation."""
+def ensure_my_swampe_importable(_: Path | None = None) -> None:
+    """Require an importable ``my_swampe`` installation."""
     enforce_no_tpu_backend()
     try:
-        import my_swamp  # noqa: F401
+        import my_swampe  # noqa: F401
     except Exception as exc:
         raise RuntimeError(
-            "Could not import my_swamp. Install it into the active environment "
+            "Could not import my_swampe. Install it into the active environment "
             "first."
         ) from exc
 
 
 def _snapshot_from_last_state(last_state: object) -> ReducedCarrySnapshot:
-    """Convert a MY_SWAMP scan carry into a reduced carry snapshot."""
+    """Convert a MY_SWAMPE scan carry into a reduced carry snapshot."""
     return ReducedCarrySnapshot(
         Phi_curr=np.asarray(last_state.Phi_curr, dtype=np.float64),
         U_curr=np.asarray(last_state.U_curr, dtype=np.float64),
@@ -139,8 +139,8 @@ def _stack_reduced_carry_state_jax(state: object) -> Any:
 
 
 def _build_run_flags(*, diagnostics: bool) -> Any:
-    """Build the fixed MY_SWAMP runtime flags used by the emulator pipeline."""
-    from my_swamp.model import RunFlags
+    """Build the fixed MY_SWAMPE runtime flags used by the emulator pipeline."""
+    from my_swampe.model import RunFlags
 
     return RunFlags(
         forcflag=True,
@@ -167,9 +167,9 @@ def _initialize_trajectory_state(
     dt_seconds: float,
     starttime_index: int,
 ) -> tuple[Any, Any, Any, Any]:
-    """Build static operators and the initial two-level MY_SWAMP state."""
+    """Build static operators and the initial two-level MY_SWAMPE state."""
     import jax.numpy as jnp
-    from my_swamp.model import run_model_scan
+    from my_swampe.model import run_model_scan
 
     init_out = run_model_scan(
         M=int(M),
@@ -215,7 +215,7 @@ def _initialize_trajectory_state_from_vector(
 ) -> tuple[Any, Any, Any, Any]:
     """Build static operators and initial state from a conditioning vector."""
     import jax.numpy as jnp
-    from my_swamp.model import run_model_scan
+    from my_swampe.model import run_model_scan
 
     (
         a_m,
@@ -264,7 +264,7 @@ def _initialize_trajectory_state_from_vector(
 def _get_reduced_carry_chunk_runner() -> Any:
     """Build and cache a jitted chunk runner returning reduced-carry outputs."""
     import jax
-    from my_swamp.model import _step_once
+    from my_swampe.model import _step_once
 
     def _scan_chunk(
         static: Any,
@@ -278,7 +278,7 @@ def _get_reduced_carry_chunk_runner() -> Any:
         import jax.numpy as jnp  # noqa: F811
 
         def _step(carry: Any, t: Any) -> tuple[Any, jnp.ndarray]:
-            """Advance a single MY_SWAMP step inside the chunk scan."""
+            """Advance a single MY_SWAMPE step inside the chunk scan."""
             new_state, _ = _step_once(carry, t, static, flags, None, Uic, Vic)
             return new_state, _stack_reduced_carry_state_jax(new_state)
 
@@ -321,7 +321,7 @@ def _get_batched_checkpoint_runner(
     """Return a cached batched rollout runner for uniform checkpoint sequences."""
     import jax
     import jax.numpy as jnp
-    from my_swamp.model import _step_once_state_only
+    from my_swampe.model import _step_once_state_only
 
     flags = _build_run_flags(diagnostics=False)
     rel_steps = jnp.arange(1, int(n_steps_total) + 1, dtype=jnp.int32)
@@ -500,7 +500,7 @@ def run_trajectory_checkpoints(
     starttime_index: int,
     checkpoint_steps: np.ndarray,
 ) -> np.ndarray:
-    """Extract visible-state checkpoints from one MY_SWAMP rollout."""
+    """Extract visible-state checkpoints from one MY_SWAMPE rollout."""
     import jax.numpy as jnp
 
     checkpoint_steps = np.asarray(checkpoint_steps, dtype=np.int64)
@@ -604,8 +604,8 @@ def _get_diagnostic_static(
     K6: float,
     K6Phi: float | None,
 ) -> Any:
-    """Cache MY_SWAMP static spectral operators for deterministic wind diagnosis."""
-    from my_swamp.model import build_static
+    """Cache MY_SWAMPE static spectral operators for deterministic wind diagnosis."""
+    from my_swampe.model import build_static
 
     return build_static(
         M=int(M),
@@ -644,7 +644,7 @@ def diagnose_winds(
         fields.
     """
     import jax.numpy as jnp
-    from my_swamp import spectral_transform as st
+    from my_swampe import spectral_transform as st
 
     static = _get_diagnostic_static(
         M=int(M),

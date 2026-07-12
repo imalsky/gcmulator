@@ -13,10 +13,10 @@ import numpy as np
 
 from .config import GCMulatorConfig, PHYSICAL_STATE_FIELDS, resolve_path
 from .geometry import apply_geometry_state
-from .my_swamp_backend import (
+from .my_swampe_backend import (
     conditioning_param_names,
     detect_jax_backend,
-    ensure_my_swamp_importable,
+    ensure_my_swampe_importable,
     params_to_conditioning_vector,
     params_to_public_json_dict,
     run_trajectory_checkpoints,
@@ -198,7 +198,7 @@ def _resolve_generation_batch_size(
 
 
 def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, Any]:
-    """Generate the raw checkpoint-sequence dataset using MY_SWAMP as the source of truth."""
+    """Generate the raw checkpoint-sequence dataset using MY_SWAMPE as the source of truth."""
     dataset_dir = resolve_path(config_path, cfg.paths.dataset_dir)
     dataset_dir.mkdir(parents=True, exist_ok=True)
     legacy = _list_legacy_raw_files(dataset_dir)
@@ -220,7 +220,7 @@ def generate_dataset(cfg: GCMulatorConfig, *, config_path: Path) -> Dict[str, An
                 f"{dataset_dir}"
             )
 
-    ensure_my_swamp_importable(config_path.parent)
+    ensure_my_swampe_importable(config_path.parent)
 
     n_sims = int(cfg.sampling.n_sims)
     rng = np.random.default_rng(int(cfg.sampling.seed))

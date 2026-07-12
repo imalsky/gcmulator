@@ -11,7 +11,7 @@ import warnings
 
 from .config import load_config
 from .data_generation import generate_dataset
-from .my_swamp_backend import enforce_no_tpu_backend
+from .my_swampe_backend import enforce_no_tpu_backend
 from .training import train_emulator
 
 
@@ -46,7 +46,7 @@ def main() -> None:
     stage_group.add_argument(
         "--gen",
         action="store_true",
-        help="Generate raw MY_SWAMP trajectory transitions",
+        help="Generate raw MY_SWAMPE trajectory transitions",
     )
     stage_group.add_argument(
         "--train",

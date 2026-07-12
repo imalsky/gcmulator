@@ -11,11 +11,11 @@ import pytest
 
 from gcmulator.config import PHYSICAL_STATE_FIELDS, load_config
 from gcmulator.data_generation import generate_dataset
-from gcmulator.my_swamp_backend import run_trajectory_checkpoints, run_trajectory_checkpoints_batched
+from gcmulator.my_swampe_backend import run_trajectory_checkpoints, run_trajectory_checkpoints_batched
 from gcmulator.sampling import build_uniform_checkpoint_schedule, to_extended9
 
 
-pytest.importorskip("my_swamp")
+pytest.importorskip("my_swampe")
 
 
 def _sample_params() -> list:

@@ -16,7 +16,7 @@ PROJECT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("XDG_CACHE_HOME", str(PROJECT_CACHE_DIR.resolve()))
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["JAX_PLATFORM_NAME"] = "cpu"
-os.environ.setdefault("SWAMPE_JAX_ENABLE_X64", "1")
+os.environ.setdefault("MY_SWAMPE_ENABLE_X64", "1")
 MPL_CACHE_DIR = Path(os.environ.get("GCMULATOR_MPLCONFIGDIR", str(DEFAULT_MPL_CACHE_DIR))).resolve()
 MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
@@ -35,7 +35,7 @@ from gcmulator.modeling import (
     build_state_conditioned_transition_model,
     ensure_torch_harmonics_importable,
 )
-from gcmulator.my_swamp_backend import (
+from gcmulator.my_swampe_backend import (
     diagnose_winds,
     params_to_conditioning_vector,
 )
