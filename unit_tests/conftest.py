@@ -8,7 +8,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
-MY_SWAMPE_SRC = ROOT.parent / "MY_SWAMPE" / "src"
+MY_SWAMPE_SRC = ROOT.parent / "SWAMPE-JAX" / "src"
 
 for candidate in (SRC_ROOT, MY_SWAMPE_SRC):
     if candidate.is_dir():
