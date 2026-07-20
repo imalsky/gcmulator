@@ -20,7 +20,7 @@ CONDA_ENV="${CONDA_ENV:-swampe_compare}"
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
 MAIN_MODULE="${MAIN_MODULE:-gcmulator}"
 RUN_GEN_IF_MISSING="${RUN_GEN_IF_MISSING:-1}"
-MY_SWAMPE_PACKAGE_SPEC="${MY_SWAMPE_PACKAGE_SPEC:-my-swampe}"
+MY_SWAMPE_PACKAGE_SPEC="${MY_SWAMPE_PACKAGE_SPEC:-swampe-jax}"
 MY_SWAMPE_PIP_ARGS="${MY_SWAMPE_PIP_ARGS:---index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/}"
 TORCH_HARMONICS_PACKAGE_SPEC="${TORCH_HARMONICS_PACKAGE_SPEC:-torch-harmonics==0.8.1}"
 TORCH_HARMONICS_PIP_ARGS="${TORCH_HARMONICS_PIP_ARGS:---no-deps --no-build-isolation}"
@@ -76,7 +76,7 @@ fi
 
 # Always refresh my_swampe from package source.
 echo "Reinstalling my_swampe package: ${MY_SWAMPE_PACKAGE_SPEC}"
-python -m pip uninstall -y my_swampe my-swampe >/dev/null 2>&1 || true
+python -m pip uninstall -y swampe-jax my-swampe >/dev/null 2>&1 || true
 python -m pip install --upgrade --no-deps "${MY_SWAMPE_PIP_ARGS_ARR[@]}" "${MY_SWAMPE_PACKAGE_SPEC}"
 if ! python - <<'PY' >/dev/null 2>&1
 import my_swampe  # noqa: F401
